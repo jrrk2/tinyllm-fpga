@@ -32,11 +32,37 @@ def qfloor(x_real, scale):
                    -32768, 32767).astype(np.int16)
 
 # ---------------------------------------------------------------------------
+# RTL matvec_int8_engine bit-accurate emulation.
+#   acc_r = Σ x_int * w_int8        (40-bit signed accumulator)
+#   scale_q15[i] = round(x_scale * W_rsc[i] / out_scale * 32768)   int16 sat
+#   y_int[i] = sat16( (acc_r * scale_q15[i]) >> 15 )       (>>> = ASR floor)
+# ---------------------------------------------------------------------------
+def matvec_int8_rtl(x_int16, x_scale, W_q8, W_rsc, out_scale):
+    # acc: shape (out_dim,) — integer dot product
+    acc = (x_int16.astype(np.int64) @ W_q8.astype(np.int64).T)   # exact, 40-bit fits in int64
+    # Per-row scale_q15, clipped to int16
+    scale_q15 = np.round(x_scale * W_rsc / float(out_scale) * 32768.0)
+    scale_q15 = np.clip(scale_q15, -32768, 32767).astype(np.int64)
+    # (acc * scale) >> 15 with ASR (floor toward -inf for negative values)
+    prod = acc * scale_q15
+    shifted = prod >> 15            # Python >> is ASR for signed ints in int64
+    return np.clip(shifted, -32768, 32767).astype(np.int16)
+
+# ---------------------------------------------------------------------------
 # RTL RMSNorm — Q5.12 inv_rms + msb LUT seed + 3 NR iterations
 # Gamma is pre-scaled by 1/lsc[norm] (matches fold_gamma in gen_smollm_blockfp)
 # ---------------------------------------------------------------------------
-SEED = {31:2365, 30:3344, 29:4730, 28:6689, 27:9459, 26:13377,
-        25:18919, 24:26755, 23:37837, 22:53510}
+RMS_INV_W = int(os.environ.get('RMS_INV_W', '16'))    # 16 = RTL Q5.12; >16 = widened
+RMS_INV_MAX = (1 << RMS_INV_W) - 1
+# Extended seed LUT — fills in entries the RTL table currently saturates on.
+SEED = {}
+for _msb in range(0, 32):
+    _v_approx = 1.5 * (2.0 ** (_msb - 30))
+    _seed = round((1.0 / math.sqrt(_v_approx)) * 4096)
+    SEED[_msb] = min(_seed, RMS_INV_MAX)
+# RTL's actual narrow table (covers msb 22..31 only); use for default width = 16.
+RTL_SEED = {31:2365, 30:3344, 29:4730, 28:6689, 27:9459, 26:13377,
+            25:18919, 24:26755, 23:37837, 22:53510}
 
 def rmsnorm_rtl(x_int, gamma_scaled):
     EPS_Q30 = 10737
@@ -45,14 +71,17 @@ def rmsnorm_rtl(x_int, gamma_scaled):
     sum_sq = int(np.sum(x_int.astype(np.int64) ** 2))
     v_q30 = ((sum_sq * INV_D_Q32) >> 32) + EPS_Q30
     v_msb = (int.bit_length(int(v_q30)) - 1) if v_q30 > 0 else 0
-    inv_rms = SEED.get(v_msb, 65535)
+    if RMS_INV_W == 16:
+        inv_rms = RTL_SEED.get(v_msb, 65535)
+    else:
+        inv_rms = SEED.get(v_msb, RMS_INV_MAX)
     C_1P5_Q30 = (3 * (1 << 30)) // 2
     for _ in range(3):
         y_sq = inv_rms * inv_rms
         vy2 = v_q30 * y_sq
         vy2_q30 = vy2 >> 24
         corr = 0 if vy2_q30 >= (1 << 32) else max(0, C_1P5_Q30 - (vy2_q30 >> 1))
-        inv_rms = min((inv_rms * corr + (1 << 29)) >> 30, 65535)
+        inv_rms = min((inv_rms * corr + (1 << 29)) >> 30, RMS_INV_MAX)
     g_int = np.clip(np.floor(gamma_scaled * 32768).astype(np.int64), -32768, 32767)
     return np.clip((x_int.astype(np.int64) * g_int * inv_rms) >> 27,
                    -32768, 32767).astype(np.int16)
@@ -166,9 +195,10 @@ def fwd(h_int, lw, lsc, h_in_p2, h1_p2, h_out_p2, pos, kv, kv_pos, cfg):
         h_real = h_int.astype(np.float64) * s_in / 32768.0
         n1 = qfloor(S.rmsnorm(h_real, lw['g1']), lsc['norm1'])
 
-    q = S.matvec_int8(n1, lsc['norm1'], lw['Wq'], lw['Wq_r'], lsc['q'])
-    k = S.matvec_int8(n1, lsc['norm1'], lw['Wk'], lw['Wk_r'], lsc['k'])
-    v = S.matvec_int8(n1, lsc['norm1'], lw['Wv'], lw['Wv_r'], lsc['v'])
+    mv = matvec_int8_rtl if has('matvec') else S.matvec_int8
+    q = mv(n1, lsc['norm1'], lw['Wq'], lw['Wq_r'], lsc['q'])
+    k = mv(n1, lsc['norm1'], lw['Wk'], lw['Wk_r'], lsc['k'])
+    v = mv(n1, lsc['norm1'], lw['Wv'], lw['Wv_r'], lsc['v'])
     qr = S.dequantize_q15(q, lsc['q']); kr = S.dequantize_q15(k, lsc['k']); vr = S.dequantize_q15(v, lsc['v'])
     for h in range(H_Q):  qr[h*HD:(h+1)*HD] = rope_rtl(qr[h*HD:(h+1)*HD], pos)
     for h in range(H_KV): kr[h*HD:(h+1)*HD] = rope_rtl(kr[h*HD:(h+1)*HD], pos)
@@ -197,7 +227,7 @@ def fwd(h_int, lw, lsc, h_in_p2, h1_p2, h_out_p2, pos, kv, kv_pos, cfg):
             attn[h*HD:(h+1)*HD] += sm[t] * S.dequantize_q15(kv['v_int'][t,kvh], lsc['v'])
     attn_int = qfloor(attn, lsc['attn'])
 
-    o_int = S.matvec_int8(attn_int, lsc['attn'], lw['Wo'], lw['Wo_r'], lsc['attn']).astype(np.int64)
+    o_int = mv(attn_int, lsc['attn'], lw['Wo'], lw['Wo_r'], lsc['attn']).astype(np.int64)
 
     # --- Residual 1 ---
     r1f = int(round(lsc['attn'] / s_h1 * 256.0))
@@ -212,8 +242,8 @@ def fwd(h_int, lw, lsc, h_in_p2, h1_p2, h_out_p2, pos, kv, kv_pos, cfg):
         h1_real = h1_int.astype(np.float64) * s_h1 / 32768.0
         n2 = qfloor(S.rmsnorm(h1_real, lw['g2']), lsc['norm2'])
 
-    g = S.matvec_int8(n2, lsc['norm2'], lw['Wg'], lw['Wg_r'], lsc['gate'])
-    u = S.matvec_int8(n2, lsc['norm2'], lw['Wu'], lw['Wu_r'], lsc['up'])
+    g = mv(n2, lsc['norm2'], lw['Wg'], lw['Wg_r'], lsc['gate'])
+    u = mv(n2, lsc['norm2'], lw['Wu'], lw['Wu_r'], lsc['up'])
 
     # --- SwiGLU with RTL LUT + saturated factors ---
     if has('silu') or has('swiglu_fac'):
@@ -223,7 +253,7 @@ def fwd(h_int, lw, lsc, h_in_p2, h1_p2, h_out_p2, pos, kv, kv_pos, cfg):
         mlp_real = S.silu(S.dequantize_q15(g, lsc['gate'])) * S.dequantize_q15(u, lsc['up'])
         mlp_int = qfloor(mlp_real, lsc['mlp'])
 
-    d_int = S.matvec_int8(mlp_int, lsc['mlp'], lw['Wd'], lw['Wd_r'], lsc['down']).astype(np.int64)
+    d_int = mv(mlp_int, lsc['mlp'], lw['Wd'], lw['Wd_r'], lsc['down']).astype(np.int64)
 
     # --- Residual 2 ---
     r2f = int(round(lsc['down'] / s_out * 256.0))
