@@ -288,6 +288,12 @@ module rmsnorm #(
               inv_rms <= nr_y_new;    // NR iteration 3 — final value
               out_cnt <= '0;
               state   <= S_OUTPUT;
+`ifdef MICROGPT_RMS_PROBE
+              // Each rmsnorm call dumps: v_q30, v_msb, final inv_rms.
+              // Use to bisect Python emulator vs RTL when inv_rms saturates.
+              $display("RMS_PROBE  v_q30=%0d  v_msb=%0d  inv_rms=%0d",
+                       v_q30, v_msb, nr_y_new);
+`endif
             end
 
             default: state <= S_IDLE;

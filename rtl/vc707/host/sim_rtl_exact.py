@@ -385,7 +385,7 @@ def fwd(h_int, lw, lsc, h_in_p2, h1_p2, h_out_p2, pos, kv, kv_pos, cfg):
 def main():
     tok = AutoTokenizer.from_pretrained(S.MODEL)
     model = AutoModelForCausalLM.from_pretrained(S.MODEL, torch_dtype=torch.float32).eval()
-    cfg = dict(D=576, H_Q=9, H_KV=3, HD=64, FFN=1536, NL=30, MAX_CTX=64)
+    cfg = dict(D=576, H_Q=9, H_KV=3, HD=64, FFN=1536, NL=30, MAX_CTX=4)
     sc = S.calibrate(model, tok, 'Once upon a time there was a princess.', margin=1.5)
 
     h_p2 = [(S.pow2(sc[li].get('hidden_in',1.0)),
@@ -427,9 +427,42 @@ def main():
     sc = eff_sc   # USE eff_sc throughout — matches RTL per-row brom scaling
 
     ids = tok('Once upon a time', return_tensors='pt').input_ids[0].tolist()
-    kv = [{'k_int': np.zeros((cfg['MAX_CTX'], cfg['H_KV'], cfg['HD']), dtype=np.int16),
-           'v_int': np.zeros((cfg['MAX_CTX'], cfg['H_KV'], cfg['HD']), dtype=np.int16)} for _ in range(30)]
-    for step, tid in enumerate(ids):
+    # RTL reads its initial KV cache from K_CACHE_INIT.hex / V_CACHE_INIT.hex
+    # (computed by gen_smollm_blockfp with FP rmsnorm).  To match RTL exactly
+    # for the pos=3 forward, preload those values.  RTL_KV_PRELOAD=1 turns this
+    # on (default) — set to 0 to compute KV from scratch like Python sim.
+    PRELOAD = int(os.environ.get('RTL_KV_PRELOAD', '1'))
+    kv = []
+    if PRELOAD:
+        def load_hex_int16(path, count):
+            vals = []
+            with open(path) as f:
+                for line in f:
+                    s = line.split('//')[0].strip()
+                    if s:
+                        v = int(s, 16)
+                        if v >= 32768: v -= 65536
+                        vals.append(v)
+            assert len(vals) >= count, f"{path}: {len(vals)} < {count}"
+            return np.array(vals[:count], dtype=np.int16)
+        ENTRIES_PER_LAYER = cfg['MAX_CTX'] * cfg['H_KV'] * cfg['HD']  # 4*3*64=768
+        TOTAL = 30 * ENTRIES_PER_LAYER
+        k_flat = load_hex_int16('generated/tm_layer_K_CACHE_INIT.hex', TOTAL)
+        v_flat = load_hex_int16('generated/tm_layer_V_CACHE_INIT.hex', TOTAL)
+        for li in range(30):
+            base = li * ENTRIES_PER_LAYER
+            k = k_flat[base:base+ENTRIES_PER_LAYER].reshape(cfg['MAX_CTX'], cfg['H_KV'], cfg['HD'])
+            v = v_flat[base:base+ENTRIES_PER_LAYER].reshape(cfg['MAX_CTX'], cfg['H_KV'], cfg['HD'])
+            kv.append({'k_int': k.astype(np.int16).copy(), 'v_int': v.astype(np.int16).copy()})
+        print(f'PRELOADED KV from hex; running ONLY pos=3 forward', file=sys.stderr)
+    else:
+        for _ in range(30):
+            kv.append({'k_int': np.zeros((cfg['MAX_CTX'], cfg['H_KV'], cfg['HD']), dtype=np.int16),
+                       'v_int': np.zeros((cfg['MAX_CTX'], cfg['H_KV'], cfg['HD']), dtype=np.int16)})
+    # If preloading KV, run ONLY the final pos=3 forward (matches RTL).
+    # Otherwise run all 4 forwards (matches sim_blockfp.py and original behaviour).
+    steps_to_run = [(len(ids)-1, ids[-1])] if PRELOAD else list(enumerate(ids))
+    for step, tid in steps_to_run:
         e_real = embed[tid].astype(np.float32)
         h = qfloor(e_real, float(1 << h_p2[0][0]))
         for li in range(30):
