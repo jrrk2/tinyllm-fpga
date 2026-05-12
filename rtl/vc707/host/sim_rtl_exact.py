@@ -350,7 +350,10 @@ def fwd(h_int, lw, lsc, h_in_p2, h1_p2, h_out_p2, pos, kv, kv_pos, cfg):
     o_int = mv(attn_int, lsc['attn'], lw['Wo'], lw['Wo_r'], lsc['attn']).astype(np.int64)
 
     # --- Residual 1 ---
-    r1f = int(round(lsc['attn'] / s_h1 * 256.0))
+    # CLAMP r1f to [1, 2^24-1] — matches gen_smollm_blockfp.py's max(1, min(..))
+    # Without the clamp, lsc[attn]/s_h1*256 rounds to 0 in mid-layers where
+    # s_h1 is huge (2^15), making h_out = h_in (no-op cascade).
+    r1f = max(1, min(int(round(lsc['attn'] / s_h1 * 256.0)), (1 << 24) - 1))
     sh1 = h1_p2 - h_in_p2
     hi_a = (h_int.astype(np.int64) >> sh1) if sh1 >= 0 else (h_int.astype(np.int64) << (-sh1))
     h1_int = np.clip(hi_a + ((o_int * r1f) >> 8), -32768, 32767).astype(np.int16)
@@ -376,7 +379,7 @@ def fwd(h_int, lw, lsc, h_in_p2, h1_p2, h_out_p2, pos, kv, kv_pos, cfg):
     d_int = mv(mlp_int, lsc['mlp'], lw['Wd'], lw['Wd_r'], lsc['down']).astype(np.int64)
 
     # --- Residual 2 ---
-    r2f = int(round(lsc['down'] / s_out * 256.0))
+    r2f = max(1, min(int(round(lsc['down'] / s_out * 256.0)), (1 << 24) - 1))
     sh2 = h_out_p2 - h1_p2
     h1_a = (h1_int.astype(np.int64) >> sh2) if sh2 >= 0 else (h1_int.astype(np.int64) << (-sh2))
     return np.clip(h1_a + ((d_int * r2f) >> 8), -32768, 32767).astype(np.int16)
