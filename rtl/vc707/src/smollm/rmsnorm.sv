@@ -14,12 +14,7 @@
 //   x*x      : Q2.30 unsigned per term, summed into 64-bit sum_sq
 //   mean_sq  : sum_sq >> LOG2D   (D must be a power of 2)
 //   v        : mean_sq[31:0] + EPS_Q30  (Q2.30, fits 32 bits)
-//   inv_rms  : 1/sqrt(v_real) in Q12.12 unsigned (24-bit) — max ≈ 4096
-//              Widened from Q5.12 (max 16) because SmolLM2 hidden state at
-//              h_p2 up to 15 yields v_msb in [13..21], where Q5.12 saturated
-//              at inv_rms=65535 (~16) — far below the true 100-300 range,
-//              undermagnituding the rmsnorm output and corrupting downstream
-//              layers.  Q12.12 covers msb ≥ 6 without clamping.
+//   inv_rms  : 1/sqrt(v_real) in Q5.12 unsigned (16-bit)
 //              32-entry LUT seed + 3 NR iterations → ≤ ±1 LSB vs numpy
 //   y[i]     : sat_q15( x[i] * gamma[i] * inv_rms >>> 27 )
 
@@ -58,7 +53,7 @@ module rmsnorm #(
 
   // NR state
   logic [31:0] v_q30;    // mean_sq + eps, Q2.30
-  logic [23:0] inv_rms;  // 1/sqrt(v_real) in Q12.12 unsigned (was Q5.12)
+  logic [15:0] inv_rms;  // 1/sqrt(v_real) in Q5.12 unsigned
   logic  [2:0] nr_cnt;   // 0: compute v, 1: load seed, 2-4: 3 NR iters
 
   typedef enum logic [2:0] {S_IDLE, S_LOAD, S_COMPUTE, S_OUTPUT, S_DONE} state_t;
@@ -113,41 +108,24 @@ module rmsnorm #(
   end
 
   // -----------------------------------------------------------------------
-  // Combinational: 32-entry LUT → Q12.12 seed for 1/sqrt(v_q30).
-  // Entry msb: seed = round( 1/sqrt(1.5 * 2^(msb-30)) * 2^12 ), 24-bit clip.
-  // Q12.12 fits inv_rms up to ~4096; SmolLM2 forward sees msb ≥ 13 (inv_rms
-  // up to ~300), well within range.  msb ≤ 5 still saturates (24'hFFFFFF).
+  // Combinational: 32-entry LUT → Q5.12 seed for 1/sqrt(v_q30).
+  // Entry msb: seed = round( 1/sqrt(1.5 * 2^(msb-30)) * 2^12 ), clip 65535.
+  // For msb ≤ 21 inv_rms > 32 overflows Q5.12 → clamp; output saturates.
   // -----------------------------------------------------------------------
-  logic [23:0] y_seed;
+  logic [15:0] y_seed;
   always_comb begin : lut_seed
     case (v_msb)
-      5'd31: y_seed = 24'd2365;
-      5'd30: y_seed = 24'd3344;
-      5'd29: y_seed = 24'd4730;
-      5'd28: y_seed = 24'd6689;
-      5'd27: y_seed = 24'd9459;
-      5'd26: y_seed = 24'd13377;
-      5'd25: y_seed = 24'd18919;
-      5'd24: y_seed = 24'd26755;
-      5'd23: y_seed = 24'd37837;
-      5'd22: y_seed = 24'd53510;
-      5'd21: y_seed = 24'd75674;
-      5'd20: y_seed = 24'd107020;
-      5'd19: y_seed = 24'd151349;
-      5'd18: y_seed = 24'd214040;
-      5'd17: y_seed = 24'd302698;
-      5'd16: y_seed = 24'd428079;
-      5'd15: y_seed = 24'd605396;
-      5'd14: y_seed = 24'd856159;
-      5'd13: y_seed = 24'd1210791;
-      5'd12: y_seed = 24'd1712317;
-      5'd11: y_seed = 24'd2421583;
-      5'd10: y_seed = 24'd3424635;
-      5'd 9: y_seed = 24'd4843165;
-      5'd 8: y_seed = 24'd6849270;
-      5'd 7: y_seed = 24'd9686330;
-      5'd 6: y_seed = 24'd13698540;
-      default: y_seed = 24'hFFFFFF;  // msb ≤ 5: saturate Q12.12 (real-world unreached)
+      5'd31: y_seed = 16'd2365;
+      5'd30: y_seed = 16'd3344;
+      5'd29: y_seed = 16'd4730;
+      5'd28: y_seed = 16'd6689;
+      5'd27: y_seed = 16'd9459;
+      5'd26: y_seed = 16'd13377;
+      5'd25: y_seed = 16'd18919;
+      5'd24: y_seed = 16'd26755;
+      5'd23: y_seed = 16'd37837;
+      5'd22: y_seed = 16'd53510;
+      default: y_seed = 16'd65535;   // msb ≤ 21: inv_rms > 32, saturate
     endcase
   end
 
@@ -155,30 +133,30 @@ module rmsnorm #(
   // Combinational: Newton-Raphson iteration (one per clock in S_COMPUTE).
   //   y_{n+1} = y_n * (1.5 - 0.5 * v_real * y_n^2)
   //
-  // y in Q12.12 (unsigned 24-bit), v in Q2.30 (unsigned 32-bit):
-  //   y_sq      = y * y                     Q24.24  48-bit unsigned
-  //   vy2       = v * y_sq                  Q26.54  80-bit unsigned
-  //   vy2_q30   = vy2 >> 24                 56-bit (Q26.30 of v*y^2)
+  // y in Q5.12 (unsigned 16-bit), v in Q2.30 (unsigned 32-bit):
+  //   y_sq      = y * y                     Q10.24  32-bit unsigned
+  //   vy2       = v * y_sq                  Q12.54  64-bit unsigned
+  //   vy2_q30   = vy2 >> 24                 40-bit (Q2.30 of v*y^2)
   //   corr      = C_1P5_Q30 - vy2_q30>>1   signed 33-bit, clamped ≥ 0
-  //   y_new     = (y * corr + 2^29) >> 30   24-bit unsigned, clipped
+  //   y_new     = (y * corr + 2^29) >> 30   16-bit unsigned, clipped
   // -----------------------------------------------------------------------
   localparam logic [31:0] C_1P5_Q30 = 32'h6000_0000; // 1.5 * 2^30
 
-  logic [47:0]        nr_y_sq;
-  logic [79:0]        nr_vy2;
-  logic [55:0]        nr_vy2_q30;
+  logic [31:0]        nr_y_sq;
+  logic [63:0]        nr_vy2;
+  logic [39:0]        nr_vy2_q30;
   logic signed [32:0] nr_corr;
-  logic signed [57:0] nr_y_new_full;
-  logic [57:0]        nr_biased;
-  logic [23:0]        nr_y_new;
+  logic signed [48:0] nr_y_new_full;
+  logic [48:0]        nr_biased;
+  logic [15:0]        nr_y_new;
 
   always_comb begin : nr_datapath
-    nr_y_sq      = inv_rms * inv_rms;                              // 48-bit
-    nr_vy2       = {32'b0, v_q30} * {32'b0, nr_y_sq};              // 80-bit
-    nr_vy2_q30   = nr_vy2[79:24];                                  // 56-bit
+    nr_y_sq      = inv_rms * inv_rms;                              // 32-bit
+    nr_vy2       = {32'b0, v_q30} * {32'b0, nr_y_sq};             // 64-bit
+    nr_vy2_q30   = nr_vy2[63:24];                                  // 40-bit
 
     // correction = 1.5 - 0.5*v*y^2 in Q2.30, clamped to [0, 1.5_q30]
-    if (nr_vy2_q30[55:32] != 24'h0) begin
+    if (nr_vy2_q30[39:32] != 8'h00) begin
       // vy2_q30 overflows 32 bits → v*y^2 >> 4 → correction → 0
       nr_corr = 33'sb0;
     end else begin
@@ -187,36 +165,39 @@ module rmsnorm #(
       if (nr_corr < 0) nr_corr = 33'sb0;
     end
 
-    // y_new = round(y * correction / 2^30); clip to 24-bit unsigned
-    nr_y_new_full = $signed({1'b0, inv_rms}) * nr_corr;    // 25 × 33 = 58 bits
-    nr_biased     = $unsigned(nr_y_new_full) + 58'h0000_0000_2000_0000; // + 2^29
-    // Extract bits [53:30] as the 24-bit Q12.12 result; saturate on overflow
-    if (nr_biased[57:54] != 4'b0000)
-      nr_y_new = 24'hFFFFFF;
+    // y_new = round(y * correction / 2^30); clip to 16-bit unsigned
+    nr_y_new_full = $signed({1'b0, inv_rms}) * nr_corr;    // 16 × 33 = 49 bits
+    nr_biased     = $unsigned(nr_y_new_full) + 49'h0000_2000_0000; // + 2^29
+    // Extract bits [45:30] as the 16-bit Q5.12 result; saturate on overflow
+    if (nr_biased[48:46] != 3'b000)
+      nr_y_new = 16'hFFFF;
     else
-      nr_y_new = nr_biased[53:30];
+      nr_y_new = nr_biased[45:30];
   end
 
   // -----------------------------------------------------------------------
   // Output datapath: y[i] = sat_q15( x * gamma * inv_rms >>> 27 )
   //   xg     = x_int * g_int          Q2.30, signed 32-bit
-  //   xg_inv = xg * inv_rms_q12       Q14.42, signed 57-bit  (Q12.12 widened)
-  //   y_sh   = xg_inv >>> 27          Q14.15, signed 30-bit
+  //   xg_inv = xg * inv_rms_q12       Q7.42, signed 48-bit
+  //   y_sh   = xg_inv >>> 27          Q7.15, signed 21-bit
   //   sat    clamp to [-32768, 32767]
   // -----------------------------------------------------------------------
   logic signed [31:0] o_xg;
-  logic signed [56:0] o_xg_inv;
-  logic signed [29:0] o_y_shift;
+  logic signed [47:0] o_xg_inv;
+  logic signed [20:0] o_y_shift;
   logic signed [15:0] o_y_sat;
 
   always_comb begin : out_datapath
+    // Use full out_cnt — Sonnet's [CW-2:0] slice was a power-of-2-D
+    // optimisation that wraps for non-power-of-2 D (e.g. D=576 only
+    // addresses indices 0..511).
     o_xg     = $signed(x_mem[out_cnt]) * $signed(g_mem[out_cnt]);
-    o_xg_inv = o_xg * $signed({1'b0, inv_rms});   // signed 32 × signed 25 = 57-bit
-    o_y_shift = $signed(o_xg_inv[56:27]);          // arithmetic right shift by 27
+    o_xg_inv = o_xg * $signed({1'b0, inv_rms});   // signed × unsigned → signed 48-bit
+    o_y_shift = $signed(o_xg_inv[47:27]);          // arithmetic right shift by 27
 
-    if      (o_y_shift >  30'sd32767) o_y_sat = 16'sh7FFF;
-    else if (o_y_shift < -30'sd32768) o_y_sat = 16'sh8000;
-    else                              o_y_sat = o_y_shift[15:0];
+    if      (o_y_shift > $signed(21'sh007FFF)) o_y_sat = 16'sh7FFF;
+    else if (o_y_shift < $signed(21'shFF8000)) o_y_sat = 16'sh8000;
+    else                                        o_y_sat = o_y_shift[15:0];
   end
 
   // -----------------------------------------------------------------------

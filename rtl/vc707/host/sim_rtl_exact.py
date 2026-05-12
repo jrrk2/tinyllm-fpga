@@ -52,7 +52,7 @@ def matvec_int8_rtl(x_int16, x_scale, W_q8, W_rsc, out_scale):
 # RTL RMSNorm — Q5.12 inv_rms + msb LUT seed + 3 NR iterations
 # Gamma is pre-scaled by 1/lsc[norm] (matches fold_gamma in gen_smollm_blockfp)
 # ---------------------------------------------------------------------------
-RMS_INV_W = int(os.environ.get('RMS_INV_W', '24'))    # 24 = RTL Q12.12 (post-widening); 16 = old Q5.12
+RMS_INV_W = int(os.environ.get('RMS_INV_W', '16'))    # 16 = RTL Q5.12; >16 = widened
 RMS_INV_MAX = (1 << RMS_INV_W) - 1
 # Extended seed LUT — fills in entries the RTL table currently saturates on.
 SEED = {}
