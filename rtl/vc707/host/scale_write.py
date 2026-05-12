@@ -8,18 +8,20 @@ Protocol:
              to the brom whose kind matches; that brom writes its port B.
 
 Kind mapping (matches smollm_layer.sv decode):
-   0=Q  1=K  2=V  3=O  4=GATE  5=UP  6=DOWN
+   0=Q  1=K  2=V  3=O  4=GATE  5=UP  6=DOWN  7=GAMMA1  8=GAMMA2
 
 Address layout per matrix (entries are interleaved by layer):
-   Q,O,DOWN:   layer*D + row   (D=576, NL=30, max=17280)
-   K,V:        layer*H_KV*HD + row  (H_KV=3, HD=64, max=5760)
-   GATE,UP:    layer*FFN + row (FFN=1536, max=46080)
+   Q,O,DOWN:        layer*D + row   (D=576, NL=30, max=17280)
+   K,V:             layer*H_KV*HD + row  (H_KV=3, HD=64, max=5760)
+   GATE,UP:         layer*FFN + row (FFN=1536, max=46080)
+   GAMMA1,GAMMA2:   layer*D + lane  (D=576, NL=30, max=17280)
 """
 import argparse, socket, struct, sys, time
 
 PEER = ("192.168.1.42", 19783)
 
-KINDS = {"Q":0, "K":1, "V":2, "O":3, "GATE":4, "UP":5, "DOWN":6}
+KINDS = {"Q":0, "K":1, "V":2, "O":3, "GATE":4, "UP":5, "DOWN":6,
+         "GAMMA1":7, "GAMMA2":8}
 
 _seq = [0]
 def nxt():

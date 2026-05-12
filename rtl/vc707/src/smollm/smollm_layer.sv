@@ -205,6 +205,8 @@ module smollm_layer #(
   wire wr_en_gate = scale_wr_en && (scale_wr_kind == 4'd4);
   wire wr_en_up   = scale_wr_en && (scale_wr_kind == 4'd5);
   wire wr_en_down = scale_wr_en && (scale_wr_kind == 4'd6);
+  wire wr_en_g1   = scale_wr_en && (scale_wr_kind == 4'd7);
+  wire wr_en_g2   = scale_wr_en && (scale_wr_kind == 4'd8);
 
   brom_SCALE_Q    i_brom_S_Q    (.clk(clk), .addr(addr_s_q),    .data(data_s_q),
     .wr_addr(scale_wr_addr[SQ_AW-1:0]),   .wr_data(scale_wr_data), .wr_en(wr_en_q));
@@ -443,8 +445,10 @@ module smollm_layer #(
   localparam int GAMMA_AW = $clog2(NL*D);
   logic [GAMMA_AW-1:0] addr_gamma1, addr_gamma2;
   wire signed [15:0]   data_gamma1, data_gamma2;
-  brom_GAMMA1 i_brom_GAMMA1 (.clk(clk), .addr(addr_gamma1), .data(data_gamma1));
-  brom_GAMMA2 i_brom_GAMMA2 (.clk(clk), .addr(addr_gamma2), .data(data_gamma2));
+  brom_GAMMA1 i_brom_GAMMA1 (.clk(clk), .addr(addr_gamma1), .data(data_gamma1),
+    .wr_addr(scale_wr_addr[GAMMA_AW-1:0]), .wr_data(scale_wr_data), .wr_en(wr_en_g1));
+  brom_GAMMA2 i_brom_GAMMA2 (.clk(clk), .addr(addr_gamma2), .data(data_gamma2),
+    .wr_addr(scale_wr_addr[GAMMA_AW-1:0]), .wr_data(scale_wr_data), .wr_en(wr_en_g2));
 
   // BRAM addresses driven combinationally from cnt; the brom's internal
   // RAMB36E1 addr register provides the 1-cycle latency that the

@@ -35,6 +35,8 @@ module RAMB36E1 #(
   parameter integer     WRITE_WIDTH_B   = 0,
   parameter integer     DOA_REG         = 0,
   parameter integer     DOB_REG         = 0,
+  parameter             WRITE_MODE_A    = "WRITE_FIRST",
+  parameter             WRITE_MODE_B    = "WRITE_FIRST",
   parameter             EN_ECC_READ     = "FALSE",
   parameter             EN_ECC_WRITE    = "FALSE",
   parameter             RAM_EXTENSION_A = "NONE",

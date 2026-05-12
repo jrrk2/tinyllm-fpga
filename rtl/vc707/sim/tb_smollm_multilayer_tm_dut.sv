@@ -55,7 +55,7 @@ module tb_smollm_multilayer_tm_dut #(
     .hidden_in(hidden_in),
     .hidden_out(hidden_out),
     .done(done),
-    // Verilator test: NL → live final hidden_state (legacy behaviour).
+    // tb default: select NL (=live final hidden_state, legacy behaviour).
     .snapshot_layer_sel(5'd31),
     .factor_wr_layer         (5'd0),
     .factor_wr_data          (32'd0),
