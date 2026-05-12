@@ -44,7 +44,11 @@ module smollm_multilayer_tm_selftest #(
   input  wire                          factor_wr_en_swiglu_mlp,
   input  wire                          factor_wr_en_attn,
   input  wire [6:0]                    factor_rd_sel,
-  output wire [31:0]                   factor_rd_data
+  output wire [31:0]                   factor_rd_data,
+  input  wire [3:0]                    scale_wr_kind,
+  input  wire [15:0]                   scale_wr_addr,
+  input  wire [15:0]                   scale_wr_data,
+  input  wire                          scale_wr_en
 
 `ifdef MICROGPT_DDR3_WEIGHTS
   ,
@@ -151,7 +155,11 @@ module smollm_multilayer_tm_selftest #(
     .factor_rd_data         (factor_rd_data),
     // factor_ram only resets on system rst, NOT on user restart — so the
     // runtime tweaks survive REG_RESTART triggering a new inference run.
-    .factor_ram_por_init    (rst)
+    .factor_ram_por_init    (rst),
+    .scale_wr_kind          (scale_wr_kind),
+    .scale_wr_addr          (scale_wr_addr),
+    .scale_wr_data          (scale_wr_data),
+    .scale_wr_en            (scale_wr_en)
 `ifdef MICROGPT_DDR3_WEIGHTS
     ,
     .clk_axi(clk_axi), .rst_axi(rst_axi),

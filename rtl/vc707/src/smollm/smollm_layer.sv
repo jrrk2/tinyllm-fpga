@@ -56,7 +56,14 @@ module smollm_layer #(
   input  wire [15:0]          sg_gate_in_factor,   // lsc[gate]/SILU_LUT_SCALE  Q1.15
   input  wire [15:0]          sg_up_in_factor,     // lsc[up]/SILU_LUT_SCALE    Q1.15
   input  wire [23:0]          sg_mlp_out_factor,   // SILU_LUT_SCALE^2/lsc[mlp] Q16.8
-  input  wire [23:0]          attn_factor          // lsc[v]/lsc[attn]          Q16.8
+  input  wire [23:0]          attn_factor,         // lsc[v]/lsc[attn]          Q16.8
+  // Host-write port for per-row scale brom overrides.  Defaults still
+  // load from .INIT_xx params at config; runtime writes overlay specific
+  // (matrix, entry) slots.  kind: 0=Q 1=K 2=V 3=O 4=GATE 5=UP 6=DOWN.
+  input  wire [3:0]           scale_wr_kind,
+  input  wire [15:0]          scale_wr_addr,
+  input  wire [15:0]          scale_wr_data,
+  input  wire                 scale_wr_en
 `ifdef MICROGPT_DDR3_WEIGHTS
   ,
   // ILA probe taps — named exports, wired to ila instances in the top.
@@ -187,13 +194,32 @@ module smollm_layer #(
   wire  [15:0]        data_s_q, data_s_k, data_s_v, data_s_o;
   wire  [15:0]        data_s_gate, data_s_up, data_s_down;
 
-  brom_SCALE_Q    i_brom_S_Q    (.clk(clk), .addr(addr_s_q),    .data(data_s_q));
-  brom_SCALE_K    i_brom_S_K    (.clk(clk), .addr(addr_s_k),    .data(data_s_k));
-  brom_SCALE_V    i_brom_S_V    (.clk(clk), .addr(addr_s_v),    .data(data_s_v));
-  brom_SCALE_O    i_brom_S_O    (.clk(clk), .addr(addr_s_o),    .data(data_s_o));
-  brom_SCALE_GATE i_brom_S_GATE (.clk(clk), .addr(addr_s_gate), .data(data_s_gate));
-  brom_SCALE_UP   i_brom_S_UP   (.clk(clk), .addr(addr_s_up),   .data(data_s_up));
-  brom_SCALE_DOWN i_brom_S_DOWN (.clk(clk), .addr(addr_s_down), .data(data_s_down));
+  // Scale-BRAM writes from host: scale_wr_kind selects matrix
+  // (0=Q 1=K 2=V 3=O 4=GATE 5=UP 6=DOWN), addr is the per-matrix entry,
+  // data is the 16-bit replacement scale.  Defaults still come from
+  // .INIT_xx params; runtime writes overlay specific entries.
+  wire wr_en_q    = scale_wr_en && (scale_wr_kind == 4'd0);
+  wire wr_en_k    = scale_wr_en && (scale_wr_kind == 4'd1);
+  wire wr_en_v    = scale_wr_en && (scale_wr_kind == 4'd2);
+  wire wr_en_o    = scale_wr_en && (scale_wr_kind == 4'd3);
+  wire wr_en_gate = scale_wr_en && (scale_wr_kind == 4'd4);
+  wire wr_en_up   = scale_wr_en && (scale_wr_kind == 4'd5);
+  wire wr_en_down = scale_wr_en && (scale_wr_kind == 4'd6);
+
+  brom_SCALE_Q    i_brom_S_Q    (.clk(clk), .addr(addr_s_q),    .data(data_s_q),
+    .wr_addr(scale_wr_addr[SQ_AW-1:0]),   .wr_data(scale_wr_data), .wr_en(wr_en_q));
+  brom_SCALE_K    i_brom_S_K    (.clk(clk), .addr(addr_s_k),    .data(data_s_k),
+    .wr_addr(scale_wr_addr[SKV_AW-1:0]),  .wr_data(scale_wr_data), .wr_en(wr_en_k));
+  brom_SCALE_V    i_brom_S_V    (.clk(clk), .addr(addr_s_v),    .data(data_s_v),
+    .wr_addr(scale_wr_addr[SKV_AW-1:0]),  .wr_data(scale_wr_data), .wr_en(wr_en_v));
+  brom_SCALE_O    i_brom_S_O    (.clk(clk), .addr(addr_s_o),    .data(data_s_o),
+    .wr_addr(scale_wr_addr[SQ_AW-1:0]),   .wr_data(scale_wr_data), .wr_en(wr_en_o));
+  brom_SCALE_GATE i_brom_S_GATE (.clk(clk), .addr(addr_s_gate), .data(data_s_gate),
+    .wr_addr(scale_wr_addr[SFFN_AW-1:0]), .wr_data(scale_wr_data), .wr_en(wr_en_gate));
+  brom_SCALE_UP   i_brom_S_UP   (.clk(clk), .addr(addr_s_up),   .data(data_s_up),
+    .wr_addr(scale_wr_addr[SFFN_AW-1:0]), .wr_data(scale_wr_data), .wr_en(wr_en_up));
+  brom_SCALE_DOWN i_brom_S_DOWN (.clk(clk), .addr(addr_s_down), .data(data_s_down),
+    .wr_addr(scale_wr_addr[SQ_AW-1:0]),   .wr_data(scale_wr_data), .wr_en(wr_en_down));
 
   // ------------------------------------------------------------------------
   //  Weight streamer.

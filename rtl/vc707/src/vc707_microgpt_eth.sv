@@ -471,6 +471,14 @@ module vc707_microgpt_eth (
   // factor_rd_data at the next address.  Forces Vivado to keep the
   // override-RAM observable so the entire write path can't be DCE'd.
   reg [6:0]  factor_rd_sel_eth;
+
+  // Per-row scale brom override regs.  Host writes 0x01C with
+  // {kind[3:0], addr[15:0]}, then 0x01D with the 16-bit data — that
+  // second write fires a one-cycle scale_wr_en pulse on the core side.
+  reg [3:0]  scale_wr_kind_eth;
+  reg [15:0] scale_wr_addr_eth;
+  reg [15:0] scale_wr_data_eth;
+  reg        scale_wr_toggle_eth;
   reg start_sync0 = 1'b0, start_sync1 = 1'b0, start_seen_reg = 1'b0;
   reg clear_sync0 = 1'b0, clear_sync1 = 1'b0, clear_seen_reg = 1'b0;
   reg step_sync0 = 1'b0, step_sync1 = 1'b0, step_seen_reg = 1'b0;
@@ -847,6 +855,31 @@ module vc707_microgpt_eth (
     factor_rd_data_eth_s1 <= factor_rd_data_eth_s0;
   end
 
+  // Per-row scale write CDC — same toggle-handshake pattern as factor_wr.
+  reg        scale_wr_tog_s0, scale_wr_tog_s1, scale_wr_tog_s2;
+  reg [3:0]  scale_wr_kind_core;
+  reg [15:0] scale_wr_addr_core, scale_wr_data_core;
+  wire       scale_wr_edge_core = scale_wr_tog_s1 ^ scale_wr_tog_s2;
+  always @(posedge core_clk or negedge core_resetn) begin
+    if (!core_resetn) begin
+      scale_wr_tog_s0 <= 1'b0; scale_wr_tog_s1 <= 1'b0; scale_wr_tog_s2 <= 1'b0;
+    end else begin
+      scale_wr_tog_s0 <= scale_wr_toggle_eth;
+      scale_wr_tog_s1 <= scale_wr_tog_s0;
+      scale_wr_tog_s2 <= scale_wr_tog_s1;
+      if (scale_wr_edge_core) begin
+        scale_wr_kind_core <= scale_wr_kind_eth;
+        scale_wr_addr_core <= scale_wr_addr_eth;
+        scale_wr_data_core <= scale_wr_data_eth;
+      end
+    end
+  end
+  reg scale_wr_pulse_core;
+  always @(posedge core_clk or negedge core_resetn) begin
+    if (!core_resetn) scale_wr_pulse_core <= 1'b0;
+    else              scale_wr_pulse_core <= scale_wr_edge_core;
+  end
+
   smollm_multilayer_tm_selftest i_lay_st (
     .clk                ( core_clk         ),
     .rst                ( ~core_resetn     ),
@@ -861,6 +894,10 @@ module vc707_microgpt_eth (
     .factor_wr_en_attn       ( factor_wr_en_attn_core       ),
     .factor_rd_sel           ( factor_rd_sel_core           ),
     .factor_rd_data          ( factor_rd_data_core          ),
+    .scale_wr_kind           ( scale_wr_kind_core           ),
+    .scale_wr_addr           ( scale_wr_addr_core           ),
+    .scale_wr_data           ( scale_wr_data_core           ),
+    .scale_wr_en             ( scale_wr_pulse_core          ),
 
     .clk_axi ( ui_clk                                  ),
     .rst_axi ( ui_clk_sync_rst | ~init_calib_complete  ),
@@ -997,6 +1034,10 @@ module vc707_microgpt_eth (
       factor_wr_kind_eth   <= '0;
       factor_wr_toggle_eth <= 1'b0;
       factor_rd_sel_eth    <= '0;
+      scale_wr_kind_eth    <= '0;
+      scale_wr_addr_eth    <= '0;
+      scale_wr_data_eth    <= '0;
+      scale_wr_toggle_eth  <= 1'b0;
     end
 
     if (read_pending_reg) begin
@@ -1078,6 +1119,14 @@ module vc707_microgpt_eth (
         // Factor readback select.  Host writes {kind[1:0], layer[4:0]} here,
         // then reads 0x00F to get the factor value back.
         factor_rd_sel_eth <= jtag_master_writedata[6:0];
+      end else if (jtag_word_addr == 10'h01C) begin
+        // Scale brom write: stage {kind[3:0], addr[15:0]}.
+        scale_wr_addr_eth <= jtag_master_writedata[15:0];
+        scale_wr_kind_eth <= jtag_master_writedata[19:16];
+      end else if (jtag_word_addr == 10'h01D) begin
+        // Scale brom write trigger: capture data + toggle handshake.
+        scale_wr_data_eth   <= jtag_master_writedata[15:0];
+        scale_wr_toggle_eth <= ~scale_wr_toggle_eth;
       end
     end
   end

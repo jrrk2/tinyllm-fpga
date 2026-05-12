@@ -69,7 +69,13 @@ module smollm_multilayer_tm #(
   output wire [31:0]             factor_rd_data,
   // Power-on-only init pulse for the factor RAM (does NOT toggle on
   // user-triggered restart).  Driven from selftest by a startup SR.
-  input  wire                    factor_ram_por_init
+  input  wire                    factor_ram_por_init,
+  // Per-row scale brom overrides — kind selects matrix, addr indexes
+  // entry, data is the replacement 16-bit scale value.
+  input  wire [3:0]              scale_wr_kind,
+  input  wire [15:0]             scale_wr_addr,
+  input  wire [15:0]             scale_wr_data,
+  input  wire                    scale_wr_en
 `ifdef MICROGPT_DDR3_WEIGHTS
   ,
   input  wire                        clk_axi,
@@ -217,7 +223,11 @@ module smollm_multilayer_tm #(
     .sg_gate_in_factor(cur_sg_gate_in_factor),
     .sg_up_in_factor  (cur_sg_up_in_factor),
     .sg_mlp_out_factor(cur_sg_mlp_out_factor),
-    .attn_factor      (cur_attn_factor)
+    .attn_factor      (cur_attn_factor),
+    .scale_wr_kind    (scale_wr_kind),
+    .scale_wr_addr    (scale_wr_addr),
+    .scale_wr_data    (scale_wr_data),
+    .scale_wr_en      (scale_wr_en)
 `ifdef MICROGPT_DDR3_WEIGHTS
     ,
     .clk_axi(clk_axi), .rst_axi(rst_axi),

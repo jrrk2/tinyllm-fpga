@@ -48,16 +48,18 @@ def init_strings(slab: list[int]) -> list[str]:
 
 
 def emit_ramb36(name: str, inits: list[str], indent="  ") -> list[str]:
-    """Emit one RAMB36E1 #(...) i_<name> (...) instance in 2K x 18 TDP
-    read-only mode.  addr_11 is an 11-bit address signal name; douta is
-    a 32-bit wire receiving DOADO."""
+    """Emit one RAMB36E1 #(...) i_<name> (...) instance in 2K x 18 TDP mode:
+    port A = read (16-bit data + 2 parity), port B = write (host override
+    from Ethernet — see scale_wr_* signals in smollm_layer.sv).  Defaults
+    loaded from .INIT_xx parameters at config time; host writes overlay
+    those defaults at runtime without rebuilding the bitstream."""
     L = []
     L.append(f"{indent}RAMB36E1 #(")
     L.append(f'{indent}  .RAM_MODE("TDP"),')
     L.append(f"{indent}  .READ_WIDTH_A(18),")
     L.append(f"{indent}  .WRITE_WIDTH_A(0),")
     L.append(f"{indent}  .READ_WIDTH_B(0),")
-    L.append(f"{indent}  .WRITE_WIDTH_B(0),")
+    L.append(f"{indent}  .WRITE_WIDTH_B(18),")
     L.append(f"{indent}  .DOA_REG(0),")
     L.append(f"{indent}  .DOB_REG(0),")
     L.append(f'{indent}  .EN_ECC_READ("FALSE"),')
@@ -67,6 +69,8 @@ def emit_ramb36(name: str, inits: list[str], indent="  ") -> list[str]:
     L.append(f'{indent}  .SIM_DEVICE("7SERIES"),')
     L.append(f"{indent}  .INIT_A(36'h0), .INIT_B(36'h0),")
     L.append(f"{indent}  .SRVAL_A(36'h0), .SRVAL_B(36'h0),")
+    L.append(f'{indent}  .WRITE_MODE_A("WRITE_FIRST"),')
+    L.append(f'{indent}  .WRITE_MODE_B("WRITE_FIRST"),')
     for i, s in enumerate(inits):
         L.append(f"{indent}  .INIT_{i:02X}(256'h{s}),")
     for i in range(16):
@@ -74,19 +78,19 @@ def emit_ramb36(name: str, inits: list[str], indent="  ") -> list[str]:
         L.append(f"{indent}  .INITP_{i:02X}(256'h0){comma}")
     L.append(f"{indent}) i_{name} (")
     L.append(f"{indent}  .CLKARDCLK(clk), .CLKBWRCLK(clk),")
-    L.append(f"{indent}  .ENARDEN(1'b1), .ENBWREN(1'b0),")
+    L.append(f"{indent}  .ENARDEN(1'b1), .ENBWREN({name}_wr_en_b),")
     L.append(f"{indent}  .REGCEAREGCE(1'b1), .REGCEB(1'b0),")
     L.append(f"{indent}  .RSTRAMARSTRAM(1'b0), .RSTRAMB(1'b0),")
     L.append(f"{indent}  .RSTREGARSTREG(1'b0), .RSTREGB(1'b0),")
     L.append(f"{indent}  .CASCADEINA(1'b0), .CASCADEINB(1'b0),")
     L.append(f"{indent}  .INJECTSBITERR(1'b0), .INJECTDBITERR(1'b0),")
-    L.append(f"{indent}  // 2Kx18 mode: ADDRARDADDR[14:4] = addr; [3:0] tied 0;")
+    L.append(f"{indent}  // 2Kx18 mode: ADDR[14:4] = entry; [3:0] tied 0;")
     L.append(f"{indent}  // bit[15] tied 1 (no cascade).")
     L.append(f"{indent}  .ADDRARDADDR({{1'b1, {name}_addr_11, 4'b0}}),")
-    L.append(f"{indent}  .ADDRBWRADDR(16'h8000),")
+    L.append(f"{indent}  .ADDRBWRADDR({{1'b1, wr_addr_11, 4'b0}}),")
     L.append(f"{indent}  .DIADI(32'b0), .DIPADIP(4'b0),")
-    L.append(f"{indent}  .DIBDI(32'b0), .DIPBDIP(4'b0),")
-    L.append(f"{indent}  .WEA(4'b0), .WEBWE(8'b0),")
+    L.append(f"{indent}  .DIBDI({{16'b0, wr_data}}), .DIPBDIP(4'b0),")
+    L.append(f"{indent}  .WEA(4'b0), .WEBWE({{6'b0, {{2{{{name}_wr_en_b}}}}}}),")
     L.append(f"{indent}  .DOADO({name}_dout), .DOPADOP(),")
     L.append(f"{indent}  .DOBDO(), .DOPBDOP(),")
     # Unused outputs — tied off to silence Vivado Synth 8-7023 warnings.
@@ -114,19 +118,27 @@ def gen_module(entries: list[int], mod_name: str, mem_file: str) -> str:
     L.append(f"module {mod_name} (")
     L.append(f"  input  wire             clk,")
     L.append(f"  input  wire [{aw-1:>2}:0]   addr,")
-    L.append(f"  output wire [15:0]      data")
+    L.append(f"  output wire [15:0]      data,")
+    L.append(f"  // Host-write port (port B of the underlying RAMB36E1s)")
+    L.append(f"  input  wire [{aw-1:>2}:0]   wr_addr,")
+    L.append(f"  input  wire [15:0]      wr_data,")
+    L.append(f"  input  wire             wr_en")
     L.append(f");")
     L.append(f"")
     L.append(f"  // Sim flow picks up sim/ramb36e1_stub.sv (gated on `VERILATOR`)")
-    L.append(f"  // which models the same 2K x 18 read-only behaviour Vivado uses.")
-    L.append(f"  // No `ifdef branching here so simulation and synthesis exercise")
-    L.append(f"  // the identical wrapper logic.")
+    L.append(f"  // which models the same 2K x 18 TDP behaviour Vivado uses.")
     L.append(f"")
+    L.append(f"  wire [10:0] wr_addr_11 = wr_addr[10:0];")
 
-    # One 32-bit DOADO per BRAM
+    # One 32-bit DOADO per BRAM + per-BRAM write enable
     for b in range(nbr):
         L.append(f"  wire [31:0] b{b}_dout;")
         L.append(f"  wire [10:0] b{b}_addr_11 = addr[10:0];")
+    if nbr == 1:
+        L.append(f"  wire b0_wr_en_b = wr_en;")
+    else:
+        for b in range(nbr):
+            L.append(f"  wire b{b}_wr_en_b = wr_en && (wr_addr[{aw-1}:11] == {bsel}'d{b});")
 
     L.append(f"")
     # Emit RAMB36E1 instances

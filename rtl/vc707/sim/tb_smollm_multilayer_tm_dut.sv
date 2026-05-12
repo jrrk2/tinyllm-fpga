@@ -65,6 +65,10 @@ module tb_smollm_multilayer_tm_dut #(
     .factor_rd_sel           (7'b0),
     .factor_rd_data          (/* unused */),
     .factor_ram_por_init     (rst),
+    .scale_wr_kind           (4'b0),
+    .scale_wr_addr           (16'b0),
+    .scale_wr_data           (16'b0),
+    .scale_wr_en             (1'b0),
     // Single-clock test: tie clk_axi=clk, rst_axi=rst.
     .clk_axi(clk), .rst_axi(rst),
     .m_axi_arvalid(arvalid), .m_axi_arready(arready),
