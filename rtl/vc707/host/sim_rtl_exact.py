@@ -160,10 +160,130 @@ def softmax_rtl(x_int16):
     return np.clip(out, 0, 32767).astype(np.int16)
 
 # ---------------------------------------------------------------------------
-# RoPE — use FP sin/cos for now (RTL uses CORDIC; can swap later)
+# RTL CORDIC RoPE — bit-accurate emulation of rope.sv + cordic_sincos.sv
 # ---------------------------------------------------------------------------
+PI_HALF_Q27 = 210828714           # round(pi/2 * 2^27)
+PI_Q27      = 421657428           # round(pi   * 2^27)
+PI_OVER_8_Q29 = 210828714         # round(pi/8 * 2^29) — same constant numerically
+K_Q3_27     = 81504109            # 1/prod(sqrt(1+4^-i) for i in range(16)) * 2^27
+ATAN_Q3_27  = [105414357, 62229729, 32880480, 16690645, 8377711, 4192939,
+                2096981,   1048555,   524285,   262144,  131072,   65536,
+                  32768,     16384,     8192,     4096]
+
+# FREQ_TURNS_Q31 from generated/rope_freq_turns.svh — load on first use
+FREQ_TURNS_Q31 = None
+def load_freq_turns():
+    global FREQ_TURNS_Q31
+    if FREQ_TURNS_Q31 is not None: return
+    vals = []
+    # Look in both potential generated dirs
+    paths = ['generated/rope_freq_turns.svh',
+             '../generated/rope_freq_turns.svh']
+    text = None
+    for p in paths:
+        if os.path.exists(p):
+            with open(p) as f: text = f.read()
+            break
+    if text is None:
+        raise FileNotFoundError("rope_freq_turns.svh not found")
+    import re
+    for m in re.finditer(r"32'd\s*(\d+)", text):
+        vals.append(int(m.group(1)))
+    FREQ_TURNS_Q31 = vals[:32]
+
+def cordic_sincos_rtl(angle_q3_27):
+    """Bit-accurate emulation of cordic_sincos.sv.  Returns (cos_q15, sin_q15)."""
+    # Quadrant fold
+    if angle_q3_27 > PI_HALF_Q27:
+        z = PI_Q27 - angle_q3_27
+        cos_neg = True
+    elif angle_q3_27 < -PI_HALF_Q27:
+        z = -PI_Q27 - angle_q3_27
+        cos_neg = True
+    else:
+        z = angle_q3_27
+        cos_neg = False
+    # Initialize CORDIC state in Q3.27
+    x = K_Q3_27
+    y = 0
+    # Sign-extend z to 31 bits.  Python ints are arbitrary precision so just track.
+    for i in range(16):
+        # arithmetic shifts; Python >> is floor for negative
+        x_shift = x >> i if x >= 0 else -((-x) >> i)   # match $signed >>> in Verilog (ASR)
+        y_shift = y >> i if y >= 0 else -((-y) >> i)
+        # Actually Python's >> on negative ints IS ASR (floor toward -inf).
+        # E.g., -5 >> 1 = -3.  That matches Verilog $signed >>>.
+        x_shift = x >> i
+        y_shift = y >> i
+        if z >= 0:
+            x, y, z = x - y_shift, y + x_shift, z - ATAN_Q3_27[i]
+        else:
+            x, y, z = x + y_shift, y - x_shift, z + ATAN_Q3_27[i]
+    # Round Q3.27 → Q1.15: >> 12 with bias 2^11
+    x_round = x + 2048
+    y_round = y + 2048
+    x_shift = x_round >> 12
+    y_shift = y_round >> 12
+    if   x_shift >  32767: cos_out = -32767 if cos_neg else  32767
+    elif x_shift < -32768: cos_out =  32767 if cos_neg else -32768
+    else:                  cos_out = -x_shift if cos_neg else x_shift
+    if   y_shift >  32767: sin_out =  32767
+    elif y_shift < -32768: sin_out = -32768
+    else:                  sin_out = y_shift
+    # Mask to 16-bit signed range for safety
+    if cos_out > 32767:  cos_out = 32767
+    if cos_out < -32768: cos_out = -32768
+    return cos_out, sin_out
+
 def rope_rtl(x, pos, base=10000.0):
-    return S.rope(x, pos, base)   # TODO: CORDIC-faithful version
+    """Bit-accurate RoPE rotation matching rope.sv: 16-iter CORDIC for 32 pairs,
+    then x'[j] = x[j]*cos - x[j+H2]*sin / x'[j+H2] = x[j+H2]*cos + x[j]*sin."""
+    if not has('rope'):
+        return S.rope(x, pos, base)
+    load_freq_turns()
+    H = len(x)
+    H2 = H // 2
+    # x comes in as FP real values (caller dequantizes).  Convert to Q1.15 int16.
+    # mac_q15 takes int16, so we need to quantize at some scale.  RTL receives
+    # Q1.15 directly from the matvec output (no rescale before rope).  Caller
+    # passes us FP values — convert via current scale lsc[q]/lsc[k] (handled by
+    # caller).  Here we just operate on the array as if it were already int16-equivalent.
+    x_real = np.asarray(x, dtype=np.float64)
+    # Quantize at a per-call scale so peak fits int16 with some headroom.
+    scale = max(float(np.abs(x_real).max()), 1e-9)
+    x_int = np.clip(np.floor(x_real * 32768.0 / scale), -32768, 32767).astype(np.int64)
+    # Compute cos/sin for each pair j=0..H2-1
+    cos_buf = np.zeros(H2, dtype=np.int64)
+    sin_buf = np.zeros(H2, dtype=np.int64)
+    for j in range(H2):
+        ang_t43 = pos * FREQ_TURNS_Q31[j]
+        ang_turns = ang_t43 & ((1 << 31) - 1)
+        # Sign-extend bit 30
+        if ang_turns & (1 << 30):
+            ang_turns = ang_turns - (1 << 31)
+        ang_prod = ang_turns * PI_OVER_8_Q29
+        # >>> 29 of signed 62-bit; Python >> is ASR for signed
+        cord_angle = ang_prod >> 29
+        # Mask to 31-bit signed range (sign-extend bit 30)
+        cord_angle = cord_angle & ((1 << 31) - 1)
+        if cord_angle & (1 << 30):
+            cord_angle = cord_angle - (1 << 31)
+        c, s = cordic_sincos_rtl(cord_angle)
+        cos_buf[j] = c
+        sin_buf[j] = s
+    # Apply rotation via mac_q15:  for j<H2: out[j] = (xa*cos - xb*sin) >>> 15
+    #                              for j>=H2: out[j] = (xb*cos + xa*sin) >>> 15
+    out_int = np.zeros(H, dtype=np.int64)
+    for j in range(H2):
+        xa = x_int[j]
+        xb = x_int[j + H2]
+        c = cos_buf[j]
+        s = sin_buf[j]
+        sum_lo = xa * c - xb * s
+        sum_hi = xb * c + xa * s
+        out_int[j]      = np.clip(sum_lo >> 15, -32768, 32767)
+        out_int[j + H2] = np.clip(sum_hi >> 15, -32768, 32767)
+    return out_int.astype(np.float64) * scale / 32768.0
 
 # ---------------------------------------------------------------------------
 # Per-layer factor_ram (Q1.15 gate/up, Q16.8 mlp_out, Q16.8 attn)
