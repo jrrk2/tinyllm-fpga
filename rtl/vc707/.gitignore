@@ -1,0 +1,47 @@
+# Vivado build artefacts
+microgpt_eth.runs/
+microgpt_eth.cache/
+microgpt_eth.hw/
+microgpt_eth.ip_user_files/
+microgpt_eth.gen/
+microgpt_eth.sim/
+microgpt_eth.srcs/
+.Xil/
+*.log
+*.jou
+*.pb
+*.str
+*.backup.*
+vivado_*.log
+webtalk*
+reports/
+
+# Bitstream output dir
+work/
+
+# Verilator object dirs
+sim/obj_dir/
+sim/obj_dir_*/
+sim/obj_factor_ram/
+
+# xsim object/database
+sim/xsim.dir/
+sim/xsim.jou
+sim/xsim.log
+sim/*.exe
+sim/*.wdb
+sim/xelab.*
+sim/xvlog.*
+sim/xsim_*.backup.*
+
+# Test data files (per-run, regenerated)
+fpga_layer_*.txt
+py_layer_*.txt
+py_l00_*.txt
+/tmp/xsim_*
+
+# Synthesis probe outputs
+sim/synth_factor_ram_*.v
+sim/synth_factor_ram_util.rpt
+sim/synth_factor_ram.dcp
+sim/*.dcp
