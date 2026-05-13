@@ -11,7 +11,7 @@ VFLAGS    := -Wall -Wno-fatal -cc --exe --build -j 0 \
 
 SMOLLM_SRC := ../src/smollm
 
-.PHONY: all matvec rmsnorm rope swiglu swiglu_selftest softmax persist softmax_selftest weight_streamer smollm_layer_ddr3 multilayer_tm clean
+.PHONY: all matvec rmsnorm rope swiglu swiglu_selftest softmax persist softmax_selftest weight_streamer smollm_layer_ddr3 multilayer_tm bfp-layer clean
 
 all: matvec rmsnorm rope swiglu softmax persist softmax_selftest
 
@@ -580,6 +580,40 @@ $(BROM_SV): ../generated/brom_%.sv: ../generated/tm_layer_%.hex \
 ../generated/tm_layer_K_CACHE_INIT.hex \
 ../generated/tm_layer_V_CACHE_INIT.hex: ../host/gen_multilayer_test.py
 	python3 ../host/gen_multilayer_test.py --mode tm --nlayers 3
+
+# ---------------------- smollm_layer_bfp (full block-FP layer) ----------------------
+# Boots from the lbfp_*.hex baked by host/gen_smollm_blockfp_bfp.py
+# (run via `make` in vc707/ — see its lbfp_stamp target).  PASSes when
+# hidden_out matches the per-stage BFP golden within ±256 LSB mantissa
+# (sub-1% relative error across 14 op stages).
+bfp-layer: obj_dir/Vtb_smollm_layer_bfp
+	@echo "=== running smollm_layer_bfp sim ==="
+	@./obj_dir/Vtb_smollm_layer_bfp
+
+obj_dir/Vtb_smollm_layer_bfp: tb_smollm_layer_bfp.sv tb_smollm_layer_bfp.cpp \
+                              $(SMOLLM_SRC)/smollm_layer_bfp.sv \
+                              $(SMOLLM_SRC)/matvec_bfp_engine.sv \
+                              $(SMOLLM_SRC)/rmsnorm_bfp.sv \
+                              $(SMOLLM_SRC)/rope_bfp.sv \
+                              $(SMOLLM_SRC)/swiglu_bfp.sv \
+                              $(SMOLLM_SRC)/softmax_bfp.sv \
+                              $(SMOLLM_SRC)/residual_bfp.sv \
+                              $(SMOLLM_SRC)/cordic_sincos.sv
+	$(VERILATOR) -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-fatal -cc --exe --build \
+	    -j 0 --x-assign 0 --x-initial 0 \
+	    -CFLAGS "-O2 -std=c++17" \
+	    --top-module tb_smollm_layer_bfp \
+	    -I../generated -I$(SMOLLM_SRC) \
+	    tb_smollm_layer_bfp.sv tb_smollm_layer_bfp.cpp \
+	    $(SMOLLM_SRC)/smollm_layer_bfp.sv \
+	    $(SMOLLM_SRC)/matvec_bfp_engine.sv \
+	    $(SMOLLM_SRC)/rmsnorm_bfp.sv \
+	    $(SMOLLM_SRC)/rope_bfp.sv \
+	    $(SMOLLM_SRC)/swiglu_bfp.sv \
+	    $(SMOLLM_SRC)/softmax_bfp.sv \
+	    $(SMOLLM_SRC)/residual_bfp.sv \
+	    $(SMOLLM_SRC)/cordic_sincos.sv \
+	    -o Vtb_smollm_layer_bfp
 
 clean:
 	rm -rf obj_dir test_matvec.bin test_rmsnorm.bin test_rope.bin test_swiglu.bin test_softmax.bin

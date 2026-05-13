@@ -81,6 +81,36 @@ $(tm_stamp): $(TM_HEX_GEN) host/gen_layer_ddr3.py
 $(GENERATED_DIR)/silu_lut.hex: sim/gen_swiglu_lut.py
 	python3 sim/gen_swiglu_lut.py
 
+# ----------------------------------------------------------------------
+# Block-FP weight bake for smollm_layer_bfp (small-dim selftest config).
+# Emits all weight / gamma / KV-init mantissa+exponent hex files plus a
+# hidden-in LUT SVH used by smollm_layer_bfp_selftest.sv.  Even when the
+# int8 path is the active top-level instantiation, Vivado parses the BFP
+# modules listed in run.tcl and elaborates their $readmemh initializers
+# — so the hex files must exist (else: warnings + zero-initialized BRAMs).
+#
+# Override on the command line:
+#   make BFP_D=576 BFP_HD=64 BFP_FFN=1536 BFP_MAX_CTX=4 ...
+# ----------------------------------------------------------------------
+BFP_D       ?= 64
+BFP_H_Q     ?= 1
+BFP_H_KV    ?= 1
+BFP_HD      ?= 64
+BFP_FFN     ?= 128
+BFP_MAX_CTX ?= 4
+BFP_POS     ?= 3
+BFP_KV_POS  ?= 3
+
+lbfp_stamp := $(GENERATED_DIR)/.lbfp_D$(BFP_D)_H$(BFP_H_Q)x$(BFP_H_KV)_HD$(BFP_HD)_F$(BFP_FFN)_C$(BFP_MAX_CTX).stamp
+
+$(lbfp_stamp): host/gen_smollm_blockfp_bfp.py
+	@echo "=== baking block-FP weights (D=$(BFP_D) H_Q=$(BFP_H_Q) H_KV=$(BFP_H_KV) HD=$(BFP_HD) FFN=$(BFP_FFN) MAX_CTX=$(BFP_MAX_CTX)) ==="
+	@rm -f $(GENERATED_DIR)/.lbfp_*.stamp
+	D=$(BFP_D) H_Q=$(BFP_H_Q) H_KV=$(BFP_H_KV) HD=$(BFP_HD) FFN=$(BFP_FFN) \
+	MAX_CTX=$(BFP_MAX_CTX) POS=$(BFP_POS) KV_POS=$(BFP_KV_POS) \
+	  python3 host/gen_smollm_blockfp_bfp.py
+	@touch $@
+
 # Pattern rule: each brom_<NAME>.sv depends on its tm_layer_<NAME>.hex
 # AND on the gen_brom_sv.py script.  This catches the case where some
 # other flow (e.g. the sim Verilator regression) overwrites the .hex
@@ -90,11 +120,19 @@ $(BROM_SV): $(GENERATED_DIR)/brom_%.sv: $(GENERATED_DIR)/tm_layer_%.hex \
                                         host/gen_brom_sv.py | $(tm_stamp)
 	python3 host/gen_brom_sv.py $< $@ brom_$*
 
-$(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex
+$(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(lbfp_stamp)
 	mkdir -p $(work-dir)
 	$(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
 	cp microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit ./$(work-dir)/ 2>/dev/null || \
 	cp microgpt_eth.runs/impl_1/vc707_microgpt_eth*.bit ./$(work-dir)/ 2>/dev/null || true
+
+# Quick convenience target: bake BFP hex + run the Verilator layer test.
+# Useful for sanity-checking precision after RTL edits before launching a
+# full Vivado synth (≈45 min on VC707).
+bfp-sim: $(lbfp_stamp)
+	$(MAKE) -C sim bfp-layer
+
+.PHONY: bfp-sim
 
 $(ips): %.xci :
 	mkdir -p $(work-dir)
