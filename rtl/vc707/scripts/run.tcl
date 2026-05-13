@@ -141,6 +141,10 @@ read_verilog -sv { \
     src/smollm/residual_bfp.sv \
     src/smollm/smollm_layer_bfp.sv \
     src/smollm/smollm_layer_bfp_selftest.sv \
+    src/smollm/embed_lookup_bfp.sv \
+    src/smollm/smollm_multilayer_tm_bfp.sv \
+    src/smollm/smollm_decode_head_bfp.sv \
+    src/smollm/autoregress_bfp_top.sv \
 }
 
 # Generated brom_*.sv wrappers — explicit RAMB36E1 instances for the
