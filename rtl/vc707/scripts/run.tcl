@@ -136,6 +136,13 @@ set_property -dict { file_type {Verilog Header} is_global_include 1} -objects $f
 
 set_property top vc707_microgpt_eth [current_fileset]
 
+# Propagate Verilog `defines from the env-var VIVADO_DEFINES (set by the
+# Makefile).  Used for MICROGPT_USE_BFP (swap top-level layer instance).
+if {[info exists ::env(VIVADO_DEFINES)] && $::env(VIVADO_DEFINES) ne ""} {
+    puts "INFO: VIVADO_DEFINES = $::env(VIVADO_DEFINES)"
+    set_property verilog_define $::env(VIVADO_DEFINES) [current_fileset]
+}
+
 update_compile_order -fileset sources_1
 
 synth_design -rtl -name rtl_1

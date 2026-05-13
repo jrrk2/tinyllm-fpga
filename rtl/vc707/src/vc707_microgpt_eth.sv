@@ -880,6 +880,7 @@ module vc707_microgpt_eth (
     else              scale_wr_pulse_core <= scale_wr_edge_core;
   end
 
+`ifndef MICROGPT_USE_BFP
   smollm_multilayer_tm_selftest i_lay_st (
     .clk                ( core_clk         ),
     .rst                ( ~core_resetn     ),
@@ -951,6 +952,69 @@ module vc707_microgpt_eth (
     .ila_ml_layer_idx   ( ila_ml_layer_idx   )
 `endif
   );
+`else  // MICROGPT_USE_BFP
+`ifdef MICROGPT_LAYER_DEBUG
+  // The int8 multi-layer instance exposes a set of ILA/diagnostic probes;
+  // the BFP single-layer selftest doesn't.  Pick one.
+  initial begin
+    $display("ERROR: MICROGPT_LAYER_DEBUG + MICROGPT_USE_BFP combination is not supported.");
+    $finish;
+  end
+`endif
+  // ----------------------------------------------------------------------
+  // Block-FP path: small-dim single-layer selftest (D=64, FFN=128, MAX_CTX=4).
+  // Weights / gammas / KV-init come from $readmemh'd BRAMs (lbfp_*.hex baked
+  // by host/gen_smollm_blockfp_bfp.py).  No DDR3 weight streaming → AXI
+  // master is tied off below.  scale_wr_* regmap port is reused as the
+  // BFP weight overlay port (wr_kind/addr/data/en), so existing host
+  // tooling can patch BFP weights without a new regmap address.
+  //
+  // result mapping (lay_result is 9216 bits in the int8 path):
+  //   [0     +: 16*16 ] = 16 BFP mantissas (smollm_layer_bfp_selftest's
+  //                       RESULT_LANES=16 hidden_out lanes).
+  //   [16*16 +:  4*8 ] = per-tile exponents (D/TILE = 4 entries).
+  //   [    rest      ] = 0.  Host tooling that reads only the legacy
+  //                       0x1D0 window sees the mantissas.
+  // ----------------------------------------------------------------------
+  wire [16*16-1:0] bfp_result_m;
+  wire [4*8-1:0]   bfp_result_e;
+  smollm_layer_bfp_selftest #(
+    .D(64), .H_Q(1), .H_KV(1), .HD(64), .FFN(128), .MAX_CTX(4),
+    .RESULT_LANES(16)
+  ) i_lay_st (
+    .clk      ( core_clk         ),
+    .rst      ( ~core_resetn     ),
+    .restart  ( lay_restart_core ),
+    // Reuse scale_wr_* as BFP weight overlay (5/18-bit fields fit in
+    // the existing 4/16-bit regmap wires with zero-extension):
+    .wr_kind  ( {1'b0, scale_wr_kind_core}  ),
+    .wr_addr  ( {2'b0, scale_wr_addr_core}  ),
+    .wr_data  ( scale_wr_data_core          ),
+    .wr_en    ( scale_wr_pulse_core         ),
+    .result_m ( bfp_result_m                ),
+    .result_e ( bfp_result_e                ),
+    .done     ( lay_done_core               )
+  );
+  assign lay_result = {{(9216-16*16-4*8){1'b0}}, bfp_result_e, bfp_result_m};
+
+  // AXI master to MIG: tied off (BFP path has no DDR3 weight streaming).
+  assign m_axi_arvalid = 1'b0;
+  assign m_axi_arid    = '0;
+  assign m_axi_araddr  = '0;
+  assign m_axi_arlen   = '0;
+  assign m_axi_arsize  = '0;
+  assign m_axi_arburst = '0;
+  assign m_axi_arlock  = 1'b0;
+  assign m_axi_arcache = '0;
+  assign m_axi_arprot  = '0;
+  assign m_axi_arqos   = '0;
+  assign m_axi_rready  = 1'b1;
+
+  // Factor read port returns zero in the BFP path (no swiglu/attn factors).
+  // (factor_rd_data_core is wire-declared at module scope; drive to '0.)
+  assign factor_rd_data_core = '0;
+`endif
+
   reg [1:0] lay_done_sync = 2'd0;
   always_ff @(posedge eth_clk) lay_done_sync <= {lay_done_sync[0], lay_done_core};
   wire lay_done = lay_done_sync[1];

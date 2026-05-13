@@ -120,6 +120,16 @@ $(BROM_SV): $(GENERATED_DIR)/brom_%.sv: $(GENERATED_DIR)/tm_layer_%.hex \
                                         host/gen_brom_sv.py | $(tm_stamp)
 	python3 host/gen_brom_sv.py $< $@ brom_$*
 
+# Toggle the top-level layer instance.  USE_BFP=1 swaps the int8
+# smollm_multilayer_tm_selftest for smollm_layer_bfp_selftest (small-dim
+# single-layer block-FP selftest).  Passed through to Vivado via
+# scripts/run.tcl's MICROGPT_USE_BFP define.
+USE_BFP ?= 0
+ifeq ($(USE_BFP),1)
+  VIVADO_DEFINES := MICROGPT_USE_BFP
+  export VIVADO_DEFINES
+endif
+
 $(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(lbfp_stamp)
 	mkdir -p $(work-dir)
 	$(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
