@@ -1,26 +1,16 @@
 // autoregress_bfp_top.sv — self-contained block-FP autoregressive token
 // generator.  Single `start` pulse runs the prompt + autoregress loop on
-// chip; emits done when finished plus a packed bus of all generated
+// chip; emits `done` when finished plus a packed bus of all generated
 // tokens.  Suitable as the FPGA top-level instantiation for the SmolLM2
 // BFP path.
 //
-// Architecture:
-//   prompt ROM ($readmemh-loaded with N_PROMPT 16-bit token ids)
-//      |
-//      v
-//   FSM (drives token_in / pos / kv_pos / model_start, captures token_out)
-//      |
-//      v
-//   single-token model stack:
-//      embed_lookup_bfp -> smollm_multilayer_tm_bfp -> smollm_decode_head_bfp
-//      |
-//      v
-//   result RAM (N_STEPS 16-bit tokens, packed to result_tokens output)
-//
-// One full forward = N_STEPS = N_PROMPT + N_GEN token-step model calls.
-// kv_pos advances each step (0..N_STEPS-1).  In prompt phase the FSM
-// drives prompt[step]; in autoregress phase it drives the previous
-// token_out.
+// When STREAM_WEIGHTS=1 (with STREAM_LOOKUP=1), the three sub-modules
+// each own an AXI master that fetches their slice of the weight set
+// from DDR3.  Because the model stages are strictly sequential —
+// EMBED → NL × LAYER → DECODE — only one master is active at a time,
+// so this module collapses the three onto a single AR/R channel via a
+// priority OR-mux (the source whose arvalid is high wins, and rvalid
+// is broadcast back to all three).
 
 `include "bfp_format.svh"
 
@@ -38,19 +28,61 @@ module autoregress_bfp_top #(
   parameter int N_PROMPT = 4,
   parameter int N_GEN    = 15,
   parameter int N_STEPS  = N_PROMPT + N_GEN,
-  parameter     PREFIX   = "lbfp_full_"
+  parameter     PREFIX   = "lbfp_full_",
+  parameter bit STREAM_WEIGHTS = 1'b0,
+  parameter bit STREAM_LOOKUP  = 1'b0,
+  parameter int AXI_ADDR_WIDTH = 30,
+  parameter int AXI_ID_WIDTH   = 5
 )(
   input  wire                          clk,
   input  wire                          rst,
   input  wire                          start,
   output logic                         done,
-  // Packed bus of N_STEPS 16-bit token ids (step 0 in LSBs).
-  output logic [N_STEPS*16-1:0]        result_tokens
+  output logic [N_STEPS*16-1:0]        result_tokens,
+  // Layer-0 / region base offsets — caller patches in lbfp_ddr3.svh
+  // constants.  Ignored when neither stream is enabled.
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WQ_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WQ_e,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WK_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WK_e,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WV_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WV_e,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WO_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WO_e,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WG_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WG_e,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WU_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WU_e,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WDN_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WDN_e,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_EMBED_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_EMBED_e,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_EMBED_LU_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_EMBED_LU_e,
+  // AXI master to MIG (clk_axi domain).
+  input  wire                          clk_axi,
+  input  wire                          rst_axi,
+  output wire                          m_axi_arvalid,
+  input  wire                          m_axi_arready,
+  output wire [AXI_ID_WIDTH-1:0]       m_axi_arid,
+  output wire [AXI_ADDR_WIDTH-1:0]     m_axi_araddr,
+  output wire [7:0]                    m_axi_arlen,
+  output wire [2:0]                    m_axi_arsize,
+  output wire [1:0]                    m_axi_arburst,
+  output wire                          m_axi_arlock,
+  output wire [3:0]                    m_axi_arcache,
+  output wire [2:0]                    m_axi_arprot,
+  output wire [3:0]                    m_axi_arqos,
+  input  wire                          m_axi_rvalid,
+  output wire                          m_axi_rready,
+  input  wire [AXI_ID_WIDTH-1:0]       m_axi_rid,
+  input  wire [511:0]                  m_axi_rdata,
+  input  wire [1:0]                    m_axi_rresp,
+  input  wire                          m_axi_rlast
 );
 
   // ---------------------------------------------------------------------------
-  // Prompt ROM — 4 token ids baked into a hex file by the host generator.
-  // One 16-bit value per line (16'd0..49152, $readmemh format).
+  // Prompt ROM.
   // ---------------------------------------------------------------------------
   (* ram_style = "block" *) logic [15:0] prompt_rom [0:N_PROMPT-1];
 `ifdef MICROGPT_WEIGHT_DIR
@@ -59,10 +91,54 @@ module autoregress_bfp_top #(
   initial $readmemh({PREFIX, "PROMPT.hex"}, prompt_rom);
 `endif
 
-  // ---------------------------------------------------------------------------
-  // Inner single-token model: embed_lookup → multilayer × NL → decode_head
-  // ---------------------------------------------------------------------------
   localparam int NT_D = D / BFP_TILE;
+
+  // ---------------------------------------------------------------------------
+  // Inner sub-module wires (3 AXI masters that share m_axi_*).
+  // ---------------------------------------------------------------------------
+  wire                          emb_arvalid, lay_arvalid, dec_arvalid;
+  wire [AXI_ID_WIDTH-1:0]       emb_arid,    lay_arid,    dec_arid;
+  wire [AXI_ADDR_WIDTH-1:0]     emb_araddr,  lay_araddr,  dec_araddr;
+  wire [7:0]                    emb_arlen,   lay_arlen,   dec_arlen;
+  wire [2:0]                    emb_arsize,  lay_arsize,  dec_arsize;
+  wire [1:0]                    emb_arburst, lay_arburst, dec_arburst;
+  wire                          emb_arlock,  lay_arlock,  dec_arlock;
+  wire [3:0]                    emb_arcache, lay_arcache, dec_arcache;
+  wire [2:0]                    emb_arprot,  lay_arprot,  dec_arprot;
+  wire [3:0]                    emb_arqos,   lay_arqos,   dec_arqos;
+  wire                          emb_rready,  lay_rready,  dec_rready;
+
+  // ---------------------------------------------------------------------------
+  // Three-way AR-channel priority OR-mux.
+  // Because EMB → LAY → DEC are strictly sequential, only one arvalid is
+  // ever high; the priority ordering protects against transient overlap.
+  // ---------------------------------------------------------------------------
+  assign m_axi_arvalid = emb_arvalid | lay_arvalid | dec_arvalid;
+  assign m_axi_arid    = emb_arvalid ? emb_arid    : lay_arvalid ? lay_arid    : dec_arid;
+  assign m_axi_araddr  = emb_arvalid ? emb_araddr  : lay_arvalid ? lay_araddr  : dec_araddr;
+  assign m_axi_arlen   = emb_arvalid ? emb_arlen   : lay_arvalid ? lay_arlen   : dec_arlen;
+  assign m_axi_arsize  = emb_arvalid ? emb_arsize  : lay_arvalid ? lay_arsize  : dec_arsize;
+  assign m_axi_arburst = emb_arvalid ? emb_arburst : lay_arvalid ? lay_arburst : dec_arburst;
+  assign m_axi_arlock  = emb_arvalid ? emb_arlock  : lay_arvalid ? lay_arlock  : dec_arlock;
+  assign m_axi_arcache = emb_arvalid ? emb_arcache : lay_arvalid ? lay_arcache : dec_arcache;
+  assign m_axi_arprot  = emb_arvalid ? emb_arprot  : lay_arvalid ? lay_arprot  : dec_arprot;
+  assign m_axi_arqos   = emb_arvalid ? emb_arqos   : lay_arvalid ? lay_arqos   : dec_arqos;
+  // rready: broadcast `1`; each sub-module ignores rvalid when inactive.
+  assign m_axi_rready  = emb_rready & lay_rready & dec_rready;
+
+  // arready arrives back; route to whichever source's arvalid is winning.
+  wire emb_arready = m_axi_arready & emb_arvalid;
+  wire lay_arready = m_axi_arready & (~emb_arvalid) & lay_arvalid;
+  wire dec_arready = m_axi_arready & (~emb_arvalid) & (~lay_arvalid) & dec_arvalid;
+  // rvalid / rid / rdata / rresp / rlast broadcast — at most one
+  // sub-module's load FSM is in its R-state at any moment.
+  wire emb_rvalid_b = m_axi_rvalid;
+  wire lay_rvalid_b = m_axi_rvalid;
+  wire dec_rvalid_b = m_axi_rvalid;
+
+  // ---------------------------------------------------------------------------
+  // embed_lookup_bfp.
+  // ---------------------------------------------------------------------------
   logic                                mdl_start;
   logic [15:0]                         mdl_token_in;
   logic [10:0]                         mdl_pos;
@@ -73,21 +149,38 @@ module autoregress_bfp_top #(
 
   embed_lookup_bfp #(
     .D(D), .VOCAB(VOCAB), .PREFIX(PREFIX),
-    .STREAM_LOOKUP(1'b0)
+    .STREAM_LOOKUP(STREAM_LOOKUP),
+    .AXI_ADDR_WIDTH(AXI_ADDR_WIDTH),
+    .AXI_ID_WIDTH(AXI_ID_WIDTH)
   ) i_emb (
     .clk(clk), .rst(rst), .start(mdl_start),
     .token_id(mdl_token_in),
     .hidden_m(emb_m), .hidden_e(emb_e), .done(emb_done),
-    .ws_base_EMBED_LU_m('0), .ws_base_EMBED_LU_e('0),
-    .clk_axi(clk), .rst_axi(rst),
-    .m_axi_arvalid(), .m_axi_arready(1'b0), .m_axi_arid(), .m_axi_araddr(),
-    .m_axi_arlen(), .m_axi_arsize(), .m_axi_arburst(), .m_axi_arlock(),
-    .m_axi_arcache(), .m_axi_arprot(), .m_axi_arqos(),
-    .m_axi_rvalid(1'b0), .m_axi_rready(),
-    .m_axi_rid('0), .m_axi_rdata('0), .m_axi_rresp('0), .m_axi_rlast(1'b0)
+    .ws_base_EMBED_LU_m(ws_base_EMBED_LU_m),
+    .ws_base_EMBED_LU_e(ws_base_EMBED_LU_e),
+    .clk_axi(clk_axi), .rst_axi(rst_axi),
+    .m_axi_arvalid(emb_arvalid),
+    .m_axi_arready(emb_arready),
+    .m_axi_arid   (emb_arid),
+    .m_axi_araddr (emb_araddr),
+    .m_axi_arlen  (emb_arlen),
+    .m_axi_arsize (emb_arsize),
+    .m_axi_arburst(emb_arburst),
+    .m_axi_arlock (emb_arlock),
+    .m_axi_arcache(emb_arcache),
+    .m_axi_arprot (emb_arprot),
+    .m_axi_arqos  (emb_arqos),
+    .m_axi_rvalid (emb_rvalid_b),
+    .m_axi_rready (emb_rready),
+    .m_axi_rid    (m_axi_rid),
+    .m_axi_rdata  (m_axi_rdata),
+    .m_axi_rresp  (m_axi_rresp),
+    .m_axi_rlast  (m_axi_rlast)
   );
 
-  // Three-stage inner FSM: EMB → LAY → DEC.
+  // ---------------------------------------------------------------------------
+  // smollm_multilayer_tm_bfp.
+  // ---------------------------------------------------------------------------
   logic signed [D*BFP_MANT_W-1:0]      lay_in_m;
   logic signed [NT_D*BFP_EXP_W-1:0]    lay_in_e;
   logic                                lay_start;
@@ -97,39 +190,88 @@ module autoregress_bfp_top #(
 
   smollm_multilayer_tm_bfp #(
     .D(D), .H_Q(H_Q), .H_KV(H_KV), .HD(HD),
-    .FFN(FFN), .MAX_CTX(MAX_CTX), .NL(NL), .PREFIX(PREFIX)
+    .FFN(FFN), .MAX_CTX(MAX_CTX), .NL(NL), .PREFIX(PREFIX),
+    .STREAM_WEIGHTS(STREAM_WEIGHTS),
+    .AXI_ADDR_WIDTH(AXI_ADDR_WIDTH),
+    .AXI_ID_WIDTH(AXI_ID_WIDTH)
   ) i_lay (
     .clk(clk), .rst(rst), .start(lay_start),
     .pos(mdl_pos), .kv_pos(mdl_kv_pos),
     .hidden_in_m(lay_in_m), .hidden_in_e(lay_in_e),
     .hidden_out_m(lay_out_m), .hidden_out_e(lay_out_e),
-    .done(lay_done)
+    .done(lay_done),
+    .ws_base_WQ_m(ws_base_WQ_m),   .ws_base_WQ_e(ws_base_WQ_e),
+    .ws_base_WK_m(ws_base_WK_m),   .ws_base_WK_e(ws_base_WK_e),
+    .ws_base_WV_m(ws_base_WV_m),   .ws_base_WV_e(ws_base_WV_e),
+    .ws_base_WO_m(ws_base_WO_m),   .ws_base_WO_e(ws_base_WO_e),
+    .ws_base_WG_m(ws_base_WG_m),   .ws_base_WG_e(ws_base_WG_e),
+    .ws_base_WU_m(ws_base_WU_m),   .ws_base_WU_e(ws_base_WU_e),
+    .ws_base_WDN_m(ws_base_WDN_m), .ws_base_WDN_e(ws_base_WDN_e),
+    .clk_axi(clk_axi), .rst_axi(rst_axi),
+    .m_axi_arvalid(lay_arvalid),
+    .m_axi_arready(lay_arready),
+    .m_axi_arid   (lay_arid),
+    .m_axi_araddr (lay_araddr),
+    .m_axi_arlen  (lay_arlen),
+    .m_axi_arsize (lay_arsize),
+    .m_axi_arburst(lay_arburst),
+    .m_axi_arlock (lay_arlock),
+    .m_axi_arcache(lay_arcache),
+    .m_axi_arprot (lay_arprot),
+    .m_axi_arqos  (lay_arqos),
+    .m_axi_rvalid (lay_rvalid_b),
+    .m_axi_rready (lay_rready),
+    .m_axi_rid    (m_axi_rid),
+    .m_axi_rdata  (m_axi_rdata),
+    .m_axi_rresp  (m_axi_rresp),
+    .m_axi_rlast  (m_axi_rlast)
   );
 
+  // ---------------------------------------------------------------------------
+  // smollm_decode_head_bfp.
+  // ---------------------------------------------------------------------------
   logic                                dec_start;
   logic signed [D*BFP_MANT_W-1:0]      dec_in_m;
   logic signed [NT_D*BFP_EXP_W-1:0]    dec_in_e;
   wire  [15:0]                         dec_token;
   wire                                 dec_done;
+
   smollm_decode_head_bfp #(
     .D(D), .VOCAB(VOCAB), .PREFIX(PREFIX),
-    .STREAM_WEIGHTS(1'b0)
+    .STREAM_WEIGHTS(STREAM_WEIGHTS),
+    .AXI_ADDR_WIDTH(AXI_ADDR_WIDTH),
+    .AXI_ID_WIDTH(AXI_ID_WIDTH)
   ) i_dec (
     .clk(clk), .rst(rst), .start(dec_start),
     .hidden_in_m(dec_in_m), .hidden_in_e(dec_in_e),
     .token_out(dec_token), .done(dec_done),
-    // DDR3 streamer tied off (Verilator mode keeps EMBED in BRAM)
-    .ws_base_EMBED_m('0), .ws_base_EMBED_e('0),
-    .clk_axi(clk), .rst_axi(rst),
-    .m_axi_arvalid(), .m_axi_arready(1'b0), .m_axi_arid(), .m_axi_araddr(),
-    .m_axi_arlen(), .m_axi_arsize(), .m_axi_arburst(), .m_axi_arlock(),
-    .m_axi_arcache(), .m_axi_arprot(), .m_axi_arqos(),
-    .m_axi_rvalid(1'b0), .m_axi_rready(),
-    .m_axi_rid('0), .m_axi_rdata('0), .m_axi_rresp('0), .m_axi_rlast(1'b0)
+    .ws_base_EMBED_m(ws_base_EMBED_m),
+    .ws_base_EMBED_e(ws_base_EMBED_e),
+    .clk_axi(clk_axi), .rst_axi(rst_axi),
+    .m_axi_arvalid(dec_arvalid),
+    .m_axi_arready(dec_arready),
+    .m_axi_arid   (dec_arid),
+    .m_axi_araddr (dec_araddr),
+    .m_axi_arlen  (dec_arlen),
+    .m_axi_arsize (dec_arsize),
+    .m_axi_arburst(dec_arburst),
+    .m_axi_arlock (dec_arlock),
+    .m_axi_arcache(dec_arcache),
+    .m_axi_arprot (dec_arprot),
+    .m_axi_arqos  (dec_arqos),
+    .m_axi_rvalid (dec_rvalid_b),
+    .m_axi_rready (dec_rready),
+    .m_axi_rid    (m_axi_rid),
+    .m_axi_rdata  (m_axi_rdata),
+    .m_axi_rresp  (m_axi_rresp),
+    .m_axi_rlast  (m_axi_rlast)
   );
 
+  // ---------------------------------------------------------------------------
+  // Outer FSM
+  // ---------------------------------------------------------------------------
   typedef enum logic [3:0] {
-    S_IDLE, S_DRIVE,                // outer loop: pick prompt or last gen
+    S_IDLE, S_DRIVE,
     S_EMB, S_EMB_WAIT,
     S_LAY, S_LAY_WAIT,
     S_DEC, S_DEC_WAIT,
@@ -139,12 +281,8 @@ module autoregress_bfp_top #(
   st_t state;
   logic [$clog2(N_STEPS+1)-1:0]        step;
   logic [15:0]                         last_token;
-  // Per-step result storage.
   logic [15:0] result_buf [0:N_STEPS-1];
 
-  // ---------------------------------------------------------------------------
-  // Main FSM
-  // ---------------------------------------------------------------------------
   always_ff @(posedge clk) begin
     if (rst) begin
       state       <= S_IDLE;
@@ -173,7 +311,6 @@ module autoregress_bfp_top #(
           state      <= S_DRIVE;
         end
         S_DRIVE: begin
-          // Choose token_in: prompt[step] for prompt phase, last_token for autoregress
           if (step < N_PROMPT) mdl_token_in <= prompt_rom[step[$clog2(N_PROMPT+1)-1:0]];
           else                 mdl_token_in <= last_token;
           mdl_pos    <= 11'(step);
@@ -197,9 +334,9 @@ module autoregress_bfp_top #(
         end
         S_DEC:       state <= S_DEC_WAIT;
         S_DEC_WAIT:  if (dec_done) begin
-          last_token            <= dec_token;
-          result_buf[step]      <= dec_token;
-          state                 <= S_NEXT;
+          last_token       <= dec_token;
+          result_buf[step] <= dec_token;
+          state            <= S_NEXT;
         end
         S_NEXT: begin
           if (step == N_STEPS - 1) state <= S_ALL_DONE;
@@ -217,7 +354,6 @@ module autoregress_bfp_top #(
     end
   end
 
-  // Pack result_buf into the wide output bus
   always_comb begin
     for (int i = 0; i < N_STEPS; i++)
       result_tokens[i*16 +: 16] = result_buf[i];

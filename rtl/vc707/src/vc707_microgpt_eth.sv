@@ -989,6 +989,25 @@ module vc707_microgpt_eth (
     end
   end
 
+  // ----------------------------------------------------------------------
+  // STREAM_WEIGHTS / STREAM_LOOKUP — gated by build define.  When
+  // MICROGPT_BFP_STREAM is set, autoregress_bfp_top owns the AXI master
+  // and reads weights from the lbfp_full_DDR3.bin image that the host
+  // must have uploaded to DDR3 before pulsing `start`.  Otherwise the
+  // path stays on $readmemh BRAMs (current Verilator-validated mode);
+  // the sub-modules still receive base offsets and AXI ports but their
+  // internal streamers are elaborated away.
+  // ----------------------------------------------------------------------
+`ifdef MICROGPT_BFP_STREAM
+  localparam bit LBFP_STREAM_WEIGHTS = 1'b1;
+  localparam bit LBFP_STREAM_LOOKUP  = 1'b1;
+`else
+  localparam bit LBFP_STREAM_WEIGHTS = 1'b0;
+  localparam bit LBFP_STREAM_LOOKUP  = 1'b0;
+`endif
+
+`include "smollm/lbfp_ddr3.svh"
+
   autoregress_bfp_top #(
     .D       (`LBFP_FULL_D),
     .H_Q     (`LBFP_FULL_HQ),
@@ -1000,28 +1019,58 @@ module vc707_microgpt_eth (
     .VOCAB   (`LBFP_FULL_VOCAB),
     .N_PROMPT(`LBFP_FULL_NPROMPT),
     .N_GEN   (`LBFP_FULL_NGEN),
-    .PREFIX  ("lbfp_full_")
+    .PREFIX  ("lbfp_full_"),
+    .STREAM_WEIGHTS (LBFP_STREAM_WEIGHTS),
+    .STREAM_LOOKUP  (LBFP_STREAM_LOOKUP),
+    .AXI_ADDR_WIDTH (30),
+    .AXI_ID_WIDTH   (5)
   ) i_lay_st (
     .clk          ( core_clk          ),
     .rst          ( ~core_resetn | lay_restart_core ),
     .start        ( bfp_start_r       ),
     .done         ( lay_done_core     ),
-    .result_tokens( bfp_result_tokens )
+    .result_tokens( bfp_result_tokens ),
+    // DDR3 region base offsets (lbfp_ddr3.svh).
+    .ws_base_WQ_m       ( `LBFP_BASE_WQ_M     ),
+    .ws_base_WQ_e       ( `LBFP_BASE_WQ_E     ),
+    .ws_base_WK_m       ( `LBFP_BASE_WK_M     ),
+    .ws_base_WK_e       ( `LBFP_BASE_WK_E     ),
+    .ws_base_WV_m       ( `LBFP_BASE_WV_M     ),
+    .ws_base_WV_e       ( `LBFP_BASE_WV_E     ),
+    .ws_base_WO_m       ( `LBFP_BASE_WO_M     ),
+    .ws_base_WO_e       ( `LBFP_BASE_WO_E     ),
+    .ws_base_WG_m       ( `LBFP_BASE_WG_M     ),
+    .ws_base_WG_e       ( `LBFP_BASE_WG_E     ),
+    .ws_base_WU_m       ( `LBFP_BASE_WU_M     ),
+    .ws_base_WU_e       ( `LBFP_BASE_WU_E     ),
+    .ws_base_WDN_m      ( `LBFP_BASE_WDN_M    ),
+    .ws_base_WDN_e      ( `LBFP_BASE_WDN_E    ),
+    .ws_base_EMBED_m    ( `LBFP_BASE_EMBED_M  ),
+    .ws_base_EMBED_e    ( `LBFP_BASE_EMBED_E  ),
+    .ws_base_EMBED_LU_m ( `LBFP_BASE_EMBED_LU_M ),
+    .ws_base_EMBED_LU_e ( `LBFP_BASE_EMBED_LU_E ),
+    // AXI master to MIG (ui_clk domain).
+    .clk_axi      ( ui_clk            ),
+    .rst_axi      ( ui_clk_sync_rst   ),
+    .m_axi_arvalid( m_axi_arvalid     ),
+    .m_axi_arready( m_axi_arready     ),
+    .m_axi_arid   ( m_axi_arid        ),
+    .m_axi_araddr ( m_axi_araddr      ),
+    .m_axi_arlen  ( m_axi_arlen       ),
+    .m_axi_arsize ( m_axi_arsize      ),
+    .m_axi_arburst( m_axi_arburst     ),
+    .m_axi_arlock ( m_axi_arlock      ),
+    .m_axi_arcache( m_axi_arcache     ),
+    .m_axi_arprot ( m_axi_arprot      ),
+    .m_axi_arqos  ( m_axi_arqos       ),
+    .m_axi_rvalid ( m_axi_rvalid      ),
+    .m_axi_rready ( m_axi_rready      ),
+    .m_axi_rid    ( m_axi_rid         ),
+    .m_axi_rdata  ( m_axi_rdata       ),
+    .m_axi_rresp  ( m_axi_rresp       ),
+    .m_axi_rlast  ( m_axi_rlast       )
   );
   assign lay_result = {{(9216 - LBFP_NSTEPS*16){1'b0}}, bfp_result_tokens};
-
-  // AXI master to MIG: tied off (BFP path has no DDR3 weight streaming).
-  assign m_axi_arvalid = 1'b0;
-  assign m_axi_arid    = '0;
-  assign m_axi_araddr  = '0;
-  assign m_axi_arlen   = '0;
-  assign m_axi_arsize  = '0;
-  assign m_axi_arburst = '0;
-  assign m_axi_arlock  = 1'b0;
-  assign m_axi_arcache = '0;
-  assign m_axi_arprot  = '0;
-  assign m_axi_arqos   = '0;
-  assign m_axi_rready  = 1'b1;
 
   // Factor read port returns zero in the BFP path (no swiglu/attn factors).
   // (factor_rd_data_core is wire-declared at module scope; drive to '0.)
