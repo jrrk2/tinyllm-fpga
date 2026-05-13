@@ -1,38 +1,43 @@
 // Stub module that exercises the same instantiation pattern as the
-// MICROGPT_USE_BFP branch of vc707_microgpt_eth.sv.  Lets Verilator
-// lint-check the port connections without pulling in Xilinx primitives.
+// MICROGPT_USE_BFP branch of vc707_microgpt_eth.sv after the swap to
+// autoregress_bfp_top.  Lets Verilator lint-check the port connections
+// without pulling in Xilinx primitives.
+`include "../generated/lbfp_full_cfg.svh"
 `include "bfp_format.svh"
 module lint_bfp_swap (
   input  wire        clk,
   input  wire        rst,
   input  wire        restart,
-  input  wire [3:0]  scale_wr_kind_core,
-  input  wire [15:0] scale_wr_addr_core,
-  input  wire [15:0] scale_wr_data_core,
-  input  wire        scale_wr_pulse_core,
   output wire [9215:0] lay_result,
   output wire          lay_done_core,
   output wire [31:0]   factor_rd_data_core
 );
-  wire [16*16-1:0] bfp_result_m;
-  wire [4*8-1:0]   bfp_result_e;
-  smollm_layer_bfp_selftest #(
-    .D(64), .H_Q(1), .H_KV(1), .HD(64), .FFN(128), .MAX_CTX(4),
-    .RESULT_LANES(16)
-  ) i_lay_st (
-    .clk      ( clk                         ),
-    .rst      ( rst                         ),
-    .restart  ( restart                     ),
-    .wr_kind  ( {1'b0, scale_wr_kind_core}  ),
-    .wr_addr  ( {2'b0, scale_wr_addr_core}  ),
-    // NB: the selftest pins layer_idx=0 internally.
+  localparam int LBFP_NSTEPS = `LBFP_FULL_NPROMPT + `LBFP_FULL_NGEN;
+  wire [LBFP_NSTEPS*16-1:0] bfp_result_tokens;
 
-    .wr_data  ( scale_wr_data_core          ),
-    .wr_en    ( scale_wr_pulse_core         ),
-    .result_m ( bfp_result_m                ),
-    .result_e ( bfp_result_e                ),
-    .done     ( lay_done_core               )
+  reg bfp_start_r = 1'b0;
+  always_ff @(posedge clk) begin
+    if (rst | restart)       bfp_start_r <= 1'b0;
+    else if (!lay_done_core) bfp_start_r <= 1'b1;
+    else                     bfp_start_r <= 1'b0;
+  end
+
+  autoregress_bfp_top #(
+    .D       (`LBFP_FULL_D),
+    .H_Q     (`LBFP_FULL_HQ),
+    .H_KV    (`LBFP_FULL_HKV),
+    .HD      (`LBFP_FULL_HD),
+    .FFN     (`LBFP_FULL_FFN),
+    .NL      (`LBFP_FULL_NL),
+    .MAX_CTX (`LBFP_FULL_MAX_CTX),
+    .VOCAB   (`LBFP_FULL_VOCAB),
+    .N_PROMPT(`LBFP_FULL_NPROMPT),
+    .N_GEN   (`LBFP_FULL_NGEN),
+    .PREFIX  ("../generated/lbfp_full_")
+  ) i_lay_st (
+    .clk(clk), .rst(rst | restart), .start(bfp_start_r),
+    .done(lay_done_core), .result_tokens(bfp_result_tokens)
   );
-  assign lay_result = {{(9216-16*16-4*8){1'b0}}, bfp_result_e, bfp_result_m};
+  assign lay_result = {{(9216 - LBFP_NSTEPS*16){1'b0}}, bfp_result_tokens};
   assign factor_rd_data_core = '0;
 endmodule

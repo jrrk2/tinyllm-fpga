@@ -953,45 +953,62 @@ module vc707_microgpt_eth (
 `endif
   );
 `else  // MICROGPT_USE_BFP
+`include "lbfp_full_cfg.svh"   // LBFP_FULL_{D,HQ,HKV,HD,FFN,NL,MAX_CTX,VOCAB,NPROMPT,NGEN}
   // NB: scripts/run.tcl removes MICROGPT_LAYER_DEBUG / MICROGPT_DDR3_WEIGHTS /
   // MICROGPT_ILA from the define set when USE_BFP=1 (those defines drive
   // int8-only ILA probes + AXI weight streamer paths the BFP single-layer
   // selftest doesn't expose).
   // ----------------------------------------------------------------------
-  // Block-FP path: small-dim single-layer selftest (D=64, FFN=128, MAX_CTX=4).
-  // Weights / gammas / KV-init come from $readmemh'd BRAMs (lbfp_*.hex baked
-  // by host/gen_smollm_blockfp_bfp.py).  No DDR3 weight streaming → AXI
-  // master is tied off below.  scale_wr_* regmap port is reused as the
-  // BFP weight overlay port (wr_kind/addr/data/en), so existing host
-  // tooling can patch BFP weights without a new regmap address.
+  // Block-FP path: full SmolLM2-135M autoregressive token generator.
   //
-  // result mapping (lay_result is 9216 bits in the int8 path):
-  //   [0     +: 16*16 ] = 16 BFP mantissas (smollm_layer_bfp_selftest's
-  //                       RESULT_LANES=16 hidden_out lanes).
-  //   [16*16 +:  4*8 ] = per-tile exponents (D/TILE = 4 entries).
-  //   [    rest      ] = 0.  Host tooling that reads only the legacy
-  //                       0x1D0 window sees the mantissas.
+  // One-shot FSM (autoregress_bfp_top.sv) drives 19 token-step inferences
+  // through embed_lookup → multilayer × NL=30 → decode_head, with the
+  // 4-token prompt baked into a BRAM ROM (lbfp_full_PROMPT.hex) and
+  // dec_token fed back as the next step's token_in.  All weights /
+  // embedding / norm gammas are $readmemh-loaded BRAMs — no DDR3
+  // streaming, so the m_axi_* read master is tied off below.
+  //
+  // result_tokens is 19 × 16 bits = 304 bits.  Pack into the lower bits
+  // of lay_result (9216-bit legacy bus); host reads via the existing
+  // 0x1D0 regmap window (32 32-bit words, 19 tokens occupy the first ~10).
   // ----------------------------------------------------------------------
-  wire [16*16-1:0] bfp_result_m;
-  wire [4*8-1:0]   bfp_result_e;
-  smollm_layer_bfp_selftest #(
-    .D(64), .H_Q(1), .H_KV(1), .HD(64), .FFN(128), .MAX_CTX(4),
-    .RESULT_LANES(16)
+  localparam int LBFP_NSTEPS = `LBFP_FULL_NPROMPT + `LBFP_FULL_NGEN;   // 19
+  wire [LBFP_NSTEPS*16-1:0] bfp_result_tokens;
+
+  // One-shot start: assert after reset / restart and hold until `done`.
+  // The autoregress FSM only samples start in S_IDLE, so a level-held
+  // signal is fine.
+  reg bfp_start_r;
+  always_ff @(posedge core_clk) begin
+    if (~core_resetn | lay_restart_core) begin
+      bfp_start_r <= 1'b0;
+    end else if (!lay_done_core) begin
+      bfp_start_r <= 1'b1;
+    end else begin
+      bfp_start_r <= 1'b0;
+    end
+  end
+
+  autoregress_bfp_top #(
+    .D       (`LBFP_FULL_D),
+    .H_Q     (`LBFP_FULL_HQ),
+    .H_KV    (`LBFP_FULL_HKV),
+    .HD      (`LBFP_FULL_HD),
+    .FFN     (`LBFP_FULL_FFN),
+    .NL      (`LBFP_FULL_NL),
+    .MAX_CTX (`LBFP_FULL_MAX_CTX),
+    .VOCAB   (`LBFP_FULL_VOCAB),
+    .N_PROMPT(`LBFP_FULL_NPROMPT),
+    .N_GEN   (`LBFP_FULL_NGEN),
+    .PREFIX  ("lbfp_full_")
   ) i_lay_st (
-    .clk      ( core_clk         ),
-    .rst      ( ~core_resetn     ),
-    .restart  ( lay_restart_core ),
-    // Reuse scale_wr_* as BFP weight overlay (5/18-bit fields fit in
-    // the existing 4/16-bit regmap wires with zero-extension):
-    .wr_kind  ( {1'b0, scale_wr_kind_core}  ),
-    .wr_addr  ( {2'b0, scale_wr_addr_core}  ),
-    .wr_data  ( scale_wr_data_core          ),
-    .wr_en    ( scale_wr_pulse_core         ),
-    .result_m ( bfp_result_m                ),
-    .result_e ( bfp_result_e                ),
-    .done     ( lay_done_core               )
+    .clk          ( core_clk          ),
+    .rst          ( ~core_resetn | lay_restart_core ),
+    .start        ( bfp_start_r       ),
+    .done         ( lay_done_core     ),
+    .result_tokens( bfp_result_tokens )
   );
-  assign lay_result = {{(9216-16*16-4*8){1'b0}}, bfp_result_e, bfp_result_m};
+  assign lay_result = {{(9216 - LBFP_NSTEPS*16){1'b0}}, bfp_result_tokens};
 
   // AXI master to MIG: tied off (BFP path has no DDR3 weight streaming).
   assign m_axi_arvalid = 1'b0;
