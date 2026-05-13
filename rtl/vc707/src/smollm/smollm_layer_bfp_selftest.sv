@@ -27,6 +27,11 @@ module smollm_layer_bfp_selftest #(
   input  wire                                clk,
   input  wire                                rst,
   input  wire                                restart,
+  // Host weight-write port (forwarded to the inner layer's BRAM write port)
+  input  wire [4:0]                          wr_kind,
+  input  wire [17:0]                         wr_addr,
+  input  wire [15:0]                         wr_data,
+  input  wire                                wr_en,
   output logic [RESULT_LANES*BFP_MANT_W-1:0] result_m,
   output logic [(D/BFP_TILE)*BFP_EXP_W-1:0]  result_e,
   output logic                               done
@@ -72,6 +77,8 @@ module smollm_layer_bfp_selftest #(
     .hidden_out_m(lay_hidden_out_m),
     .hidden_out_e(lay_hidden_out_e),
     .done(lay_done),
+    .wr_kind(wr_kind), .wr_addr(wr_addr),
+    .wr_data(wr_data), .wr_en(wr_en),
     .dbg_state(ignore_state),
     .dbg_cnt(ignore_cnt),
     .dbg_chunk(ignore_chunk)

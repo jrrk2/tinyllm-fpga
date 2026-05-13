@@ -321,15 +321,37 @@ for h_i in range(H_KV):
     kv_K[KV_POS, h_i] = k[h_i*HD:(h_i+1)*HD]
     kv_V[KV_POS, h_i] = v[h_i*HD:(h_i+1)*HD]
 attn = np.zeros(D)
+golden_scores = None
+golden_probs  = None
 for h_i in range(H_Q):
     kvh = h_i // grp
     scores = np.zeros(KV_POS + 1)
     for t in range(KV_POS + 1):
         scores[t] = float(np.dot(q[h_i*HD:(h_i+1)*HD], kv_K[t, kvh])) / math.sqrt(HD)
     sm = softmax_fp(scores)
+    if h_i == 0:
+        golden_scores = scores.copy()
+        golden_probs  = sm.copy()
     for t in range(KV_POS + 1):
         attn[h_i*HD:(h_i+1)*HD] += sm[t] * kv_V[t, kvh]
 attn = fp_quantize_vec(attn)
+# Save golden scores + probs for head 0 (single-head test config).
+# Quantize scores to BFP at scores_shared_exp (max of per-timestep exponents);
+# probs to BFP-Q1.15 (shared exp via softmax output).
+# RTL dump format: 4 mantissas (MAX_CTX) each.
+if golden_scores is not None:
+    s_pad = np.zeros(MAX_CTX); s_pad[:KV_POS+1] = golden_scores
+    p_pad = np.zeros(MAX_CTX); p_pad[:KV_POS+1] = golden_probs
+    # scores: pad to TILE for tile_quantize, then take first MAX_CTX
+    s_padT = np.zeros(TILE); s_padT[:MAX_CTX] = s_pad
+    p_padT = np.zeros(TILE); p_padT[:MAX_CTX] = p_pad
+    sm_, se_ = tile_quantize(s_padT); pm_, pe_ = tile_quantize(p_padT)
+    write_hex(os.path.join(OUT, f"{PREFIX}STAGE_SCORES_m.hex"), sm_.flatten()[:MAX_CTX], 4)
+    write_hex(os.path.join(OUT, f"{PREFIX}STAGE_SCORES_e.hex"), [int(se_[0])]*MAX_CTX, 2)
+    write_hex(os.path.join(OUT, f"{PREFIX}STAGE_PROBS_m.hex"),  pm_.flatten()[:MAX_CTX], 4)
+    write_hex(os.path.join(OUT, f"{PREFIX}STAGE_PROBS_e.hex"),  [int(pe_[0])]*MAX_CTX, 2)
+    sys.stderr.write(f"  golden scores: {golden_scores}\n")
+    sys.stderr.write(f"  golden probs:  {golden_probs}\n")
 a_m, a_e = tile_quantize(attn)
 o = matvec_hw_golden(a_m, a_e, Wo_m, Wo_e)
 h1 = fp_quantize_vec(h_in_q + o)
@@ -346,6 +368,42 @@ h_out = fp_quantize_vec(h1 + d_vec)
 h_out_m, h_out_e = tile_quantize(h_out)
 write_hex(os.path.join(OUT, f"{PREFIX}HOUT_m.hex"), h_out_m.flatten(), 4)
 write_hex(os.path.join(OUT, f"{PREFIX}HOUT_e.hex"), h_out_e, 2)
+
+# Dump per-stage intermediates so RTL can diff against them.
+def dump_stage(tag, arr):
+    m, e = tile_quantize(arr)
+    write_hex(os.path.join(OUT, f"{PREFIX}STAGE_{tag}_m.hex"), m.flatten(), 4)
+    write_hex(os.path.join(OUT, f"{PREFIX}STAGE_{tag}_e.hex"), e, 2)
+
+dump_stage('N1',  n1)
+dump_stage('Q',   q)        # post-rope Q (since rope_fp overwrites in-place)
+dump_stage('K',   k)        # post-rope K
+dump_stage('V',   v)
+dump_stage('ATTN', attn)
+dump_stage('O',   o)
+dump_stage('H1',  h1)
+dump_stage('N2',  n2)
+dump_stage('G',   g_vec)
+dump_stage('U',   u_vec)
+dump_stage('MLP', mlp)
+dump_stage('D',   d_vec)
+# Pre-rope Q/K dumps need a re-run before the in-place rope step.  Re-do.
+np.random.seed(SEED)
+# advance RNG to the same point as h_in
+_ = (np.random.randn(D,D) * 0.3); _ = (np.random.randn(H_KV*HD,D) * 0.3)
+_ = (np.random.randn(H_KV*HD,D) * 0.3); _ = (np.random.randn(D,D) * 0.3)
+_ = (np.random.randn(FFN,D) * 0.3); _ = (np.random.randn(FFN,D) * 0.3)
+_ = (np.random.randn(D,FFN) * 0.3)
+_ = np.ones(D) + 0.05*np.random.randn(D); _ = np.ones(D) + 0.05*np.random.randn(D)
+_ = (np.random.randn(MAX_CTX,H_KV*HD) * 0.5); _ = (np.random.randn(MAX_CTX,H_KV*HD) * 0.5)
+_ = (np.random.randn(D) * 1.0)
+# Recompute pre-rope:
+n1_rerun = rmsnorm_fp(h_in_q, g1_q)
+n1m_r, n1e_r = tile_quantize(n1_rerun)
+q_pre = matvec_hw_golden(n1m_r, n1e_r, Wq_m, Wq_e)
+k_pre = matvec_hw_golden(n1m_r, n1e_r, Wk_m, Wk_e)
+dump_stage('QPRE', q_pre)
+dump_stage('KPRE', k_pre)
 
 # Emit cfg.svh
 with open(os.path.join(OUT, f"{PREFIX}cfg.svh"), 'w') as f:

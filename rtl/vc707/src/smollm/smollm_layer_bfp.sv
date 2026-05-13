@@ -44,6 +44,20 @@ module smollm_layer_bfp #(
   output logic signed [D*BFP_MANT_W-1:0]     hidden_out_m,
   output logic signed [(D/BFP_TILE)*BFP_EXP_W-1:0] hidden_out_e,
   output logic                               done,
+  // Host write port for the weight / gamma / KV-init BRAMs.  Lets the host
+  // patch BFP weights post-bitstream without re-synth (matches the existing
+  // scale-brom flow for the int8 path).
+  //   wr_kind: 0=WQ_m 1=WQ_e 2=WK_m 3=WK_e 4=WV_m 5=WV_e 6=WO_m 7=WO_e
+  //            8=WG_m 9=WG_e 10=WU_m 11=WU_e 12=WDN_m 13=WDN_e
+  //            14=G1_m 15=G1_e 16=G2_m 17=G2_e
+  //            18=K_INIT_m 19=K_INIT_e 20=V_INIT_m 21=V_INIT_e
+  //   wr_addr: per-rom entry index
+  //   wr_data: 16-bit mantissa (lower 16) or 8-bit exponent (lower 8)
+  //   wr_en : 1-cycle pulse
+  input  wire [4:0]                          wr_kind,
+  input  wire [17:0]                         wr_addr,
+  input  wire [15:0]                         wr_data,
+  input  wire                                wr_en,
   // Debug taps (synthesis-friendly — only used by sim testbench)
   output logic [5:0]                         dbg_state,
   output logic [11:0]                        dbg_cnt,
@@ -168,6 +182,40 @@ module smollm_layer_bfp #(
 `endif
 
   // ---------------------------------------------------------------------------
+  // Host write port: lets a regmap overlay individual weight/gamma/KV-init
+  // entries post-bitstream.  $readmemh provides the boot defaults; this
+  // demuxes wr_kind to the addressed BRAM.  Vivado infers RAMB36E1 with a
+  // single write port + asynchronous-ish read on these arrays.
+  // ---------------------------------------------------------------------------
+  always_ff @(posedge clk) if (wr_en) begin
+    case (wr_kind)
+      5'd0:  rom_WQ_m  [wr_addr]                       <= wr_data;
+      5'd1:  rom_WQ_e  [wr_addr]                       <= wr_data[BFP_EXP_W-1:0];
+      5'd2:  rom_WK_m  [wr_addr]                       <= wr_data;
+      5'd3:  rom_WK_e  [wr_addr]                       <= wr_data[BFP_EXP_W-1:0];
+      5'd4:  rom_WV_m  [wr_addr]                       <= wr_data;
+      5'd5:  rom_WV_e  [wr_addr]                       <= wr_data[BFP_EXP_W-1:0];
+      5'd6:  rom_WO_m  [wr_addr]                       <= wr_data;
+      5'd7:  rom_WO_e  [wr_addr]                       <= wr_data[BFP_EXP_W-1:0];
+      5'd8:  rom_WG_m  [wr_addr]                       <= wr_data;
+      5'd9:  rom_WG_e  [wr_addr]                       <= wr_data[BFP_EXP_W-1:0];
+      5'd10: rom_WU_m  [wr_addr]                       <= wr_data;
+      5'd11: rom_WU_e  [wr_addr]                       <= wr_data[BFP_EXP_W-1:0];
+      5'd12: rom_WDN_m [wr_addr]                       <= wr_data;
+      5'd13: rom_WDN_e [wr_addr]                       <= wr_data[BFP_EXP_W-1:0];
+      5'd14: rom_G1_m  [wr_addr[$clog2(D)-1:0]]        <= wr_data;
+      5'd15: rom_G1_e  [wr_addr[$clog2(NT_D+1)-1:0]]   <= wr_data[BFP_EXP_W-1:0];
+      5'd16: rom_G2_m  [wr_addr[$clog2(D)-1:0]]        <= wr_data;
+      5'd17: rom_G2_e  [wr_addr[$clog2(NT_D+1)-1:0]]   <= wr_data[BFP_EXP_W-1:0];
+      5'd18: kv_k_m    [wr_addr[$clog2(MAX_CTX*H_KV*HD)-1:0]] <= wr_data;
+      5'd19: kv_k_e    [wr_addr[$clog2(MAX_CTX*NT_KV)-1:0]]   <= wr_data[BFP_EXP_W-1:0];
+      5'd20: kv_v_m    [wr_addr[$clog2(MAX_CTX*H_KV*HD)-1:0]] <= wr_data;
+      5'd21: kv_v_e    [wr_addr[$clog2(MAX_CTX*NT_KV)-1:0]]   <= wr_data[BFP_EXP_W-1:0];
+      default: ;
+    endcase
+  end
+
+  // ---------------------------------------------------------------------------
   // Working buffers
   // ---------------------------------------------------------------------------
   logic signed [BFP_MANT_W-1:0] hin_m   [0:D-1];
@@ -253,7 +301,12 @@ module smollm_layer_bfp #(
   logic [6:0]       chunk;
   logic [4:0]       head_idx;
   logic [4:0]       kv_t;
-  logic [BFP_EXP_W-1:0] score_emax;
+  logic signed [BFP_EXP_W-1:0] score_emax;
+  // Comb-derived signed view of the matvec engine's lane-0 exp output.
+  // The part-select mv_out_e[0+:8] is unsigned by SV rules, so explicit
+  // re-typing is needed for signed comparisons against score_emax.
+  wire signed [BFP_EXP_W-1:0] mv_lane0_e = $signed(mv_out_e[0 +: BFP_EXP_W]);
+  wire signed [BFP_MANT_W-1:0] mv_lane0_m = $signed(mv_out_m[0 +: BFP_MANT_W]);
 
   // Sub-engine reset (one-shot pulses between matvecs / etc.)
   logic eng_rst;
@@ -313,20 +366,45 @@ module smollm_layer_bfp #(
     .out_valid(rp_y_valid), .done(rp_done)
   );
 
-  logic                                sg_start, sg_valid, sg_last;
-  logic signed [BFP_MANT_W-1:0]        sg_g_m, sg_u_m;
-  logic signed [BFP_EXP_W -1:0]        sg_g_e, sg_u_e;
+  // SwiGLU engine — same comb-drive pattern as residual (load+emit
+  // alternation with in_ready back-pressure at tile boundaries).
+  logic                                sg_start;
+  logic                                sg_drive;
+  logic signed [BFP_MANT_W-1:0]        sg_g_m_c, sg_u_m_c;
+  logic signed [BFP_EXP_W -1:0]        sg_g_e_c, sg_u_e_c;
+  logic                                sg_valid_c, sg_last_c;
   wire                                 sg_in_ready;
   wire  signed [BFP_MANT_W-1:0]        sg_y_m;
   wire  signed [BFP_EXP_W -1:0]        sg_y_e;
   wire                                 sg_y_valid, sg_done;
 
+  always_comb sg_drive = (state == S_SWG);
+  always_comb begin
+    sg_g_m_c   = '0; sg_g_e_c = '0;
+    sg_u_m_c   = '0; sg_u_e_c = '0;
+    sg_valid_c = 1'b0;
+    sg_last_c  = 1'b0;
+    if (sg_drive) begin
+      sg_g_m_c   = g_m[cnt[CW_FFN-1:0]];
+      sg_g_e_c   = g_e[cnt[CW_FFN-1:0] / BFP_TILE];
+      sg_u_m_c   = u_m[cnt[CW_FFN-1:0]];
+      sg_u_e_c   = u_e[cnt[CW_FFN-1:0] / BFP_TILE];
+      // NB: gate in_valid by in_ready (mirrors the standalone testbench).
+      // This makes the 1-cycle valid_r pipeline inside swiglu_bfp line up
+      // with the comb up_mant_r / silu_at_lut registration — otherwise the
+      // first prod_buf write after S_EMIT→S_LOAD would store the stale
+      // (last-S_EMIT-cycle) input.
+      sg_valid_c = sg_in_ready && (cnt < FFN);
+      sg_last_c  = sg_in_ready && (cnt == FFN-1);
+    end
+  end
+
   swiglu_bfp #(.D(FFN)) i_sg (
     .clk(clk), .rst(rst),
     .start(sg_start),
-    .in_gate_mant(sg_g_m), .in_gate_exp(sg_g_e),
-    .in_up_mant(sg_u_m),   .in_up_exp(sg_u_e),
-    .in_valid(sg_valid), .last_elem(sg_last),
+    .in_gate_mant(sg_g_m_c), .in_gate_exp(sg_g_e_c),
+    .in_up_mant(sg_u_m_c),   .in_up_exp(sg_u_e_c),
+    .in_valid(sg_valid_c), .last_elem(sg_last_c),
     .in_ready(sg_in_ready),
     .out_y_mant(sg_y_m), .out_y_exp(sg_y_e),
     .out_valid(sg_y_valid), .done(sg_done)
@@ -349,20 +427,52 @@ module smollm_layer_bfp #(
     .out_valid(sm_y_valid), .done(sm_done)
   );
 
-  logic                                rs_start, rs_valid, rs_last;
-  logic signed [BFP_MANT_W-1:0]        rs_a_m, rs_b_m;
-  logic signed [BFP_EXP_W -1:0]        rs_a_e, rs_b_e;
+  // Residual engine — combinational input drive so the engine's S_LOAD→
+  // S_EMIT back-pressure (in_ready dropping at tile boundary) directly stops
+  // cnt advancement WITHOUT losing the next-to-be-consumed sample.  See the
+  // commented timing trace in S_RES1 / S_RES2 for why a registered drive
+  // off-by-ones at tile boundaries.
+  logic                                rs_start;
+  logic                                rs_drive_res1;     // 1 in S_RES1
+  logic                                rs_drive_res2;     // 1 in S_RES2
+  logic signed [BFP_MANT_W-1:0]        rs_a_m_c, rs_b_m_c;
+  logic signed [BFP_EXP_W -1:0]        rs_a_e_c, rs_b_e_c;
+  logic                                rs_valid_c, rs_last_c;
   wire                                 rs_in_ready;
   wire  signed [BFP_MANT_W-1:0]        rs_y_m;
   wire  signed [BFP_EXP_W -1:0]        rs_y_e;
   wire                                 rs_y_valid, rs_done;
 
+  always_comb rs_drive_res1 = (state == S_RES1);
+  always_comb rs_drive_res2 = (state == S_RES2);
+  always_comb begin
+    rs_a_m_c   = '0; rs_a_e_c = '0;
+    rs_b_m_c   = '0; rs_b_e_c = '0;
+    rs_valid_c = 1'b0;
+    rs_last_c  = 1'b0;
+    if (rs_drive_res1) begin
+      rs_a_m_c   = hin_m[cnt[CW_D-1:0]];
+      rs_a_e_c   = hin_e[cnt[CW_D-1:0] / BFP_TILE];
+      rs_b_m_c   = o_m  [cnt[CW_D-1:0]];
+      rs_b_e_c   = o_e  [cnt[CW_D-1:0] / BFP_TILE];
+      rs_valid_c = rs_in_ready && (cnt < D);
+      rs_last_c  = rs_in_ready && (cnt == D-1);
+    end else if (rs_drive_res2) begin
+      rs_a_m_c   = h1_m[cnt[CW_D-1:0]];
+      rs_a_e_c   = h1_e[cnt[CW_D-1:0] / BFP_TILE];
+      rs_b_m_c   = d_m [cnt[CW_D-1:0]];
+      rs_b_e_c   = d_e [cnt[CW_D-1:0] / BFP_TILE];
+      rs_valid_c = rs_in_ready && (cnt < D);
+      rs_last_c  = rs_in_ready && (cnt == D-1);
+    end
+  end
+
   residual_bfp #(.D(D)) i_rs (
     .clk(clk), .rst(rst),
     .start(rs_start),
-    .in_a_mant(rs_a_m), .in_a_exp(rs_a_e),
-    .in_b_mant(rs_b_m), .in_b_exp(rs_b_e),
-    .in_valid(rs_valid), .last_elem(rs_last), .in_ready(rs_in_ready),
+    .in_a_mant(rs_a_m_c), .in_a_exp(rs_a_e_c),
+    .in_b_mant(rs_b_m_c), .in_b_exp(rs_b_e_c),
+    .in_valid(rs_valid_c), .last_elem(rs_last_c), .in_ready(rs_in_ready),
     .out_y_mant(rs_y_m), .out_y_exp(rs_y_e),
     .out_valid(rs_y_valid), .done(rs_done)
   );
@@ -413,6 +523,13 @@ module smollm_layer_bfp #(
   integer ii;       // for-loop scratch in always_ff (synth-safe with int loop body)
   logic [4:0] head_grp;
   logic [11:0] av_row_base;      // current AV row offset = head*HD + chunk*LANES
+  // Common w_e for AV — max of kv_v_e[t][chunk] over t in [0..kv_pos].
+  // Computed per-chunk in S_AV_PRIME; used by S_AV_DRIVE to align each
+  // timestep's V mantissa before feeding the matvec engine.
+  logic signed [BFP_EXP_W-1:0] av_emax;
+  // Residual / SwiGLU output write-index — independent of cnt (which tracks
+  // input drive) because the engines emit interleaved with loading.
+  logic [11:0] out_cnt;
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -443,28 +560,17 @@ module smollm_layer_bfp #(
       rp_x_m          <= '0;
       rp_x_e          <= '0;
       sg_start        <= 1'b0;
-      sg_valid        <= 1'b0;
-      sg_last         <= 1'b0;
-      sg_g_m          <= '0;
-      sg_g_e          <= '0;
-      sg_u_m          <= '0;
-      sg_u_e          <= '0;
       sm_start        <= 1'b0;
       sm_valid        <= 1'b0;
       sm_n            <= '0;
       sm_x_m          <= '0;
       sm_x_e          <= '0;
       rs_start        <= 1'b0;
-      rs_valid        <= 1'b0;
-      rs_last         <= 1'b0;
-      rs_a_m          <= '0;
-      rs_a_e          <= '0;
-      rs_b_m          <= '0;
-      rs_b_e          <= '0;
       scores_e_shared <= '0;
       probs_e_shared  <= '0;
       head_grp        <= '0;
       av_row_base     <= '0;
+      out_cnt         <= '0;
     end else begin
       // Default pulses → 0
       mv_start <= 1'b0;
@@ -476,13 +582,9 @@ module smollm_layer_bfp #(
       rp_start <= 1'b0;
       rp_valid <= 1'b0;
       sg_start <= 1'b0;
-      sg_valid <= 1'b0;
-      sg_last  <= 1'b0;
       sm_start <= 1'b0;
       sm_valid <= 1'b0;
       rs_start <= 1'b0;
-      rs_valid <= 1'b0;
-      rs_last  <= 1'b0;
       eng_rst  <= 1'b0;
       done     <= 1'b0;
 
@@ -834,13 +936,16 @@ module smollm_layer_bfp #(
           else cnt <= cnt + 1'b1;
         end
         S_QK_DRAIN: if (mv_out_valid) begin
-          scores_m  [kv_t] <= mv_out_m[0 +: BFP_MANT_W];
-          qk_score_e[kv_t] <= mv_out_e[0 +: BFP_EXP_W ];
-          if (mv_out_e[0 +: BFP_EXP_W] > score_emax)
-            score_emax <= mv_out_e[0 +: BFP_EXP_W];
+`ifdef LBFP_STAGE_DUMP
+          $display("[QK_DRAIN] kv_t=%0d mv_lane0_m=%0d mv_lane0_e=%0d score_emax=%0d this_>max=%0d",
+                   kv_t, mv_lane0_m, mv_lane0_e, score_emax,
+                   (mv_lane0_e > score_emax));
+`endif
+          scores_m  [kv_t] <= mv_lane0_m;
+          qk_score_e[kv_t] <= mv_lane0_e;
+          if (mv_lane0_e > score_emax) score_emax <= mv_lane0_e;
           if (kv_t == kv_pos) begin
-            scores_e_shared <= (mv_out_e[0 +: BFP_EXP_W] > score_emax)
-                              ? mv_out_e[0 +: BFP_EXP_W] : score_emax;
+            scores_e_shared <= (mv_lane0_e > score_emax) ? mv_lane0_e : score_emax;
             cnt      <= '0;
             eng_rst  <= 1'b1;
             sm_start <= 1'b1;          // fire start one cycle before first valid
@@ -896,36 +1001,59 @@ module smollm_layer_bfp #(
         S_AV_PRIME: begin
           mv_start <= 1'b1; cnt <= '0; state <= S_AV_DRIVE;
           head_grp <= 5'(kv_grp_of(head_idx));
+          // Find max of kv_v_e for this head's V tile at chunk `chunk`,
+          // across timesteps 0..kv_pos.  For kv_t==kv_pos use v_e (current step
+          // didn't write back to the cache yet).
+          begin : av_emax_calc
+            automatic logic signed [BFP_EXP_W-1:0] em;
+            automatic int tile_idx;
+            tile_idx = (kv_grp_of(head_idx) * HD + chunk * LANES) / BFP_TILE;
+            em = $signed(v_e[tile_idx]);  // current-step contribution
+            for (int t = 0; t < MAX_CTX; t++)
+              if (t < kv_pos)
+                if ($signed(kv_v_e[t * NT_KV + tile_idx]) > em)
+                  em = $signed(kv_v_e[t * NT_KV + tile_idx]);
+            av_emax <= em;
+          end
         end
         // matvec engine requires input dim to be a multiple of TILE so that
-        // tile_done can fire.  Pad with zeros past kv_pos to the next TILE
-        // boundary; mv_last fires on the final padded cycle.
-        S_AV_DRIVE: begin
+        // tile_done can fire AND all 16 elements of a tile share one w_e.
+        // For AV the per-timestep V values have different per-tile exps, so
+        // we pre-shift each timestep's V mantissa to av_emax and feed av_emax
+        // as the shared w_e for every cycle (including the post-kv_pos
+        // padding zeros).
+        S_AV_DRIVE: begin : av_drive_blk
+          automatic int tile_idx;
+          automatic logic signed [BFP_EXP_W-1:0] v_e_this;
+          automatic logic signed [BFP_EXP_W-1:0] shamt;
+          tile_idx = (head_grp * HD + chunk * LANES) / BFP_TILE;
           mv_valid <= 1'b1;
           mv_x_e   <= probs_e_shared;
           if (cnt <= kv_pos) begin
             mv_x_m <= probs_m[cnt[CW_CTX-1:0]];
+            if (cnt[CW_CTX-1:0] == kv_pos) v_e_this = $signed(v_e[tile_idx]);
+            else v_e_this = $signed(kv_v_e[cnt[CW_CTX-1:0] * NT_KV + tile_idx]);
+            shamt = av_emax - v_e_this;
             for (ii = 0; ii < LANES; ii++) begin
-              if (cnt[CW_CTX-1:0] == kv_pos) begin
-                mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <=
-                  v_m[head_grp * HD + chunk * LANES + ii];
-                mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <=
-                  v_e[(head_grp * HD + chunk * LANES + ii) / BFP_TILE];
-              end else begin
-                mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <=
-                  kv_v_m[cnt[CW_CTX-1:0] * H_KV*HD + head_grp * HD + chunk * LANES + ii];
-                mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <=
-                  kv_v_e[cnt[CW_CTX-1:0] * NT_KV
-                         + (head_grp * HD + chunk * LANES + ii) / BFP_TILE];
-              end
+              automatic logic signed [BFP_MANT_W-1:0] m_raw;
+              if (cnt[CW_CTX-1:0] == kv_pos)
+                m_raw = $signed(v_m[head_grp * HD + chunk * LANES + ii]);
+              else
+                m_raw = $signed(
+                  kv_v_m[cnt[CW_CTX-1:0] * H_KV*HD + head_grp * HD + chunk * LANES + ii]);
+              if (shamt >= 16)     mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <= '0;
+              else if (shamt >= 0) mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <= m_raw >>> shamt[3:0];
+              else                 mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <= m_raw;
+              mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <= av_emax;
             end
           end else begin
-            // Padding: drive zero mantissas (any exp works; weight zero
-            // contributes nothing to the MAC)
+            // Padding cycles past kv_pos.  Mantissas zero; w_e == av_emax so
+            // the matvec engine's tile_exp ends up at probs_e + av_emax (the
+            // intended scale).
             mv_x_m <= '0;
             for (ii = 0; ii < LANES; ii++) begin
               mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <= '0;
-              mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <= '0;
+              mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <= av_emax;
             end
           end
           mv_last <= (cnt == BFP_TILE - 1);
@@ -1005,7 +1133,7 @@ module smollm_layer_bfp #(
         end
         S_OMV_NEXT: begin
           if (chunk == CHUNKS_D - 1) begin
-            chunk   <= '0; cnt <= '0;
+            chunk   <= '0; cnt <= '0; out_cnt <= '0;
             eng_rst <= 1'b1; rs_start <= 1'b1; state <= S_RES1;
           end else begin
             chunk   <= chunk + 1'b1;
@@ -1014,32 +1142,41 @@ module smollm_layer_bfp #(
         end
 
         // ===================================================================
-        // Residual 1: h1 = hin + o
+        // Residual 1: h1 = hin + o.
+        //
+        // rs_a_*/rs_b_*/rs_valid/rs_last are driven COMBINATIONALLY from cnt
+        // (see always_comb above and the rs_drive_res1 flag).  The engine's
+        // in_ready gate naturally pauses cnt during S_EMIT phases.  When
+        // in_valid && in_ready both high THIS cycle, the engine WILL consume
+        // the comb data into its registers this same cycle — so cnt can
+        // advance without losing data at tile boundaries.
         // ===================================================================
         S_RES1: begin
-          rs_valid <= rs_in_ready;
-          rs_a_m   <= hin_m[cnt[CW_D-1:0]];
-          rs_a_e   <= hin_e[cnt[CW_D-1:0] / BFP_TILE];
-          rs_b_m   <= o_m  [cnt[CW_D-1:0]];
-          rs_b_e   <= o_e  [cnt[CW_D-1:0] / BFP_TILE];
-          rs_last  <= rs_in_ready && (cnt == D-1);
-          if (rs_in_ready) begin
-            if (cnt == D-1) begin
-              state <= S_RES1_WAIT; cnt <= '0;
-            end else cnt <= cnt + 1'b1;
+          // (comb drive is via rs_drive_res1 / cnt above)
+          if (rs_in_ready && rs_valid_c) begin
+            if (cnt == D-1) state <= S_RES1_WAIT;
+            else            cnt <= cnt + 1'b1;
+          end
+          // Capture outputs concurrently — engine emits during S_LOAD gaps.
+          if (rs_y_valid) begin
+            h1_m[out_cnt[CW_D-1:0]] <= rs_y_m;
+            if (out_cnt[3:0] == 4'd0)
+              h1_e[out_cnt[CW_D-1:0] / BFP_TILE] <= rs_y_e;
+            out_cnt <= out_cnt + 1'b1;
           end
         end
         S_RES1_WAIT: begin
           if (rs_y_valid) begin
-            h1_m[cnt[CW_D-1:0]] <= rs_y_m;
-            if (cnt[3:0] == 4'd0)
-              h1_e[cnt[CW_D-1:0] / BFP_TILE] <= rs_y_e;
-            cnt <= cnt + 1'b1;
+            h1_m[out_cnt[CW_D-1:0]] <= rs_y_m;
+            if (out_cnt[3:0] == 4'd0)
+              h1_e[out_cnt[CW_D-1:0] / BFP_TILE] <= rs_y_e;
+            out_cnt <= out_cnt + 1'b1;
           end
           if (rs_done) begin
             state    <= S_NORM2;
             eng_rst  <= 1'b1;
             cnt      <= '0;
+            out_cnt  <= '0;
             rn_start <= 1'b1;
           end
         end
@@ -1151,34 +1288,34 @@ module smollm_layer_bfp #(
         end
         S_UMV_NEXT: begin
           if (chunk == CHUNKS_FFN - 1) begin
-            chunk <= '0; cnt <= '0; eng_rst <= 1'b1; sg_start <= 1'b1; state <= S_SWG;
+            chunk <= '0; cnt <= '0; out_cnt <= '0;
+            eng_rst <= 1'b1; sg_start <= 1'b1; state <= S_SWG;
           end else begin
             chunk <= chunk + 1'b1; eng_rst <= 1'b1; state <= S_UMV_PRIME;
           end
         end
 
         // ===================================================================
-        // SwiGLU (FFN -> FFN)
+        // SwiGLU (FFN -> FFN).  Comb drive via sg_drive flag.
         // ===================================================================
         S_SWG: begin
-          sg_valid <= sg_in_ready;
-          sg_g_m   <= g_m[cnt[CW_FFN-1:0]];
-          sg_g_e   <= g_e[cnt[CW_FFN-1:0] / BFP_TILE];
-          sg_u_m   <= u_m[cnt[CW_FFN-1:0]];
-          sg_u_e   <= u_e[cnt[CW_FFN-1:0] / BFP_TILE];
-          sg_last  <= sg_in_ready && (cnt == FFN-1);
-          if (sg_in_ready) begin
-            if (cnt == FFN-1) begin
-              state <= S_SWG_WAIT; cnt <= '0;
-            end else cnt <= cnt + 1'b1;
+          if (sg_in_ready && sg_valid_c) begin
+            if (cnt == FFN-1) state <= S_SWG_WAIT;
+            else              cnt <= cnt + 1'b1;
+          end
+          if (sg_y_valid) begin
+            mlp_m[out_cnt[CW_FFN-1:0]] <= sg_y_m;
+            if (out_cnt[3:0] == 4'd0)
+              mlp_e[out_cnt[CW_FFN-1:0] / BFP_TILE] <= sg_y_e;
+            out_cnt <= out_cnt + 1'b1;
           end
         end
         S_SWG_WAIT: begin
           if (sg_y_valid) begin
-            mlp_m[cnt[CW_FFN-1:0]] <= sg_y_m;
-            if (cnt[3:0] == 4'd0)
-              mlp_e[cnt[CW_FFN-1:0] / BFP_TILE] <= sg_y_e;
-            cnt <= cnt + 1'b1;
+            mlp_m[out_cnt[CW_FFN-1:0]] <= sg_y_m;
+            if (out_cnt[3:0] == 4'd0)
+              mlp_e[out_cnt[CW_FFN-1:0] / BFP_TILE] <= sg_y_e;
+            out_cnt <= out_cnt + 1'b1;
           end
           if (sg_done) begin
             chunk <= '0; eng_rst <= 1'b1; state <= S_DMV_PRIME;
@@ -1223,7 +1360,7 @@ module smollm_layer_bfp #(
         end
         S_DMV_NEXT: begin
           if (chunk == CHUNKS_D - 1) begin
-            chunk    <= '0; cnt <= '0;
+            chunk    <= '0; cnt <= '0; out_cnt <= '0;
             eng_rst  <= 1'b1; rs_start <= 1'b1; state <= S_RES2;
           end else begin
             chunk    <= chunk + 1'b1;
@@ -1232,27 +1369,26 @@ module smollm_layer_bfp #(
         end
 
         // ===================================================================
-        // Residual 2: hout = h1 + d
+        // Residual 2: hout = h1 + d.  Comb drive via rs_drive_res2.
         // ===================================================================
         S_RES2: begin
-          rs_valid <= rs_in_ready;
-          rs_a_m   <= h1_m[cnt[CW_D-1:0]];
-          rs_a_e   <= h1_e[cnt[CW_D-1:0] / BFP_TILE];
-          rs_b_m   <= d_m [cnt[CW_D-1:0]];
-          rs_b_e   <= d_e [cnt[CW_D-1:0] / BFP_TILE];
-          rs_last  <= rs_in_ready && (cnt == D-1);
-          if (rs_in_ready) begin
-            if (cnt == D-1) begin
-              state <= S_RES2_WAIT; cnt <= '0;
-            end else cnt <= cnt + 1'b1;
+          if (rs_in_ready && rs_valid_c) begin
+            if (cnt == D-1) state <= S_RES2_WAIT;
+            else            cnt <= cnt + 1'b1;
+          end
+          if (rs_y_valid) begin
+            hout_m[out_cnt[CW_D-1:0]] <= rs_y_m;
+            if (out_cnt[3:0] == 4'd0)
+              hout_e[out_cnt[CW_D-1:0] / BFP_TILE] <= rs_y_e;
+            out_cnt <= out_cnt + 1'b1;
           end
         end
         S_RES2_WAIT: begin
           if (rs_y_valid) begin
-            hout_m[cnt[CW_D-1:0]] <= rs_y_m;
-            if (cnt[3:0] == 4'd0)
-              hout_e[cnt[CW_D-1:0] / BFP_TILE] <= rs_y_e;
-            cnt <= cnt + 1'b1;
+            hout_m[out_cnt[CW_D-1:0]] <= rs_y_m;
+            if (out_cnt[3:0] == 4'd0)
+              hout_e[out_cnt[CW_D-1:0] / BFP_TILE] <= rs_y_e;
+            out_cnt <= out_cnt + 1'b1;
           end
           if (rs_done) state <= S_DONE;
         end
@@ -1270,6 +1406,92 @@ module smollm_layer_bfp #(
   always_comb dbg_state = state;
   always_comb dbg_cnt   = cnt;
   always_comb dbg_chunk = chunk;
+
+`ifdef LBFP_STAGE_DUMP
+  // Sim-only intermediate dumps.  $writememh executes on the cycle the
+  // FSM transitions OUT of each post-stage state.  Vivado will warn-skip
+  // these; Verilator writes the listed array to a hex file.
+  logic [5:0] prev_state;
+  always_ff @(posedge clk) begin
+    if (rst) prev_state <= 6'h3f;
+    else begin
+      prev_state <= state;
+      if (prev_state == 6'd3 && state == 6'd4) begin
+        $writememh("rtl_n1_m.hex", n1_m);
+        $writememh("rtl_n1_e.hex", n1_e);
+      end
+      if (prev_state == 6'd7 && state == 6'd8) begin
+        $writememh("rtl_qpre_m.hex", q_m);
+        $writememh("rtl_qpre_e.hex", q_e);
+      end
+      if (prev_state == 6'd11 && state == 6'd12) begin
+        $writememh("rtl_kpre_m.hex", k_m);
+        $writememh("rtl_kpre_e.hex", k_e);
+      end
+      if (prev_state == 6'd15 && state == 6'd16) begin
+        $writememh("rtl_v_m.hex", v_m);
+        $writememh("rtl_v_e.hex", v_e);
+      end
+      // State numbers shifted by +2 vs original because of new S_ROPEQ_RQ + S_ROPEK_RQ states.
+      // S_KVWR_M = 22 (was 20) — state right after RQ/RoPE is complete.
+      if (state == 6'd22 && prev_state == 6'd21) begin
+        // Post-rope-requant Q + K
+        $writememh("rtl_q_m.hex", q_m);
+        $writememh("rtl_q_e.hex", q_e);
+        $writememh("rtl_k_m.hex", k_m);
+        $writememh("rtl_k_e.hex", k_e);
+      end
+      // After attention (transition to S_OMV_PRIME)
+      if (prev_state == 6'd32 && state == 6'd33) begin
+        $writememh("rtl_attn_m.hex", attn_m);
+        $writememh("rtl_attn_e.hex", attn_e);
+      end
+      // After softmax wait (S_SM_WAIT=28 → S_AV_PRIME=29): scores + probs ready
+      if (prev_state == 6'd28 && state == 6'd29) begin
+        $writememh("rtl_scores_m.hex", scores_m);
+        $writememh("rtl_qkscore_e.hex", qk_score_e);
+        $writememh("rtl_probs_m.hex", probs_m);
+        $display("scores_e_shared=%0d probs_e_shared=%0d",
+                 $signed(scores_e_shared), $signed(probs_e_shared));
+      end
+      // After O matvec (transition to S_RES1)
+      if (prev_state == 6'd36 && state == 6'd37) begin
+        $writememh("rtl_o_m.hex", o_m);
+        $writememh("rtl_o_e.hex", o_e);
+      end
+      // After RES1 (transition to S_NORM2)
+      if (prev_state == 6'd38 && state == 6'd39) begin
+        $writememh("rtl_h1_m.hex", h1_m);
+        $writememh("rtl_h1_e.hex", h1_e);
+      end
+      // After NORM2 (transition to S_GMV)
+      if (prev_state == 6'd40 && state == 6'd41) begin
+        $writememh("rtl_n2_m.hex", n2_m);
+        $writememh("rtl_n2_e.hex", n2_e);
+      end
+      // After GMV
+      if (prev_state == 6'd44 && state == 6'd45) begin
+        $writememh("rtl_g_m.hex", g_m);
+        $writememh("rtl_g_e.hex", g_e);
+      end
+      // After UMV
+      if (prev_state == 6'd48 && state == 6'd49) begin
+        $writememh("rtl_u_m.hex", u_m);
+        $writememh("rtl_u_e.hex", u_e);
+      end
+      // After SWG
+      if (prev_state == 6'd50 && state == 6'd51) begin
+        $writememh("rtl_mlp_m.hex", mlp_m);
+        $writememh("rtl_mlp_e.hex", mlp_e);
+      end
+      // After DMV
+      if (prev_state == 6'd54 && state == 6'd55) begin
+        $writememh("rtl_d_m.hex", d_m);
+        $writememh("rtl_d_e.hex", d_e);
+      end
+    end
+  end
+`endif
 
 endmodule
 
