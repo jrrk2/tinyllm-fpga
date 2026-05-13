@@ -130,8 +130,8 @@ $(BROM_SV): $(GENERATED_DIR)/brom_%.sv: $(GENERATED_DIR)/tm_layer_%.hex \
 #                  BRAMs.  Adds MICROGPT_BFP_STREAM; also bakes the DDR3
 #                  image (.bin) that the host has to upload before pulsing
 #                  `start`.
-USE_BFP    ?= 0
-BFP_STREAM ?= 0
+USE_BFP    ?= 1
+BFP_STREAM ?= 1
 VIVADO_DEFINES :=
 ifeq ($(USE_BFP),1)
   VIVADO_DEFINES += MICROGPT_USE_BFP
