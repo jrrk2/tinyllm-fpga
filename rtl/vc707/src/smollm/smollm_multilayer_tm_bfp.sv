@@ -62,7 +62,8 @@ module smollm_multilayer_tm_bfp #(
 
   smollm_layer_bfp #(
     .D(D), .H_Q(H_Q), .H_KV(H_KV), .HD(HD),
-    .FFN(FFN), .MAX_CTX(MAX_CTX), .NL(NL), .PREFIX(PREFIX)
+    .FFN(FFN), .MAX_CTX(MAX_CTX), .NL(NL), .PREFIX(PREFIX),
+    .STREAM_WEIGHTS(1'b0)
   ) i_lay (
     .clk(clk), .rst(rst),
     .start(lay_start),
@@ -72,6 +73,20 @@ module smollm_multilayer_tm_bfp #(
     .hidden_out_m(lay_hidden_out_m), .hidden_out_e(lay_hidden_out_e),
     .done(lay_done),
     .wr_kind(5'd0), .wr_addr(18'd0), .wr_data(16'd0), .wr_en(1'b0),
+    // DDR3 streamer ports tied off (STREAM_WEIGHTS=0)
+    .ws_base_WQ_m('0), .ws_base_WQ_e('0),
+    .ws_base_WK_m('0), .ws_base_WK_e('0),
+    .ws_base_WV_m('0), .ws_base_WV_e('0),
+    .ws_base_WO_m('0), .ws_base_WO_e('0),
+    .ws_base_WG_m('0), .ws_base_WG_e('0),
+    .ws_base_WU_m('0), .ws_base_WU_e('0),
+    .ws_base_WDN_m('0), .ws_base_WDN_e('0),
+    .clk_axi(clk), .rst_axi(rst),
+    .m_axi_arvalid(), .m_axi_arready(1'b0), .m_axi_arid(), .m_axi_araddr(),
+    .m_axi_arlen(), .m_axi_arsize(), .m_axi_arburst(), .m_axi_arlock(),
+    .m_axi_arcache(), .m_axi_arprot(), .m_axi_arqos(),
+    .m_axi_rvalid(1'b0), .m_axi_rready(),
+    .m_axi_rid('0), .m_axi_rdata('0), .m_axi_rresp('0), .m_axi_rlast(1'b0),
     .dbg_state(ignore_state), .dbg_cnt(ignore_cnt), .dbg_chunk(ignore_chunk)
   );
 

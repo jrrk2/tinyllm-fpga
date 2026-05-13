@@ -37,7 +37,14 @@ module smollm_layer_bfp #(
   // NL>1 → multilayer mode where layer_idx selects the active layer's
   // ROM bank.  KV cache likewise scales by NL.
   parameter int    NL      = 1,
-  parameter        PREFIX  = "lbfp_"
+  parameter        PREFIX  = "lbfp_",
+  // When STREAM_WEIGHTS=1, the 7 weight matrices are served by an
+  // internal weight_streamer_bfp_mt instance that fetches chunks from
+  // DDR3 via the AXI master ports below.  $readmemh ROMs are dropped.
+  // Gammas + KV cache remain on-chip (small).  Default 0 = selftest.
+  parameter bit    STREAM_WEIGHTS = 1'b0,
+  parameter int    AXI_ADDR_WIDTH = 30,
+  parameter int    AXI_ID_WIDTH   = 5
 )(
   input  wire                                clk,
   input  wire                                rst,
@@ -50,6 +57,46 @@ module smollm_layer_bfp #(
   output logic signed [D*BFP_MANT_W-1:0]     hidden_out_m,
   output logic signed [(D/BFP_TILE)*BFP_EXP_W-1:0] hidden_out_e,
   output logic                               done,
+  // -------------------------------------------------------------------
+  // DDR3 streamer interface (used iff STREAM_WEIGHTS=1).
+  // Caller (autoregress_bfp_top / multilayer_tm) computes the layer-
+  // qualified byte base for each of the 7 matrices and presents them
+  // here; the layer applies chunk_idx * in_dim_bytes internally via the
+  // streamer.  AXI master ports route to MIG ui_clk domain.
+  // -------------------------------------------------------------------
+  input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WQ_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WQ_e,
+  input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WK_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WK_e,
+  input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WV_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WV_e,
+  input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WO_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WO_e,
+  input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WG_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WG_e,
+  input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WU_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WU_e,
+  input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WDN_m,
+  input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WDN_e,
+  input  wire                                clk_axi,
+  input  wire                                rst_axi,
+  output wire                                m_axi_arvalid,
+  input  wire                                m_axi_arready,
+  output wire [AXI_ID_WIDTH-1:0]             m_axi_arid,
+  output wire [AXI_ADDR_WIDTH-1:0]           m_axi_araddr,
+  output wire [7:0]                          m_axi_arlen,
+  output wire [2:0]                          m_axi_arsize,
+  output wire [1:0]                          m_axi_arburst,
+  output wire                                m_axi_arlock,
+  output wire [3:0]                          m_axi_arcache,
+  output wire [2:0]                          m_axi_arprot,
+  output wire [3:0]                          m_axi_arqos,
+  input  wire                                m_axi_rvalid,
+  output wire                                m_axi_rready,
+  input  wire [AXI_ID_WIDTH-1:0]             m_axi_rid,
+  input  wire [511:0]                        m_axi_rdata,
+  input  wire [1:0]                          m_axi_rresp,
+  input  wire                                m_axi_rlast,
   // Host write port for the weight / gamma / KV-init BRAMs.  Lets the host
   // patch BFP weights post-bitstream without re-synth (matches the existing
   // scale-brom flow for the int8 path).
@@ -163,22 +210,28 @@ module smollm_layer_bfp #(
   (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] kv_k_e [0:NL*MAX_CTX*NT_KV-1];
   (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] kv_v_e [0:NL*MAX_CTX*NT_KV-1];
 
+  // When STREAM_WEIGHTS=1, the 14 weight $readmemh's are dropped (weights
+  // come from DDR3 via the streamer below); gammas + KV cache continue
+  // to load from hex.  The W?_? rom_* arrays are still declared above
+  // for elaboration symmetry but go unused (synthesis prunes them).
 `ifdef MICROGPT_WEIGHT_DIR
   initial begin
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WQ_m.hex"},  rom_WQ_m);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WK_m.hex"},  rom_WK_m);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WV_m.hex"},  rom_WV_m);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WO_m.hex"},  rom_WO_m);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WG_m.hex"},  rom_WG_m);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WU_m.hex"},  rom_WU_m);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WDN_m.hex"}, rom_WDN_m);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WQ_e.hex"},  rom_WQ_e);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WK_e.hex"},  rom_WK_e);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WV_e.hex"},  rom_WV_e);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WO_e.hex"},  rom_WO_e);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WG_e.hex"},  rom_WG_e);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WU_e.hex"},  rom_WU_e);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WDN_e.hex"}, rom_WDN_e);
+    if (!STREAM_WEIGHTS) begin
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WQ_m.hex"},  rom_WQ_m);
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WK_m.hex"},  rom_WK_m);
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WV_m.hex"},  rom_WV_m);
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WO_m.hex"},  rom_WO_m);
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WG_m.hex"},  rom_WG_m);
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WU_m.hex"},  rom_WU_m);
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WDN_m.hex"}, rom_WDN_m);
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WQ_e.hex"},  rom_WQ_e);
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WK_e.hex"},  rom_WK_e);
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WV_e.hex"},  rom_WV_e);
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WO_e.hex"},  rom_WO_e);
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WG_e.hex"},  rom_WG_e);
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WU_e.hex"},  rom_WU_e);
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WDN_e.hex"}, rom_WDN_e);
+    end
     $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "G1_m.hex"},  rom_G1_m);
     $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "G2_m.hex"},  rom_G2_m);
     $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "G1_e.hex"},  rom_G1_e);
@@ -190,20 +243,22 @@ module smollm_layer_bfp #(
   end
 `else
   initial begin
-    $readmemh({PREFIX, "WQ_m.hex"},  rom_WQ_m);
-    $readmemh({PREFIX, "WK_m.hex"},  rom_WK_m);
-    $readmemh({PREFIX, "WV_m.hex"},  rom_WV_m);
-    $readmemh({PREFIX, "WO_m.hex"},  rom_WO_m);
-    $readmemh({PREFIX, "WG_m.hex"},  rom_WG_m);
-    $readmemh({PREFIX, "WU_m.hex"},  rom_WU_m);
-    $readmemh({PREFIX, "WDN_m.hex"}, rom_WDN_m);
-    $readmemh({PREFIX, "WQ_e.hex"},  rom_WQ_e);
-    $readmemh({PREFIX, "WK_e.hex"},  rom_WK_e);
-    $readmemh({PREFIX, "WV_e.hex"},  rom_WV_e);
-    $readmemh({PREFIX, "WO_e.hex"},  rom_WO_e);
-    $readmemh({PREFIX, "WG_e.hex"},  rom_WG_e);
-    $readmemh({PREFIX, "WU_e.hex"},  rom_WU_e);
-    $readmemh({PREFIX, "WDN_e.hex"}, rom_WDN_e);
+    if (!STREAM_WEIGHTS) begin
+      $readmemh({PREFIX, "WQ_m.hex"},  rom_WQ_m);
+      $readmemh({PREFIX, "WK_m.hex"},  rom_WK_m);
+      $readmemh({PREFIX, "WV_m.hex"},  rom_WV_m);
+      $readmemh({PREFIX, "WO_m.hex"},  rom_WO_m);
+      $readmemh({PREFIX, "WG_m.hex"},  rom_WG_m);
+      $readmemh({PREFIX, "WU_m.hex"},  rom_WU_m);
+      $readmemh({PREFIX, "WDN_m.hex"}, rom_WDN_m);
+      $readmemh({PREFIX, "WQ_e.hex"},  rom_WQ_e);
+      $readmemh({PREFIX, "WK_e.hex"},  rom_WK_e);
+      $readmemh({PREFIX, "WV_e.hex"},  rom_WV_e);
+      $readmemh({PREFIX, "WO_e.hex"},  rom_WO_e);
+      $readmemh({PREFIX, "WG_e.hex"},  rom_WG_e);
+      $readmemh({PREFIX, "WU_e.hex"},  rom_WU_e);
+      $readmemh({PREFIX, "WDN_e.hex"}, rom_WDN_e);
+    end
     $readmemh({PREFIX, "G1_m.hex"},  rom_G1_m);
     $readmemh({PREFIX, "G2_m.hex"},  rom_G2_m);
     $readmemh({PREFIX, "G1_e.hex"},  rom_G1_e);
@@ -342,12 +397,26 @@ module smollm_layer_bfp #(
   wire  signed [LANES*BFP_EXP_W -1:0]        mv_out_e;
   wire                                       mv_out_valid;
 
+  // mv_w_m_eff / mv_w_e_eff: muxed weight bus presented to the matvec
+  // engine.  In selftest mode (STREAM_WEIGHTS=0) these forward the
+  // registered mv_w_m / mv_w_e values read from on-chip ROMs.  In
+  // streaming mode the engine sees the streamer's bank_m / bank_e
+  // outputs directly (combinational mux), with rd_col / rd_tile driven
+  // by the FSM's `cnt` so that the 1-cycle BRAM read latency lines up
+  // with mv_x_m's 1-cycle pipeline.
+  wire signed [LANES*BFP_MANT_W-1:0]         mv_w_m_eff;
+  wire signed [LANES*BFP_EXP_W -1:0]         mv_w_e_eff;
+  wire        [255:0]                        ws_weight_m_out;
+  wire        [127:0]                        ws_weight_e_out;
+  assign mv_w_m_eff = STREAM_WEIGHTS ? $signed(ws_weight_m_out) : mv_w_m;
+  assign mv_w_e_eff = STREAM_WEIGHTS ? $signed(ws_weight_e_out) : mv_w_e;
+
   matvec_bfp_engine #(.LANES(LANES)) i_mv (
     .clk(clk), .rst(rst | eng_rst),
     .start_matvec(mv_start),
     .in_x_mant(mv_x_m), .in_x_exp(mv_x_e),
     .in_valid(mv_valid), .last_elem(mv_last),
-    .w_mant(mv_w_m), .w_exp(mv_w_e),
+    .w_mant(mv_w_m_eff), .w_exp(mv_w_e_eff),
     .out_mant(mv_out_m), .out_exp(mv_out_e), .out_valid(mv_out_valid)
   );
 
@@ -534,6 +603,135 @@ module smollm_layer_bfp #(
   endfunction
 
   // ---------------------------------------------------------------------------
+  // DDR3 weight streamer (used iff STREAM_WEIGHTS=1).
+  //
+  //   Active matvec is identified by ws_matvec_id:
+  //     0=Q  1=K  2=V  3=O  4=G  5=U  6=DN
+  //
+  //   Per chunk, the layer FSM pulses ws_load_req with ws_chunk_idx=chunk
+  //   and waits for ws_ready before transitioning into the matvec DRIVE
+  //   phase.  Then ws_rd_col / ws_rd_tile (driven from `cnt`) deliver
+  //   weight_m_out / weight_e_out one cycle later — same pipeline as the
+  //   on-chip ROM read it replaces.
+  // ---------------------------------------------------------------------------
+  logic [2:0]                       ws_matvec_id;
+  logic                             ws_load_req;
+  wire                              ws_ready, ws_busy_unused;
+  logic [AXI_ADDR_WIDTH-1:0]        ws_base_m_mux, ws_base_e_mux;
+  logic [11:0]                      ws_in_dim_mux, ws_in_dim_tiles_mux;
+  logic [11:0]                      ws_rd_col, ws_rd_tile;
+
+  // 4-phase per-chunk load handshake.  Mirrors smollm_layer.sv's MV_LOAD_
+  // {REQ,HOLD,WAIT} pattern: pulse load_req, wait for ws_ready to fall
+  // (HOLD — avoids reading stale ready=1 from a previous chunk), then
+  // wait for it to rise (WAIT — fresh tile is in bank).  Stays in WSP_READY
+  // once data is in bank, until *_NEXT resets it for the next chunk.
+  typedef enum logic [1:0] {
+    WSP_KICK, WSP_HOLD, WSP_WAIT, WSP_READY
+  } ws_phase_t;
+  ws_phase_t ws_phase;
+
+  // rd_col / rd_tile track cnt during DRIVE: the streamer has a 1-cycle
+  // BRAM read latency, matching the existing `mv_w_m <= rom[cnt]` pipeline
+  // alignment exactly.  Outside DRIVE the values don't matter.
+  always_comb ws_rd_col  = cnt;
+  always_comb ws_rd_tile = cnt >> 4;
+
+  always_comb begin
+    // Default — Q.
+    ws_base_m_mux        = ws_base_WQ_m;
+    ws_base_e_mux        = ws_base_WQ_e;
+    ws_in_dim_mux        = 12'(D);
+    ws_in_dim_tiles_mux  = 12'(NT_D);
+    unique case (ws_matvec_id)
+      3'd0: begin ws_base_m_mux = ws_base_WQ_m;  ws_base_e_mux = ws_base_WQ_e;
+                  ws_in_dim_mux = 12'(D);   ws_in_dim_tiles_mux = 12'(NT_D);   end
+      3'd1: begin ws_base_m_mux = ws_base_WK_m;  ws_base_e_mux = ws_base_WK_e;
+                  ws_in_dim_mux = 12'(D);   ws_in_dim_tiles_mux = 12'(NT_D);   end
+      3'd2: begin ws_base_m_mux = ws_base_WV_m;  ws_base_e_mux = ws_base_WV_e;
+                  ws_in_dim_mux = 12'(D);   ws_in_dim_tiles_mux = 12'(NT_D);   end
+      3'd3: begin ws_base_m_mux = ws_base_WO_m;  ws_base_e_mux = ws_base_WO_e;
+                  ws_in_dim_mux = 12'(D);   ws_in_dim_tiles_mux = 12'(NT_D);   end
+      3'd4: begin ws_base_m_mux = ws_base_WG_m;  ws_base_e_mux = ws_base_WG_e;
+                  ws_in_dim_mux = 12'(D);   ws_in_dim_tiles_mux = 12'(NT_D);   end
+      3'd5: begin ws_base_m_mux = ws_base_WU_m;  ws_base_e_mux = ws_base_WU_e;
+                  ws_in_dim_mux = 12'(D);   ws_in_dim_tiles_mux = 12'(NT_D);   end
+      3'd6: begin ws_base_m_mux = ws_base_WDN_m; ws_base_e_mux = ws_base_WDN_e;
+                  ws_in_dim_mux = 12'(FFN); ws_in_dim_tiles_mux = 12'(NT_FFN); end
+      default:;
+    endcase
+  end
+
+  generate
+    if (STREAM_WEIGHTS) begin : g_stream
+      weight_streamer_bfp_mt #(
+        .AXI_DATA_WIDTH (512),
+        .AXI_ADDR_WIDTH (AXI_ADDR_WIDTH),
+        .AXI_ID_WIDTH   (AXI_ID_WIDTH),
+        .IN_DIM_MAX     (FFN > D ? FFN : D),
+        .IN_DIM_BITS    (12),
+        .CHUNK_BITS     (7)
+      ) i_ws (
+        .clk_core      (clk),
+        .rst_core      (rst),
+        .matrix_base_m (ws_base_m_mux),
+        .matrix_base_e (ws_base_e_mux),
+        .chunk_idx     (chunk),                // declared below; alias
+        .in_dim        (ws_in_dim_mux),
+        .in_dim_tiles  (ws_in_dim_tiles_mux),
+        .load_req      (ws_load_req),
+        .ready         (ws_ready),
+        .busy          (ws_busy_unused),
+        .rd_col        (ws_rd_col),
+        .weight_m_out  (ws_weight_m_out),
+        .rd_tile       (ws_rd_tile),
+        .weight_e_out  (ws_weight_e_out),
+        .clk_axi       (clk_axi),
+        .rst_axi       (rst_axi),
+        .m_axi_arvalid (m_axi_arvalid),
+        .m_axi_arready (m_axi_arready),
+        .m_axi_arid    (m_axi_arid),
+        .m_axi_araddr  (m_axi_araddr),
+        .m_axi_arlen   (m_axi_arlen),
+        .m_axi_arsize  (m_axi_arsize),
+        .m_axi_arburst (m_axi_arburst),
+        .m_axi_arlock  (m_axi_arlock),
+        .m_axi_arcache (m_axi_arcache),
+        .m_axi_arprot  (m_axi_arprot),
+        .m_axi_arqos   (m_axi_arqos),
+        .m_axi_rvalid  (m_axi_rvalid),
+        .m_axi_rready  (m_axi_rready),
+        .m_axi_rid     (m_axi_rid),
+        .m_axi_rdata   (m_axi_rdata),
+        .m_axi_rresp   (m_axi_rresp),
+        .m_axi_rlast   (m_axi_rlast)
+      );
+    end else begin : g_no_stream
+      // Tie off AXI master ports — no streamer, no traffic.
+      assign m_axi_arvalid = 1'b0;
+      assign m_axi_arid    = '0;
+      assign m_axi_araddr  = '0;
+      assign m_axi_arlen   = '0;
+      assign m_axi_arsize  = 3'd6;
+      assign m_axi_arburst = 2'b01;
+      assign m_axi_arlock  = 1'b0;
+      assign m_axi_arcache = 4'b0011;
+      assign m_axi_arprot  = 3'b000;
+      assign m_axi_arqos   = 4'b0000;
+      assign m_axi_rready  = 1'b1;
+      assign ws_weight_m_out = '0;
+      assign ws_weight_e_out = '0;
+      assign ws_ready        = 1'b1;     // never gates the FSM
+      assign ws_busy_unused  = 1'b0;
+      /* verilator lint_off UNUSEDSIGNAL */
+      wire _unused_axi = &{1'b0, m_axi_arready, m_axi_rvalid, m_axi_rid,
+                           m_axi_rdata, m_axi_rresp, m_axi_rlast, clk_axi,
+                           rst_axi, 1'b0};
+      /* verilator lint_on UNUSEDSIGNAL */
+    end
+  endgenerate
+
+  // ---------------------------------------------------------------------------
   // Main FSM — all writes use non-blocking assignment; engine inputs are
   // driven from registers so they pipeline-align with mv_valid one cycle
   // later (matvec engine samples on the clock edge after we register).
@@ -589,6 +787,9 @@ module smollm_layer_bfp #(
       head_grp        <= '0;
       av_row_base     <= '0;
       out_cnt         <= '0;
+      ws_matvec_id    <= 3'd0;
+      ws_load_req     <= 1'b0;
+      ws_phase        <= WSP_KICK;
     end else begin
       // Default pulses → 0
       mv_start <= 1'b0;
@@ -605,6 +806,7 @@ module smollm_layer_bfp #(
       rs_start <= 1'b0;
       eng_rst  <= 1'b0;
       done     <= 1'b0;
+      ws_load_req <= 1'b0;
 
       case (state)
         // -------------------------------------------------------------------
@@ -612,6 +814,7 @@ module smollm_layer_bfp #(
           state   <= S_LATCH_IN;
           cnt     <= '0;
           eng_rst <= 1'b1;
+          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
         end
 
         // Copy hidden_in bus into BRAM-style arrays one element/cycle.
@@ -660,9 +863,22 @@ module smollm_layer_bfp #(
         // Q matvec — 7 phases (PRIME/DRIVE/DRAIN/NEXT) — input dim = D, out_dim = D
         // ===================================================================
         S_QMV_PRIME: begin
-          mv_start <= 1'b1;
-          cnt      <= '0;
-          state    <= S_QMV_DRIVE;
+          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+            unique case (ws_phase)
+              WSP_KICK: begin
+                ws_matvec_id <= 3'd0;
+                ws_load_req  <= 1'b1;
+                ws_phase     <= WSP_HOLD;
+              end
+              WSP_HOLD: if (!ws_ready) ws_phase <= WSP_WAIT;
+              WSP_WAIT: if ( ws_ready) ws_phase <= WSP_READY;
+              default: ;
+            endcase
+          end else begin
+            mv_start <= 1'b1;
+            cnt      <= '0;
+            state    <= S_QMV_DRIVE;
+          end
         end
         S_QMV_DRIVE: begin
           mv_valid <= 1'b1;
@@ -691,6 +907,7 @@ module smollm_layer_bfp #(
           state <= S_QMV_NEXT;
         end
         S_QMV_NEXT: begin
+          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_D - 1) begin
             chunk   <= '0;
             eng_rst <= 1'b1;
@@ -706,7 +923,20 @@ module smollm_layer_bfp #(
         // K matvec
         // ===================================================================
         S_KMV_PRIME: begin
-          mv_start <= 1'b1; cnt <= '0; state <= S_KMV_DRIVE;
+          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+            unique case (ws_phase)
+              WSP_KICK: begin
+                ws_matvec_id <= 3'd1;
+                ws_load_req  <= 1'b1;
+                ws_phase     <= WSP_HOLD;
+              end
+              WSP_HOLD: if (!ws_ready) ws_phase <= WSP_WAIT;
+              WSP_WAIT: if ( ws_ready) ws_phase <= WSP_READY;
+              default: ;
+            endcase
+          end else begin
+            mv_start <= 1'b1; cnt <= '0; state <= S_KMV_DRIVE;
+          end
         end
         S_KMV_DRIVE: begin
           mv_valid <= 1'b1;
@@ -735,6 +965,7 @@ module smollm_layer_bfp #(
           state <= S_KMV_NEXT;
         end
         S_KMV_NEXT: begin
+          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_KV - 1) begin
             chunk <= '0; eng_rst <= 1'b1; state <= S_VMV_PRIME;
           end else begin
@@ -746,7 +977,20 @@ module smollm_layer_bfp #(
         // V matvec
         // ===================================================================
         S_VMV_PRIME: begin
-          mv_start <= 1'b1; cnt <= '0; state <= S_VMV_DRIVE;
+          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+            unique case (ws_phase)
+              WSP_KICK: begin
+                ws_matvec_id <= 3'd2;
+                ws_load_req  <= 1'b1;
+                ws_phase     <= WSP_HOLD;
+              end
+              WSP_HOLD: if (!ws_ready) ws_phase <= WSP_WAIT;
+              WSP_WAIT: if ( ws_ready) ws_phase <= WSP_READY;
+              default: ;
+            endcase
+          end else begin
+            mv_start <= 1'b1; cnt <= '0; state <= S_VMV_DRIVE;
+          end
         end
         S_VMV_DRIVE: begin
           mv_valid <= 1'b1;
@@ -775,6 +1019,7 @@ module smollm_layer_bfp #(
           state <= S_VMV_NEXT;
         end
         S_VMV_NEXT: begin
+          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_KV - 1) begin
             chunk <= '0; head_idx <= '0; cnt <= '0;
             eng_rst <= 1'b1; rp_start <= 1'b1; state <= S_ROPEQ;
@@ -1105,7 +1350,20 @@ module smollm_layer_bfp #(
         // O matvec (D inputs, D outputs)
         // ===================================================================
         S_OMV_PRIME: begin
-          mv_start <= 1'b1; cnt <= '0; state <= S_OMV_DRIVE;
+          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+            unique case (ws_phase)
+              WSP_KICK: begin
+                ws_matvec_id <= 3'd3;
+                ws_load_req  <= 1'b1;
+                ws_phase     <= WSP_HOLD;
+              end
+              WSP_HOLD: if (!ws_ready) ws_phase <= WSP_WAIT;
+              WSP_WAIT: if ( ws_ready) ws_phase <= WSP_READY;
+              default: ;
+            endcase
+          end else begin
+            mv_start <= 1'b1; cnt <= '0; state <= S_OMV_DRIVE;
+          end
         end
         S_OMV_DRIVE: begin
           mv_valid <= 1'b1;
@@ -1134,6 +1392,7 @@ module smollm_layer_bfp #(
           state <= S_OMV_NEXT;
         end
         S_OMV_NEXT: begin
+          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_D - 1) begin
             chunk   <= '0; cnt <= '0; out_cnt <= '0;
             eng_rst <= 1'b1; rs_start <= 1'b1; state <= S_RES1;
@@ -1212,7 +1471,20 @@ module smollm_layer_bfp #(
         // Gate matvec (D in, FFN out)
         // ===================================================================
         S_GMV_PRIME: begin
-          mv_start <= 1'b1; cnt <= '0; state <= S_GMV_DRIVE;
+          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+            unique case (ws_phase)
+              WSP_KICK: begin
+                ws_matvec_id <= 3'd4;
+                ws_load_req  <= 1'b1;
+                ws_phase     <= WSP_HOLD;
+              end
+              WSP_HOLD: if (!ws_ready) ws_phase <= WSP_WAIT;
+              WSP_WAIT: if ( ws_ready) ws_phase <= WSP_READY;
+              default: ;
+            endcase
+          end else begin
+            mv_start <= 1'b1; cnt <= '0; state <= S_GMV_DRIVE;
+          end
         end
         S_GMV_DRIVE: begin
           mv_valid <= 1'b1;
@@ -1241,6 +1513,7 @@ module smollm_layer_bfp #(
           state <= S_GMV_NEXT;
         end
         S_GMV_NEXT: begin
+          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_FFN - 1) begin
             chunk <= '0; eng_rst <= 1'b1; state <= S_UMV_PRIME;
           end else begin
@@ -1252,7 +1525,20 @@ module smollm_layer_bfp #(
         // Up matvec (D in, FFN out)
         // ===================================================================
         S_UMV_PRIME: begin
-          mv_start <= 1'b1; cnt <= '0; state <= S_UMV_DRIVE;
+          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+            unique case (ws_phase)
+              WSP_KICK: begin
+                ws_matvec_id <= 3'd5;
+                ws_load_req  <= 1'b1;
+                ws_phase     <= WSP_HOLD;
+              end
+              WSP_HOLD: if (!ws_ready) ws_phase <= WSP_WAIT;
+              WSP_WAIT: if ( ws_ready) ws_phase <= WSP_READY;
+              default: ;
+            endcase
+          end else begin
+            mv_start <= 1'b1; cnt <= '0; state <= S_UMV_DRIVE;
+          end
         end
         S_UMV_DRIVE: begin
           mv_valid <= 1'b1;
@@ -1281,6 +1567,7 @@ module smollm_layer_bfp #(
           state <= S_UMV_NEXT;
         end
         S_UMV_NEXT: begin
+          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_FFN - 1) begin
             chunk <= '0; cnt <= '0; out_cnt <= '0;
             eng_rst <= 1'b1; sg_start <= 1'b1; state <= S_SWG;
@@ -1320,7 +1607,20 @@ module smollm_layer_bfp #(
         // Down matvec (FFN in, D out)
         // ===================================================================
         S_DMV_PRIME: begin
-          mv_start <= 1'b1; cnt <= '0; state <= S_DMV_DRIVE;
+          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+            unique case (ws_phase)
+              WSP_KICK: begin
+                ws_matvec_id <= 3'd6;
+                ws_load_req  <= 1'b1;
+                ws_phase     <= WSP_HOLD;
+              end
+              WSP_HOLD: if (!ws_ready) ws_phase <= WSP_WAIT;
+              WSP_WAIT: if ( ws_ready) ws_phase <= WSP_READY;
+              default: ;
+            endcase
+          end else begin
+            mv_start <= 1'b1; cnt <= '0; state <= S_DMV_DRIVE;
+          end
         end
         S_DMV_DRIVE: begin
           mv_valid <= 1'b1;
@@ -1349,6 +1649,7 @@ module smollm_layer_bfp #(
           state <= S_DMV_NEXT;
         end
         S_DMV_NEXT: begin
+          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_D - 1) begin
             chunk    <= '0; cnt <= '0; out_cnt <= '0;
             eng_rst  <= 1'b1; rs_start <= 1'b1; state <= S_RES2;
