@@ -101,10 +101,21 @@ module autoregress_bfp_top #(
   logic signed [NT_D*BFP_EXP_W-1:0]    dec_in_e;
   wire  [15:0]                         dec_token;
   wire                                 dec_done;
-  smollm_decode_head_bfp #(.D(D), .VOCAB(VOCAB), .PREFIX(PREFIX)) i_dec (
+  smollm_decode_head_bfp #(
+    .D(D), .VOCAB(VOCAB), .PREFIX(PREFIX),
+    .STREAM_WEIGHTS(1'b0)
+  ) i_dec (
     .clk(clk), .rst(rst), .start(dec_start),
     .hidden_in_m(dec_in_m), .hidden_in_e(dec_in_e),
-    .token_out(dec_token), .done(dec_done)
+    .token_out(dec_token), .done(dec_done),
+    // DDR3 streamer tied off (Verilator mode keeps EMBED in BRAM)
+    .ws_base_EMBED_m('0), .ws_base_EMBED_e('0),
+    .clk_axi(clk), .rst_axi(rst),
+    .m_axi_arvalid(), .m_axi_arready(1'b0), .m_axi_arid(), .m_axi_araddr(),
+    .m_axi_arlen(), .m_axi_arsize(), .m_axi_arburst(), .m_axi_arlock(),
+    .m_axi_arcache(), .m_axi_arprot(), .m_axi_arqos(),
+    .m_axi_rvalid(1'b0), .m_axi_rready(),
+    .m_axi_rid('0), .m_axi_rdata('0), .m_axi_rresp('0), .m_axi_rlast(1'b0)
   );
 
   typedef enum logic [3:0] {
