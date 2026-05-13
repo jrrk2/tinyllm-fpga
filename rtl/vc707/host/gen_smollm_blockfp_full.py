@@ -389,6 +389,11 @@ def main():
     with open(os.path.join(OUT, f"{PREFIX}PROMPT_TOKENS.txt"), 'w') as f:
         for tid in tok(PROMPT, return_tensors='pt').input_ids[0].tolist():
             f.write(f"{tid}\n")
+    # Same prompt token ids as 16-bit hex (4 hex chars per line) — used by
+    # autoregress_bfp_top.sv's $readmemh into prompt_rom.
+    with open(os.path.join(OUT, f"{PREFIX}PROMPT.hex"), 'w') as f:
+        for tid in tok(PROMPT, return_tensors='pt').input_ids[0].tolist():
+            f.write(f"{int(tid) & 0xFFFF:04x}\n")
 
     # Final norm_w (D-element gamma)
     nw_m, nw_e = tile_quantize(norm_w)

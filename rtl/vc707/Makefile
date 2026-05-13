@@ -155,7 +155,14 @@ $(lbfp_full_stamp): host/gen_smollm_blockfp_full.py
 bfp-full: $(lbfp_full_stamp)
 	$(MAKE) -C sim bfp-full
 
-.PHONY: bfp-sim bfp-full
+# Self-driven on-chip autoregress: same model, but the token-step loop is
+# inside the RTL (autoregress_bfp_top.sv).  Pulses `go`, runs all 19 token
+# steps internally, asserts `done`, exposes generated tokens via a packed
+# bus.  Demonstrates the FPGA-target flow end-to-end in Verilator.
+bfp-autoregress: $(lbfp_full_stamp)
+	$(MAKE) -C sim bfp-autoregress
+
+.PHONY: bfp-sim bfp-full bfp-autoregress
 
 $(ips): %.xci :
 	mkdir -p $(work-dir)
