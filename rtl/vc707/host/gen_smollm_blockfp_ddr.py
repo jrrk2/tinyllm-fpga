@@ -237,6 +237,27 @@ def main():
             f.write(f"  {name:14s}  0x{off:08X}  ({off:,} B)\n")
     print(f"[ddr] offsets in lbfp_full_DDR3.offsets.txt", file=sys.stderr)
 
+    # Optional: emit a $readmemh-compatible 128-bit-entry hex file for
+    # mock_axi_slave loading (Verilator end-to-end streaming test).  The
+    # file is roughly 2× the .bin size (33 ASCII chars per 16 raw bytes)
+    # so we gate it behind LBFP_EMIT_HEX=1 — by default skipped.
+    if os.environ.get('LBFP_EMIT_HEX', '0') == '1':
+        out_hex = os.path.join(OUT, 'lbfp_full_DDR3.hex')
+        nentries = (len(img) + 15) // 16
+        print(f"[ddr] emitting {out_hex}  ({nentries:,} 128-bit entries) ...",
+              file=sys.stderr)
+        with open(out_hex, 'w') as f:
+            for i in range(nentries):
+                chunk = img[i*16:(i+1)*16]
+                if len(chunk) < 16:
+                    chunk = chunk + b'\x00' * (16 - len(chunk))
+                # mock_axi_slave assembles 4 little-endian 128-bit entries
+                # per 64 B AXI beat.  Each .hex line = one entry in big-
+                # endian hex digits (MSB lane first); convert from LE bytes.
+                val = int.from_bytes(chunk, byteorder='little')
+                f.write(f"{val:032x}\n")
+        print(f"[ddr] wrote {out_hex}", file=sys.stderr)
+
 
 if __name__ == '__main__':
     main()

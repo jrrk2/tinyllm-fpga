@@ -81,6 +81,10 @@
 `define LBFP_BASE_NORM_W_M    (`LBFP_BASE_EMBED_LU_E + 30'(`LBFP_FULL_VOCAB * 64))
 `define LBFP_BASE_NORM_W_E    (`LBFP_BASE_NORM_W_M + 30'h1_0000)
 
+// Total DDR3 image size in 128-bit entries (one entry per mock_axi_slave
+// mem[] slot).  Conservatively rounded up — extra entries init to 0.
+`define LBFP_DDR3_ENTRIES   (24 * 1024 * 1024)   // 24 Mi × 16 B = 384 MB
+
 // matvec_id encoding consumed by weight_streamer_bfp_mt.sv:
 //   0=Q, 1=K, 2=V, 3=O, 4=G, 5=U, 6=DN
 `define LBFP_MV_ID_Q    3'd0

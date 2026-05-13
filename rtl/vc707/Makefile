@@ -162,7 +162,15 @@ bfp-full: $(lbfp_full_stamp)
 bfp-autoregress: $(lbfp_full_stamp)
 	$(MAKE) -C sim bfp-autoregress
 
-.PHONY: bfp-sim bfp-full bfp-autoregress
+# Same end-to-end demo but with weights streamed from a DDR3 image via
+# mock_axi_slave (STREAM_WEIGHTS=1 / STREAM_LOOKUP=1).  Validates the
+# AXI fetch + streamer pipeline against the BRAM-mode golden tokens.
+# Requires the (~670 MB) hex image — generated with LBFP_EMIT_HEX=1.
+bfp-autoregress-stream: $(lbfp_full_stamp)
+	LBFP_EMIT_HEX=1 python3 host/gen_smollm_blockfp_ddr.py
+	$(MAKE) -C sim bfp-autoregress-stream
+
+.PHONY: bfp-sim bfp-full bfp-autoregress bfp-autoregress-stream
 
 $(ips): %.xci :
 	mkdir -p $(work-dir)
