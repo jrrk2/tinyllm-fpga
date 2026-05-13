@@ -120,17 +120,51 @@ $(BROM_SV): $(GENERATED_DIR)/brom_%.sv: $(GENERATED_DIR)/tm_layer_%.hex \
                                         host/gen_brom_sv.py | $(tm_stamp)
 	python3 host/gen_brom_sv.py $< $@ brom_$*
 
-# Toggle the top-level layer instance.  USE_BFP=1 swaps the int8
-# smollm_multilayer_tm_selftest for smollm_layer_bfp_selftest (small-dim
-# single-layer block-FP selftest).  Passed through to Vivado via
-# scripts/run.tcl's MICROGPT_USE_BFP define.
-USE_BFP ?= 0
+# Toggle the top-level layer instance.
+#   USE_BFP=1    : swap the int8 multilayer path for the BFP autoregress
+#                  stack (autoregress_bfp_top + 30-layer SmolLM2-135M).
+#                  Adds MICROGPT_USE_BFP to VIVADO_DEFINES.
+#   BFP_STREAM=1 : (only meaningful with USE_BFP=1) the BFP path streams
+#                  W?_m/e + EMBED_m/e + EMBED_LU_m/e from DDR3 via the
+#                  weight_streamer_bfp_mt AXI master instead of $readmemh
+#                  BRAMs.  Adds MICROGPT_BFP_STREAM; also bakes the DDR3
+#                  image (.bin) that the host has to upload before pulsing
+#                  `start`.
+USE_BFP    ?= 0
+BFP_STREAM ?= 0
+VIVADO_DEFINES :=
 ifeq ($(USE_BFP),1)
-  VIVADO_DEFINES := MICROGPT_USE_BFP
+  VIVADO_DEFINES += MICROGPT_USE_BFP
+endif
+ifeq ($(BFP_STREAM),1)
+  VIVADO_DEFINES += MICROGPT_BFP_STREAM
+endif
+ifneq ($(strip $(VIVADO_DEFINES)),)
   export VIVADO_DEFINES
 endif
 
-$(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(lbfp_stamp)
+# Synthesis-time hex deps for the BFP path:
+#   - lbfp_full_stamp  (gen_smollm_blockfp_full.py): bakes the per-matrix
+#       lbfp_full_*.hex files that smollm_layer_bfp / decode_head /
+#       embed_lookup $readmemh-load at elaboration.  Even in streaming
+#       mode the gamma + KV-init + norm_w hex files are still BRAM-loaded
+#       (the streamer only replaces the large W?_* + EMBED matrices).
+#   - lbfp_full_DDR3_stamp  (gen_smollm_blockfp_ddr.py): bakes the .bin
+#       DDR3 image.  Only the .bin is needed for synth (the layout svh
+#       references baked-in offsets); the matching .hex is generated
+#       on-demand for the Verilator streaming testbench (LBFP_EMIT_HEX=1).
+lbfp_full_stamp      := $(GENERATED_DIR)/.lbfp_full.stamp
+lbfp_full_DDR3_stamp := $(GENERATED_DIR)/.lbfp_full_DDR3.stamp
+
+BFP_BUILD_DEPS :=
+ifeq ($(USE_BFP),1)
+  BFP_BUILD_DEPS += $(lbfp_full_stamp)
+  ifeq ($(BFP_STREAM),1)
+    BFP_BUILD_DEPS += $(lbfp_full_DDR3_stamp)
+  endif
+endif
+
+$(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(lbfp_stamp) $(BFP_BUILD_DEPS)
 	mkdir -p $(work-dir)
 	$(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
 	cp microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit ./$(work-dir)/ 2>/dev/null || \
@@ -146,7 +180,6 @@ bfp-sim: $(lbfp_stamp)
 # loop in Verilator.  Pulls weights from HuggingFace (one-time download,
 # ~270 MB).  Bake-and-run takes ~10 min wall, then compares 18 generated
 # tokens against the Python BFP golden.
-lbfp_full_stamp := $(GENERATED_DIR)/.lbfp_full.stamp
 $(lbfp_full_stamp): host/gen_smollm_blockfp_full.py
 	@echo "=== baking SmolLM2-135M block-FP weights (30 layers, full dims) ==="
 	python3 host/gen_smollm_blockfp_full.py
@@ -161,6 +194,14 @@ bfp-full: $(lbfp_full_stamp)
 # bus.  Demonstrates the FPGA-target flow end-to-end in Verilator.
 bfp-autoregress: $(lbfp_full_stamp)
 	$(MAKE) -C sim bfp-autoregress
+
+# Bake the DDR3 image (.bin) consumed by the FPGA streaming path AND
+# (optionally) the matching .hex consumed by the Verilator stream tb.
+# The .bin alone is ≈ 320 MB, the .hex doubles that — keep it gated.
+$(lbfp_full_DDR3_stamp): host/gen_smollm_blockfp_ddr.py $(lbfp_full_stamp)
+	@echo "=== baking lbfp_full_DDR3.bin ==="
+	python3 host/gen_smollm_blockfp_ddr.py
+	@touch $@
 
 # Same end-to-end demo but with weights streamed from a DDR3 image via
 # mock_axi_slave (STREAM_WEIGHTS=1 / STREAM_LOOKUP=1).  Validates the

@@ -21,18 +21,26 @@ set abs_weight_dir [file normalize ../generated]
 # probe set, so those defines are dropped (and MICROGPT_USE_BFP is added).
 # Toggled via the USE_BFP=1 Makefile knob (env var VIVADO_DEFINES).
 set _use_bfp 0
+set _bfp_stream 0
 if {[info exists ::env(VIVADO_DEFINES)]} {
     foreach d $::env(VIVADO_DEFINES) {
-        if {$d eq "MICROGPT_USE_BFP"} { set _use_bfp 1 }
+        if {$d eq "MICROGPT_USE_BFP"}     { set _use_bfp 1 }
+        if {$d eq "MICROGPT_BFP_STREAM"}  { set _bfp_stream 1 }
     }
 }
 if {$_use_bfp} {
-    puts "INFO: build defines = block-FP path (USE_BFP=1)"
-    set_property verilog_define [list \
+    set _defs [list \
         "MICROGPT_WEIGHT_DIR=\"$abs_weight_dir\"" \
         "MICROGPT_NO_OP_TESTS" \
         "MICROGPT_USE_BFP" \
-    ] [current_fileset]
+    ]
+    if {$_bfp_stream} {
+        puts "INFO: build defines = block-FP path + DDR3 streaming (USE_BFP=1 BFP_STREAM=1)"
+        lappend _defs "MICROGPT_BFP_STREAM"
+    } else {
+        puts "INFO: build defines = block-FP path (USE_BFP=1)"
+    }
+    set_property verilog_define $_defs [current_fileset]
 } else {
     puts "INFO: build defines = int8 multilayer path (default)"
     set_property verilog_define [list \
@@ -139,6 +147,7 @@ read_verilog -sv { \
     src/smollm/swiglu_bfp.sv \
     src/smollm/softmax_bfp.sv \
     src/smollm/residual_bfp.sv \
+    src/smollm/weight_streamer_bfp_mt.sv \
     src/smollm/smollm_layer_bfp.sv \
     src/smollm/smollm_layer_bfp_selftest.sv \
     src/smollm/embed_lookup_bfp.sv \
