@@ -16,13 +16,33 @@ add_files -fileset constrs_1 -norecurse constraints/microgpt_eth.xdc
 set abs_weight_dir [file normalize ../generated]
 # `MICROGPT_DDR3_WEIGHTS` selects weight_streamer_mt + AXI master in
 # smollm_layer (replacing the BRAM-only weight_streamer_brom path).
-set_property verilog_define [list \
-  "MICROGPT_WEIGHT_DIR=\"$abs_weight_dir\"" \
-  "MICROGPT_DDR3_WEIGHTS" \
-  "MICROGPT_ILA" \
-  "MICROGPT_NO_OP_TESTS" \
-  "MICROGPT_LAYER_DEBUG" \
-] [current_fileset]
+# Build define list — the int8 multilayer path needs DDR3 streaming + ILA
+# probes + LAYER_DEBUG; the block-FP path uses BRAM weights and has no ILA
+# probe set, so those defines are dropped (and MICROGPT_USE_BFP is added).
+# Toggled via the USE_BFP=1 Makefile knob (env var VIVADO_DEFINES).
+set _use_bfp 0
+if {[info exists ::env(VIVADO_DEFINES)]} {
+    foreach d $::env(VIVADO_DEFINES) {
+        if {$d eq "MICROGPT_USE_BFP"} { set _use_bfp 1 }
+    }
+}
+if {$_use_bfp} {
+    puts "INFO: build defines = block-FP path (USE_BFP=1)"
+    set_property verilog_define [list \
+        "MICROGPT_WEIGHT_DIR=\"$abs_weight_dir\"" \
+        "MICROGPT_NO_OP_TESTS" \
+        "MICROGPT_USE_BFP" \
+    ] [current_fileset]
+} else {
+    puts "INFO: build defines = int8 multilayer path (default)"
+    set_property verilog_define [list \
+        "MICROGPT_WEIGHT_DIR=\"$abs_weight_dir\"" \
+        "MICROGPT_DDR3_WEIGHTS" \
+        "MICROGPT_ILA" \
+        "MICROGPT_NO_OP_TESTS" \
+        "MICROGPT_LAYER_DEBUG" \
+    ] [current_fileset]
+}
 
 # Regenerate build_version.svh so BUILD_VERSION reflects this build's epoch.
 # Done in Tcl (Vivado's bundled Python is stripped and can't run host scripts).
@@ -135,13 +155,6 @@ set file_obj [get_files -of_objects [get_filesets sources_1] [list "*$file"]]
 set_property -dict { file_type {Verilog Header} is_global_include 1} -objects $file_obj
 
 set_property top vc707_microgpt_eth [current_fileset]
-
-# Propagate Verilog `defines from the env-var VIVADO_DEFINES (set by the
-# Makefile).  Used for MICROGPT_USE_BFP (swap top-level layer instance).
-if {[info exists ::env(VIVADO_DEFINES)] && $::env(VIVADO_DEFINES) ne ""} {
-    puts "INFO: VIVADO_DEFINES = $::env(VIVADO_DEFINES)"
-    set_property verilog_define $::env(VIVADO_DEFINES) [current_fileset]
-}
 
 update_compile_order -fileset sources_1
 

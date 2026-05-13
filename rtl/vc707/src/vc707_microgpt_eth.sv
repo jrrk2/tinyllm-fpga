@@ -953,14 +953,10 @@ module vc707_microgpt_eth (
 `endif
   );
 `else  // MICROGPT_USE_BFP
-`ifdef MICROGPT_LAYER_DEBUG
-  // The int8 multi-layer instance exposes a set of ILA/diagnostic probes;
-  // the BFP single-layer selftest doesn't.  Pick one.
-  initial begin
-    $display("ERROR: MICROGPT_LAYER_DEBUG + MICROGPT_USE_BFP combination is not supported.");
-    $finish;
-  end
-`endif
+  // NB: scripts/run.tcl removes MICROGPT_LAYER_DEBUG / MICROGPT_DDR3_WEIGHTS /
+  // MICROGPT_ILA from the define set when USE_BFP=1 (those defines drive
+  // int8-only ILA probes + AXI weight streamer paths the BFP single-layer
+  // selftest doesn't expose).
   // ----------------------------------------------------------------------
   // Block-FP path: small-dim single-layer selftest (D=64, FFN=128, MAX_CTX=4).
   // Weights / gammas / KV-init come from $readmemh'd BRAMs (lbfp_*.hex baked
