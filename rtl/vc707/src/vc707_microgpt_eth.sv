@@ -1081,6 +1081,65 @@ module vc707_microgpt_eth (
   always_ff @(posedge eth_clk) lay_done_sync <= {lay_done_sync[0], lay_done_core};
   wire lay_done = lay_done_sync[1];
 
+  // ----------------------------------------------------------------------
+  // Latched lay_done — autoregress_bfp_top.done is a 1-cycle pulse so a
+  // 200 ms host poll always misses it; latch in core_clk and clear on
+  // the next restart.  Readable at 0x1F0[1].
+  // ----------------------------------------------------------------------
+  reg lay_done_latched_core = 1'b0;
+  always_ff @(posedge core_clk or negedge core_resetn) begin
+    if (!core_resetn) begin
+      lay_done_latched_core <= 1'b0;
+    end else if (lay_restart_core) begin
+      lay_done_latched_core <= 1'b0;
+    end else if (lay_done_core) begin
+      lay_done_latched_core <= 1'b1;
+    end
+  end
+  reg [1:0] lay_done_latched_sync = 2'd0;
+  always_ff @(posedge eth_clk) lay_done_latched_sync <= {lay_done_latched_sync[0], lay_done_latched_core};
+  wire lay_done_latched = lay_done_latched_sync[1];
+
+  // ----------------------------------------------------------------------
+  // BFP AXI-master activity diagnostics (ui_clk domain).  These tap the
+  // module-scope m_axi_* wires that the BFP autoregress drives via the
+  // 3-way mux in autoregress_bfp_top.  In the int8 path the same wires
+  // are driven by weight_streamer_mt — these counters work for both.
+  //   0x050 : AR-accept count   (arvalid && arready)
+  //   0x051 : R-beat   count    (rvalid && rready)
+  //   0x052 : last accepted araddr
+  // Cross-clock: ui_clk→eth_clk via a single FF stage.  Values change
+  // slowly relative to the eth poll rate, so missing one increment is
+  // not a correctness issue for this diagnostic; read twice + check
+  // consistency if you need a clean snapshot.
+  // ----------------------------------------------------------------------
+  reg [31:0] bfp_ar_cnt_ui      = 32'd0;
+  reg [31:0] bfp_r_cnt_ui       = 32'd0;
+  reg [29:0] bfp_last_araddr_ui = 30'd0;
+  always_ff @(posedge ui_clk) begin
+    if (ui_clk_sync_rst) begin
+      bfp_ar_cnt_ui      <= 32'd0;
+      bfp_r_cnt_ui       <= 32'd0;
+      bfp_last_araddr_ui <= 30'd0;
+    end else begin
+      if (m_axi_arvalid && m_axi_arready) begin
+        bfp_ar_cnt_ui      <= bfp_ar_cnt_ui + 32'd1;
+        bfp_last_araddr_ui <= m_axi_araddr;
+      end
+      if (m_axi_rvalid && m_axi_rready)
+        bfp_r_cnt_ui       <= bfp_r_cnt_ui + 32'd1;
+    end
+  end
+  // Single-FF resample into eth_clk for the regfile read mux.
+  reg [31:0] bfp_ar_cnt_eth      = 32'd0;
+  reg [31:0] bfp_r_cnt_eth       = 32'd0;
+  reg [29:0] bfp_last_araddr_eth = 30'd0;
+  always_ff @(posedge eth_clk) begin
+    bfp_ar_cnt_eth      <= bfp_ar_cnt_ui;
+    bfp_r_cnt_eth       <= bfp_r_cnt_ui;
+    bfp_last_araddr_eth <= bfp_last_araddr_ui;
+  end
+
   wire         ddr_wr_req_eth;
   wire [29:0]  ddr_wr_addr_eth;
   wire [511:0] ddr_wr_data_eth;
@@ -1590,7 +1649,10 @@ module vc707_microgpt_eth (
       10'h1C0: read_data_comb = {31'd0, sm_done};
       // 0x1D0..0x1EF: smollm_layer hidden_out (64 lanes Q1.15, two per word)
       // 0x1F0[0]: layer_done    0x1F1[0]: layer_restart
-      10'h1F0: read_data_comb = {31'd0, lay_done};
+      10'h1F0: read_data_comb = {30'd0, lay_done_latched, lay_done};
+      10'h050: read_data_comb = bfp_ar_cnt_eth;
+      10'h051: read_data_comb = bfp_r_cnt_eth;
+      10'h052: read_data_comb = {2'd0, bfp_last_araddr_eth};
 
       // 0x00D: core_clk-domain FSM observation (single-cycle snapshot)
       10'h00D: read_data_comb = {
