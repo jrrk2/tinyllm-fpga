@@ -71,10 +71,20 @@ module autoregress_bfp_top #(
   wire  signed [NT_D*BFP_EXP_W-1:0]    emb_e;
   wire                                 emb_done;
 
-  embed_lookup_bfp #(.D(D), .VOCAB(VOCAB), .PREFIX(PREFIX)) i_emb (
+  embed_lookup_bfp #(
+    .D(D), .VOCAB(VOCAB), .PREFIX(PREFIX),
+    .STREAM_LOOKUP(1'b0)
+  ) i_emb (
     .clk(clk), .rst(rst), .start(mdl_start),
     .token_id(mdl_token_in),
-    .hidden_m(emb_m), .hidden_e(emb_e), .done(emb_done)
+    .hidden_m(emb_m), .hidden_e(emb_e), .done(emb_done),
+    .ws_base_EMBED_LU_m('0), .ws_base_EMBED_LU_e('0),
+    .clk_axi(clk), .rst_axi(rst),
+    .m_axi_arvalid(), .m_axi_arready(1'b0), .m_axi_arid(), .m_axi_araddr(),
+    .m_axi_arlen(), .m_axi_arsize(), .m_axi_arburst(), .m_axi_arlock(),
+    .m_axi_arcache(), .m_axi_arprot(), .m_axi_arqos(),
+    .m_axi_rvalid(1'b0), .m_axi_rready(),
+    .m_axi_rid('0), .m_axi_rdata('0), .m_axi_rresp('0), .m_axi_rlast(1'b0)
   );
 
   // Three-stage inner FSM: EMB → LAY → DEC.

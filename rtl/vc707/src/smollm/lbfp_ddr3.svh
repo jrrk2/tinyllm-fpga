@@ -76,7 +76,9 @@
 `define LBFP_BASE_EMBED_LU_E  (`LBFP_BASE_EMBED_LU_M + 30'(`LBFP_FULL_VOCAB * `LBFP_FULL_D * 2))
 
 // norm_w (final RMS gamma), 576 × 2 B mantissas + 36 × 1 B exps.
-`define LBFP_BASE_NORM_W_M    (`LBFP_BASE_EMBED_LU_E + 30'(`LBFP_FULL_VOCAB * (`LBFP_FULL_D / 16)))
+// EMBED_LU_e padded to 64 B per row by the baker for AXI alignment, so
+// total = VOCAB × 64 B (not VOCAB × NT_D).
+`define LBFP_BASE_NORM_W_M    (`LBFP_BASE_EMBED_LU_E + 30'(`LBFP_FULL_VOCAB * 64))
 `define LBFP_BASE_NORM_W_E    (`LBFP_BASE_NORM_W_M + 30'h1_0000)
 
 // matvec_id encoding consumed by weight_streamer_bfp_mt.sv:

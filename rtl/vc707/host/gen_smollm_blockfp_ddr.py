@@ -198,11 +198,17 @@ def main():
     add_region('EMBED_e', emb_e_buf)
 
     # EMBED row-wise narrow (for embed_lookup_bfp's per-row read).
+    # Mantissa rows are D*2 B = 1152 B (naturally 64-B aligned for D=576).
+    # Exponent rows are NT_D bytes (=36 for D=576) — pad each row to 64 B
+    # so a single AXI beat lands a whole row at any token boundary.
+    ROW_E_PAD = 64
     lu_m_buf = b''; lu_e_buf = b''
     for r in range(embed_padded.shape[0]):
         m, e = tile_quantize(embed_padded[r])
         lu_m_buf += m.tobytes()
-        lu_e_buf += e.tobytes()
+        row = e.tobytes()
+        assert len(row) <= ROW_E_PAD, f"NT_D ({len(row)}) > 64; bump ROW_E_PAD"
+        lu_e_buf += row + b'\x00' * (ROW_E_PAD - len(row))
     add_region('EMBED_LU_m', lu_m_buf)
     add_region('EMBED_LU_e', lu_e_buf)
 
