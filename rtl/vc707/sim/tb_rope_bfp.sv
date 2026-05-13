@@ -56,11 +56,11 @@ module tb_rope_bfp (input wire clk, rst, go, output wire done, fail);
 
   logic [$clog2(HD+1)-1:0] chk;
   logic fail_r, done_r;
-  // Allow ±64 LSB difference on mantissa (= ~0.2% rel err at int16; cos/sin
-  // are Q1.15 with 1-LSB rounding each, product can drift several LSBs per
-  // element + tile re-quantize noise).  Exponent must match.
-  // TODO: tighten once Python golden CORDIC is bit-exact to RTL's.
-  localparam int MANT_TOL = 64;
+  // ±4 LSB tolerance for residual cordic rounding noise (the alignment +
+  // rotation arithmetic is now bit-exact; remaining drift is sub-LSB
+  // accumulation in the 16-bit silu mantissa, plus CORDIC's 1-LSB final
+  // rounding).  Exponent must match.
+  localparam int MANT_TOL = 4;
   always_ff @(posedge clk) begin
     if (rst) begin chk<='0; fail_r<=1'b0; done_r<=1'b0; end
     else begin

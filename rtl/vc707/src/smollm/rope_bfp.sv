@@ -210,8 +210,12 @@ module rope_bfp #(
             emax = (ej > ejh2) ? {ej[BFP_EXP_W-1], ej} : {ejh2[BFP_EXP_W-1], ejh2};
             shamt_j   = BFP_EXP_W'(emax) - ej;
             shamt_jh2 = BFP_EXP_W'(emax) - ejh2;
-            mj_a   = (shamt_j  >= 16) ? '0 : mj   >>> shamt_j[3:0];
-            mjh2_a = (shamt_jh2>= 16) ? '0 : mjh2 >>> shamt_jh2[3:0];
+            // NB: the unsigned '0 in the ternary's other branch makes the
+            // whole expression unsigned in SV type-unification, which
+            // demotes >>> to LSR.  Use 16'sd0 (signed zero) to keep the
+            // expression signed end-to-end.
+            mj_a   = (shamt_j  >= 16) ? 16'sd0 : ($signed(mj)   >>> shamt_j[3:0]);
+            mjh2_a = (shamt_jh2>= 16) ? 16'sd0 : ($signed(mjh2) >>> shamt_jh2[3:0]);
             // Rotation
             prod_lo = mj_a * cos_buf[rot_idx[4:0]] - mjh2_a * sin_buf[rot_idx[4:0]];
             prod_hi = mjh2_a * cos_buf[rot_idx[4:0]] + mj_a   * sin_buf[rot_idx[4:0]];
