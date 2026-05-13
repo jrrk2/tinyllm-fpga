@@ -83,51 +83,64 @@ module smollm_layer_bfp #(
   localparam int CW_HD   = $clog2(HD   + 1);
   localparam int CW_CTX  = $clog2(MAX_CTX + 1);
 
-  // Weight ROM sizes (per chunk × per col × per lane)
-  localparam int WQ_M_SIZE  = CHUNKS_D   * D   * LANES;
-  localparam int WK_M_SIZE  = CHUNKS_KV  * D   * LANES;
-  localparam int WV_M_SIZE  = CHUNKS_KV  * D   * LANES;
-  localparam int WO_M_SIZE  = CHUNKS_D   * D   * LANES;
-  localparam int WG_M_SIZE  = CHUNKS_FFN * D   * LANES;
-  localparam int WU_M_SIZE  = CHUNKS_FFN * D   * LANES;
-  localparam int WDN_M_SIZE = CHUNKS_D   * FFN * LANES;
+  // Wide-packed ROM widths: each entry holds LANES mantissas (or exponents)
+  // concatenated, so one BRAM read per cycle returns all 16 lanes worth
+  // of data — single-port access matches what Vivado can infer / cascade
+  // RAMB18/36 primitives for.  The previous per-lane unpacked array was
+  // a 16-port read (one address per lane), which Vivado refuses to BRAM-
+  // infer (max 2 read ports) and is too big for distributed RAM (>128 Kb).
+  localparam int LANE_M_W = LANES * BFP_MANT_W;     // 256
+  localparam int LANE_E_W = LANES * BFP_EXP_W;      // 128
 
-  localparam int WQ_E_SIZE  = CHUNKS_D   * NT_D   * LANES;
-  localparam int WK_E_SIZE  = CHUNKS_KV  * NT_D   * LANES;
-  localparam int WV_E_SIZE  = CHUNKS_KV  * NT_D   * LANES;
-  localparam int WO_E_SIZE  = CHUNKS_D   * NT_D   * LANES;
-  localparam int WG_E_SIZE  = CHUNKS_FFN * NT_D   * LANES;
-  localparam int WU_E_SIZE  = CHUNKS_FFN * NT_D   * LANES;
-  localparam int WDN_E_SIZE = CHUNKS_D   * NT_FFN * LANES;
+  // Number of wide entries (one entry per col / per tile, not per lane).
+  localparam int WQ_M_ENT  = CHUNKS_D   * D;
+  localparam int WK_M_ENT  = CHUNKS_KV  * D;
+  localparam int WV_M_ENT  = CHUNKS_KV  * D;
+  localparam int WO_M_ENT  = CHUNKS_D   * D;
+  localparam int WG_M_ENT  = CHUNKS_FFN * D;
+  localparam int WU_M_ENT  = CHUNKS_FFN * D;
+  localparam int WDN_M_ENT = CHUNKS_D   * FFN;
+
+  localparam int WQ_E_ENT  = CHUNKS_D   * NT_D;
+  localparam int WK_E_ENT  = CHUNKS_KV  * NT_D;
+  localparam int WV_E_ENT  = CHUNKS_KV  * NT_D;
+  localparam int WO_E_ENT  = CHUNKS_D   * NT_D;
+  localparam int WG_E_ENT  = CHUNKS_FFN * NT_D;
+  localparam int WU_E_ENT  = CHUNKS_FFN * NT_D;
+  localparam int WDN_E_ENT = CHUNKS_D   * NT_FFN;
 
   // ---------------------------------------------------------------------------
-  // Weight ROMs
+  // Weight ROMs.  `ram_style = "block"` forces Vivado to use RAMB18/RAMB36
+  // primitives (cascaded for the 256-bit-wide mantissa output / 128-bit
+  // exponent output) rather than dissolving to FFs.
   // ---------------------------------------------------------------------------
-  logic signed [BFP_MANT_W-1:0] rom_WQ_m  [0:WQ_M_SIZE-1];
-  logic signed [BFP_MANT_W-1:0] rom_WK_m  [0:WK_M_SIZE-1];
-  logic signed [BFP_MANT_W-1:0] rom_WV_m  [0:WV_M_SIZE-1];
-  logic signed [BFP_MANT_W-1:0] rom_WO_m  [0:WO_M_SIZE-1];
-  logic signed [BFP_MANT_W-1:0] rom_WG_m  [0:WG_M_SIZE-1];
-  logic signed [BFP_MANT_W-1:0] rom_WU_m  [0:WU_M_SIZE-1];
-  logic signed [BFP_MANT_W-1:0] rom_WDN_m [0:WDN_M_SIZE-1];
+  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_WQ_m  [0:WQ_M_ENT-1];
+  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_WK_m  [0:WK_M_ENT-1];
+  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_WV_m  [0:WV_M_ENT-1];
+  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_WO_m  [0:WO_M_ENT-1];
+  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_WG_m  [0:WG_M_ENT-1];
+  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_WU_m  [0:WU_M_ENT-1];
+  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_WDN_m [0:WDN_M_ENT-1];
 
-  logic signed [BFP_EXP_W -1:0] rom_WQ_e  [0:WQ_E_SIZE-1];
-  logic signed [BFP_EXP_W -1:0] rom_WK_e  [0:WK_E_SIZE-1];
-  logic signed [BFP_EXP_W -1:0] rom_WV_e  [0:WV_E_SIZE-1];
-  logic signed [BFP_EXP_W -1:0] rom_WO_e  [0:WO_E_SIZE-1];
-  logic signed [BFP_EXP_W -1:0] rom_WG_e  [0:WG_E_SIZE-1];
-  logic signed [BFP_EXP_W -1:0] rom_WU_e  [0:WU_E_SIZE-1];
-  logic signed [BFP_EXP_W -1:0] rom_WDN_e [0:WDN_E_SIZE-1];
+  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_WQ_e  [0:WQ_E_ENT-1];
+  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_WK_e  [0:WK_E_ENT-1];
+  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_WV_e  [0:WV_E_ENT-1];
+  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_WO_e  [0:WO_E_ENT-1];
+  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_WG_e  [0:WG_E_ENT-1];
+  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_WU_e  [0:WU_E_ENT-1];
+  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_WDN_e [0:WDN_E_ENT-1];
 
-  logic signed [BFP_MANT_W-1:0] rom_G1_m [0:D-1];
-  logic signed [BFP_MANT_W-1:0] rom_G2_m [0:D-1];
-  logic signed [BFP_EXP_W -1:0] rom_G1_e [0:NT_D-1];
-  logic signed [BFP_EXP_W -1:0] rom_G2_e [0:NT_D-1];
+  // Gamma / KV-init: kept narrow (1 mantissa per entry) — small enough
+  // (D=64 entries) that they can live in distributed RAM or single BRAM.
+  (* ram_style = "block" *) logic signed [BFP_MANT_W-1:0] rom_G1_m [0:D-1];
+  (* ram_style = "block" *) logic signed [BFP_MANT_W-1:0] rom_G2_m [0:D-1];
+  (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] rom_G1_e [0:NT_D-1];
+  (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] rom_G2_e [0:NT_D-1];
 
-  logic signed [BFP_MANT_W-1:0] kv_k_m [0:MAX_CTX*H_KV*HD-1];
-  logic signed [BFP_MANT_W-1:0] kv_v_m [0:MAX_CTX*H_KV*HD-1];
-  logic signed [BFP_EXP_W -1:0] kv_k_e [0:MAX_CTX*NT_KV-1];
-  logic signed [BFP_EXP_W -1:0] kv_v_e [0:MAX_CTX*NT_KV-1];
+  (* ram_style = "block" *) logic signed [BFP_MANT_W-1:0] kv_k_m [0:MAX_CTX*H_KV*HD-1];
+  (* ram_style = "block" *) logic signed [BFP_MANT_W-1:0] kv_v_m [0:MAX_CTX*H_KV*HD-1];
+  (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] kv_k_e [0:MAX_CTX*NT_KV-1];
+  (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] kv_v_e [0:MAX_CTX*NT_KV-1];
 
 `ifdef MICROGPT_WEIGHT_DIR
   initial begin
@@ -182,38 +195,22 @@ module smollm_layer_bfp #(
 `endif
 
   // ---------------------------------------------------------------------------
-  // Host write port: lets a regmap overlay individual weight/gamma/KV-init
-  // entries post-bitstream.  $readmemh provides the boot defaults; this
-  // demuxes wr_kind to the addressed BRAM.  Vivado infers RAMB36E1 with a
-  // single write port + asynchronous-ish read on these arrays.
+  // Host write port (wr_kind / wr_addr / wr_data / wr_en): currently NOT
+  // wired internally.  The wide-packed ROM layout that Vivado needs for
+  // BRAM inference (256-bit-wide mantissa entries cascaded across multiple
+  // RAMB36 primitives) is incompatible with a single-mantissa byte-write
+  // port.  To restore writability the host would have to use a 2-cycle
+  // read-modify-write helper FSM, or the build flow would emit per-lane
+  // BRAM wrappers (cf. gen_brom_sv.py for the int8 path).
+  //
+  // For now hex files are the source of truth: regenerate via
+  //   make USE_BFP=1 bfp-sim     # rebake lbfp_*.hex
+  // and resynthesize.  The wr_* wrapper port is retained for ABI compat
+  // with the int8 scale-write regmap path, but writes are dropped here.
   // ---------------------------------------------------------------------------
-  always_ff @(posedge clk) if (wr_en) begin
-    case (wr_kind)
-      5'd0:  rom_WQ_m  [wr_addr]                       <= wr_data;
-      5'd1:  rom_WQ_e  [wr_addr]                       <= wr_data[BFP_EXP_W-1:0];
-      5'd2:  rom_WK_m  [wr_addr]                       <= wr_data;
-      5'd3:  rom_WK_e  [wr_addr]                       <= wr_data[BFP_EXP_W-1:0];
-      5'd4:  rom_WV_m  [wr_addr]                       <= wr_data;
-      5'd5:  rom_WV_e  [wr_addr]                       <= wr_data[BFP_EXP_W-1:0];
-      5'd6:  rom_WO_m  [wr_addr]                       <= wr_data;
-      5'd7:  rom_WO_e  [wr_addr]                       <= wr_data[BFP_EXP_W-1:0];
-      5'd8:  rom_WG_m  [wr_addr]                       <= wr_data;
-      5'd9:  rom_WG_e  [wr_addr]                       <= wr_data[BFP_EXP_W-1:0];
-      5'd10: rom_WU_m  [wr_addr]                       <= wr_data;
-      5'd11: rom_WU_e  [wr_addr]                       <= wr_data[BFP_EXP_W-1:0];
-      5'd12: rom_WDN_m [wr_addr]                       <= wr_data;
-      5'd13: rom_WDN_e [wr_addr]                       <= wr_data[BFP_EXP_W-1:0];
-      5'd14: rom_G1_m  [wr_addr[$clog2(D)-1:0]]        <= wr_data;
-      5'd15: rom_G1_e  [wr_addr[$clog2(NT_D+1)-1:0]]   <= wr_data[BFP_EXP_W-1:0];
-      5'd16: rom_G2_m  [wr_addr[$clog2(D)-1:0]]        <= wr_data;
-      5'd17: rom_G2_e  [wr_addr[$clog2(NT_D+1)-1:0]]   <= wr_data[BFP_EXP_W-1:0];
-      5'd18: kv_k_m    [wr_addr[$clog2(MAX_CTX*H_KV*HD)-1:0]] <= wr_data;
-      5'd19: kv_k_e    [wr_addr[$clog2(MAX_CTX*NT_KV)-1:0]]   <= wr_data[BFP_EXP_W-1:0];
-      5'd20: kv_v_m    [wr_addr[$clog2(MAX_CTX*H_KV*HD)-1:0]] <= wr_data;
-      5'd21: kv_v_e    [wr_addr[$clog2(MAX_CTX*NT_KV)-1:0]]   <= wr_data[BFP_EXP_W-1:0];
-      default: ;
-    endcase
-  end
+  /* verilator lint_off UNUSEDSIGNAL */
+  wire _unused_wr = &{1'b0, wr_kind, wr_addr, wr_data, wr_en, 1'b0};
+  /* verilator lint_on UNUSEDSIGNAL */
 
   // ---------------------------------------------------------------------------
   // Working buffers
@@ -650,13 +647,9 @@ module smollm_layer_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= n1_m[cnt[CW_D-1:0]];
           mv_x_e   <= n1_e[cnt[CW_D-1:0] / BFP_TILE];
-          for (ii = 0; ii < LANES; ii++) begin
-            mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <=
-              rom_WQ_m[((chunk * D + cnt[CW_D-1:0]) * LANES) + ii];
-            mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <=
-              rom_WQ_e[((chunk * NT_D + cnt[CW_D-1:0]/BFP_TILE) * LANES) + ii];
-          end
-          mv_last <= (cnt == D-1);
+          mv_w_m   <= rom_WQ_m[chunk * D    + cnt[CW_D-1:0]];
+          mv_w_e   <= rom_WQ_e[chunk * NT_D + cnt[CW_D-1:0] / BFP_TILE];
+          mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_QMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
@@ -698,13 +691,9 @@ module smollm_layer_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= n1_m[cnt[CW_D-1:0]];
           mv_x_e   <= n1_e[cnt[CW_D-1:0] / BFP_TILE];
-          for (ii = 0; ii < LANES; ii++) begin
-            mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <=
-              rom_WK_m[((chunk * D + cnt[CW_D-1:0]) * LANES) + ii];
-            mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <=
-              rom_WK_e[((chunk * NT_D + cnt[CW_D-1:0]/BFP_TILE) * LANES) + ii];
-          end
-          mv_last <= (cnt == D-1);
+          mv_w_m   <= rom_WK_m[chunk * D    + cnt[CW_D-1:0]];
+          mv_w_e   <= rom_WK_e[chunk * NT_D + cnt[CW_D-1:0] / BFP_TILE];
+          mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_KMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
@@ -742,13 +731,9 @@ module smollm_layer_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= n1_m[cnt[CW_D-1:0]];
           mv_x_e   <= n1_e[cnt[CW_D-1:0] / BFP_TILE];
-          for (ii = 0; ii < LANES; ii++) begin
-            mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <=
-              rom_WV_m[((chunk * D + cnt[CW_D-1:0]) * LANES) + ii];
-            mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <=
-              rom_WV_e[((chunk * NT_D + cnt[CW_D-1:0]/BFP_TILE) * LANES) + ii];
-          end
-          mv_last <= (cnt == D-1);
+          mv_w_m   <= rom_WV_m[chunk * D    + cnt[CW_D-1:0]];
+          mv_w_e   <= rom_WV_e[chunk * NT_D + cnt[CW_D-1:0] / BFP_TILE];
+          mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_VMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
@@ -1105,13 +1090,9 @@ module smollm_layer_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= attn_m[cnt[CW_D-1:0]];
           mv_x_e   <= attn_e[cnt[CW_D-1:0] / BFP_TILE];
-          for (ii = 0; ii < LANES; ii++) begin
-            mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <=
-              rom_WO_m[((chunk * D + cnt[CW_D-1:0]) * LANES) + ii];
-            mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <=
-              rom_WO_e[((chunk * NT_D + cnt[CW_D-1:0]/BFP_TILE) * LANES) + ii];
-          end
-          mv_last <= (cnt == D-1);
+          mv_w_m   <= rom_WO_m[chunk * D    + cnt[CW_D-1:0]];
+          mv_w_e   <= rom_WO_e[chunk * NT_D + cnt[CW_D-1:0] / BFP_TILE];
+          mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_OMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
@@ -1216,13 +1197,9 @@ module smollm_layer_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= n2_m[cnt[CW_D-1:0]];
           mv_x_e   <= n2_e[cnt[CW_D-1:0] / BFP_TILE];
-          for (ii = 0; ii < LANES; ii++) begin
-            mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <=
-              rom_WG_m[((chunk * D + cnt[CW_D-1:0]) * LANES) + ii];
-            mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <=
-              rom_WG_e[((chunk * NT_D + cnt[CW_D-1:0]/BFP_TILE) * LANES) + ii];
-          end
-          mv_last <= (cnt == D-1);
+          mv_w_m   <= rom_WG_m[chunk * D    + cnt[CW_D-1:0]];
+          mv_w_e   <= rom_WG_e[chunk * NT_D + cnt[CW_D-1:0] / BFP_TILE];
+          mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_GMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
@@ -1260,13 +1237,9 @@ module smollm_layer_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= n2_m[cnt[CW_D-1:0]];
           mv_x_e   <= n2_e[cnt[CW_D-1:0] / BFP_TILE];
-          for (ii = 0; ii < LANES; ii++) begin
-            mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <=
-              rom_WU_m[((chunk * D + cnt[CW_D-1:0]) * LANES) + ii];
-            mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <=
-              rom_WU_e[((chunk * NT_D + cnt[CW_D-1:0]/BFP_TILE) * LANES) + ii];
-          end
-          mv_last <= (cnt == D-1);
+          mv_w_m   <= rom_WU_m[chunk * D    + cnt[CW_D-1:0]];
+          mv_w_e   <= rom_WU_e[chunk * NT_D + cnt[CW_D-1:0] / BFP_TILE];
+          mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_UMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
@@ -1332,13 +1305,9 @@ module smollm_layer_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= mlp_m[cnt[CW_FFN-1:0]];
           mv_x_e   <= mlp_e[cnt[CW_FFN-1:0] / BFP_TILE];
-          for (ii = 0; ii < LANES; ii++) begin
-            mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <=
-              rom_WDN_m[((chunk * FFN + cnt[CW_FFN-1:0]) * LANES) + ii];
-            mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <=
-              rom_WDN_e[((chunk * NT_FFN + cnt[CW_FFN-1:0]/BFP_TILE) * LANES) + ii];
-          end
-          mv_last <= (cnt == FFN-1);
+          mv_w_m   <= rom_WDN_m[chunk * FFN    + cnt[CW_FFN-1:0]];
+          mv_w_e   <= rom_WDN_e[chunk * NT_FFN + cnt[CW_FFN-1:0] / BFP_TILE];
+          mv_last  <= (cnt == FFN-1);
           if (cnt == FFN-1) state <= S_DMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end

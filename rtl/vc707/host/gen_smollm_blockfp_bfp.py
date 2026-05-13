@@ -107,29 +107,44 @@ def write_hex(path, vals, width):
 
 
 def emit_W(prefix_tag, W):
-    """Emit rom_W<TAG>_m.hex + rom_W<TAG>_e.hex in the RTL layout."""
+    """Emit rom_W<TAG>_m.hex + rom_W<TAG>_e.hex in the RTL's wide-packed
+    layout — each line holds LANES mantissas (256 bits = 64 hex chars) for
+    mantissa ROMs, LANES exponents (128 bits = 32 hex chars) for exponent
+    ROMs.  This matches the int8 weight_streamer_brom.sv format that Vivado
+    BRAM-infers as cascaded RAMB36 primitives.
+       mantissa hex line N = concat(lane15 .. lane0) at entry N
+       entry layout: row = chunk*LANES + lane, addr = chunk*D_in + col
+    """
     m, e = quantize_W(W)
     D_out, D_in = W.shape
     NT_in = D_in // TILE
     CHUNKS_OUT = D_out // LANES
-    # mantissas: index = (chunk * D_in + col) * LANES + lane
-    mant_flat = np.zeros(CHUNKS_OUT * D_in * LANES, dtype=np.int16)
+    # Mantissa wide entries: one 256-bit word per (chunk, col)
+    mant_lines = []
     for chunk in range(CHUNKS_OUT):
         for col in range(D_in):
+            word = 0
             for lane in range(LANES):
                 row = chunk * LANES + lane
                 tile = col // TILE
                 idx_in_tile = col % TILE
-                mant_flat[(chunk * D_in + col) * LANES + lane] = m[row, tile, idx_in_tile]
-    # exponents: index = (chunk * NT_in + tile) * LANES + lane
-    exp_flat = np.zeros(CHUNKS_OUT * NT_in * LANES, dtype=np.int8)
+                mv = int(m[row, tile, idx_in_tile]) & 0xFFFF
+                word |= (mv << (lane * 16))
+            mant_lines.append(f"{word:064x}")
+    # Exponent wide entries: one 128-bit word per (chunk, tile)
+    exp_lines = []
     for chunk in range(CHUNKS_OUT):
         for tile in range(NT_in):
+            word = 0
             for lane in range(LANES):
                 row = chunk * LANES + lane
-                exp_flat[(chunk * NT_in + tile) * LANES + lane] = e[row, tile]
-    write_hex(os.path.join(OUT, f"{PREFIX}{prefix_tag}_m.hex"), mant_flat, 4)
-    write_hex(os.path.join(OUT, f"{PREFIX}{prefix_tag}_e.hex"), exp_flat, 2)
+                ev = int(e[row, tile]) & 0xFF
+                word |= (ev << (lane * 8))
+            exp_lines.append(f"{word:032x}")
+    with open(os.path.join(OUT, f"{PREFIX}{prefix_tag}_m.hex"), 'w') as f:
+        for ln in mant_lines: f.write(ln + "\n")
+    with open(os.path.join(OUT, f"{PREFIX}{prefix_tag}_e.hex"), 'w') as f:
+        for ln in exp_lines: f.write(ln + "\n")
     return m, e   # return for golden computation
 
 
