@@ -167,8 +167,12 @@ module smollm_decode_head_bfp #(
       state      <= S_IDLE;
       cnt        <= '0;
       chunk      <= '0;
-      best_m     <= 16'sh8000;     // -32768 (min Q1.15)
-      best_e     <= -8'sd128;      // most negative exp
+      // Sentinel value: -1.0 * 2^127 ≈ -1.7e38 (BFP equivalent of -infinity).
+      // Any real logit, positive or negative, beats this — fixes the
+      // step-12 <unk> failure where every logit was negative and the old
+      // sentinel (-2^-128, a tiny negative near zero) was never beaten.
+      best_m     <= 16'sh8000;
+      best_e     <= 8'sd127;
       best_idx   <= '0;
       mv_start   <= 1'b0;
       mv_valid   <= 1'b0;
@@ -254,18 +258,36 @@ module smollm_decode_head_bfp #(
           else cnt <= cnt + 1'b1;
         end
 
-        S_MV_DRAIN: if (mv_out_valid) begin
-          // Compare each of the LANES output lanes (logits) to running best
-          for (ii = 0; ii < LANES; ii++) begin
+        S_MV_DRAIN: if (mv_out_valid) begin : drain_blk
+          // Two-pass argmax inside the chunk:
+          //   1) Sequentially track local_best across all 16 lanes (blocking,
+          //      so each iteration sees the running max).
+          //   2) Compare that single local_best against the global running
+          //      best_m / best_e via one non-blocking update.
+          // The previous one-pass loop wrote best_* via non-blocking inside
+          // every iteration that beat the OLD best — last-NBA-wins semantics
+          // meant the highest-index passing lane won, not the actual max.
+          automatic logic signed [BFP_MANT_W-1:0] local_m;
+          automatic logic signed [BFP_EXP_W -1:0] local_e;
+          automatic logic [3:0]                   local_lane;
+          local_m    = $signed(mv_out_m[0 +: BFP_MANT_W]);
+          local_e    = $signed(mv_out_e[0 +: BFP_EXP_W ]);
+          local_lane = 4'd0;
+          for (ii = 1; ii < LANES; ii++) begin
             automatic logic signed [BFP_MANT_W-1:0] m_i;
             automatic logic signed [BFP_EXP_W -1:0] e_i;
             m_i = $signed(mv_out_m[ii*BFP_MANT_W +: BFP_MANT_W]);
             e_i = $signed(mv_out_e[ii*BFP_EXP_W  +: BFP_EXP_W ]);
-            if (bfp_gt(m_i, e_i, best_m, best_e)) begin
-              best_m   <= m_i;
-              best_e   <= e_i;
-              best_idx <= 16'(chunk * LANES + ii);
+            if (bfp_gt(m_i, e_i, local_m, local_e)) begin
+              local_m    = m_i;
+              local_e    = e_i;
+              local_lane = ii[3:0];
             end
+          end
+          if (bfp_gt(local_m, local_e, best_m, best_e)) begin
+            best_m   <= local_m;
+            best_e   <= local_e;
+            best_idx <= 16'(chunk * LANES + local_lane);
           end
           state <= S_MV_NEXT;
         end

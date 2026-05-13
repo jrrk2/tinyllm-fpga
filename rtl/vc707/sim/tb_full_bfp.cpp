@@ -46,18 +46,32 @@ int main(int argc, char** argv) {
   for (int i = 0; i < 8; ++i) tick();
   d->rst = 0; tick();
 
-  // golden[] starts with the prompt tokens too — golden[0..len-1] == prompt.
-  // We step (len(prompt) + N_GEN - 1) times total (prompt steps fill KV;
-  // first NEW token comes from the LAST prompt step's output).
-  const int N_STEPS = (int)golden.size() - 1;     // last golden has no follow-up
-  std::vector<int> generated;
-  int pass_count = 0, fail_count = 0;
+  // Two modes, selected by env var BFP_FEED:
+  //   BFP_FEED=golden (default): force-feed Python BFP golden tokens as inputs.
+  //     Each step is an independent test: compare RTL's argmax to golden[k].
+  //     Diagnoses arithmetic divergence per-step.
+  //   BFP_FEED=auto: feed RTL's previous output back as the next input
+  //     (true autoregress).  No per-step PASS/FAIL — we just print the
+  //     resulting text and judge coherence by eye.  Useful when RTL drifts
+  //     from golden but might still produce sensible English on its own.
+  const char* feed_mode = std::getenv("BFP_FEED");
+  bool auto_feed = (feed_mode && std::string(feed_mode) == "auto");
+  const int N_PROMPT = (int)prompt.size();
+  const int N_STEPS  = (int)golden.size();
+  int pass_count = 0, fail_count = 0, compared = 0;
+  std::vector<int> rtl_chain;
 
-  std::fprintf(stderr, "[tb_full_bfp] starting %d token steps\n", N_STEPS);
+  std::fprintf(stderr, "[tb_full_bfp] feed=%s, %d steps (prompt=%d, golden=%d)\n",
+               auto_feed ? "auto" : "golden", N_STEPS, N_PROMPT, (int)golden.size());
   for (int step = 0; step < N_STEPS; ++step) {
-    int tid_in = (step < (int)prompt.size()) ? prompt[step]
-                                              : generated.back();
-    // Drive
+    int tid_in;
+    if (step < N_PROMPT) {
+      tid_in = prompt[step];
+    } else if (auto_feed) {
+      tid_in = rtl_chain.back();
+    } else {
+      tid_in = golden[step - 1];
+    }
     d->token_in = (uint16_t)tid_in;
     d->pos      = (uint32_t)step;
     d->kv_pos   = (uint32_t)step;
@@ -65,7 +79,6 @@ int main(int argc, char** argv) {
     tick();
     d->start = 0;
 
-    // Wait for done
     const uint64_t LIM = cycle_count + 200000000ULL;
     while (!d->done && cycle_count < LIM) tick();
     if (cycle_count >= LIM) {
@@ -74,21 +87,32 @@ int main(int argc, char** argv) {
       delete d; return 1;
     }
     int tid_out = (int)d->token_out;
-    tick();   // clear done
+    tick();
 
-    // Compare: token_out at step k should equal golden[k+1] (golden is the
-    // input sequence at each step, so the model's output at step k matches
-    // golden's NEXT entry).
-    int expected = golden[step + 1];
-    bool ok = (tid_out == expected);
-    if (ok) ++pass_count; else ++fail_count;
-    std::fprintf(stderr, "  step %2d  in=%5d  out=%5d  exp=%5d  %s\n",
-                 step, tid_in, tid_out, expected, ok ? "PASS" : "FAIL");
-    generated.push_back(tid_out);
+    rtl_chain.push_back(tid_out);
+
+    // Only compare for steps where the baker actually wrote a golden nid.
+    if (step >= N_PROMPT && !auto_feed) {
+      int expected = golden[step];
+      bool ok = (tid_out == expected);
+      ++compared;
+      if (ok) ++pass_count; else ++fail_count;
+      std::fprintf(stderr, "  step %2d  in=%5d  out=%5d  exp=%5d  %s\n",
+                   step, tid_in, tid_out, expected, ok ? "PASS" : "FAIL");
+    } else {
+      const char* tag = auto_feed ? "auto" :
+                        (step < N_PROMPT ? "prefill — no golden" : "auto");
+      std::fprintf(stderr, "  step %2d  in=%5d  out=%5d  (%s)\n",
+                   step, tid_in, tid_out, tag);
+    }
   }
 
-  std::printf("=== tb_full_bfp summary: %d PASS, %d FAIL out of %d steps ===\n",
-              pass_count, fail_count, N_STEPS);
+  std::printf("=== tb_full_bfp summary: %d PASS, %d FAIL out of %d comparisons ===\n",
+              pass_count, fail_count, compared);
+  // Print the final RTL-generated chain (prompt + autoregress) for offline decoding.
+  std::printf("RTL_TOKENS:");
+  for (int t : rtl_chain) std::printf(" %d", t);
+  std::printf("\n");
   delete d;
   return fail_count == 0 ? 0 : 1;
 }
