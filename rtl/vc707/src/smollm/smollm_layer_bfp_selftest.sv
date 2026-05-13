@@ -41,7 +41,7 @@ module smollm_layer_bfp_selftest #(
 
   logic                                  lay_start;
   logic [10:0]                           lay_pos;
-  logic [4:0]                            lay_kv_pos;
+  logic [6:0]                            lay_kv_pos;
   wire  signed [D*BFP_MANT_W-1:0]        lay_hidden_in_m;
   wire  signed [NT_D*BFP_EXP_W-1:0]      lay_hidden_in_e;
   wire  signed [D*BFP_MANT_W-1:0]        lay_hidden_out_m;
@@ -72,6 +72,7 @@ module smollm_layer_bfp_selftest #(
     .clk(clk), .rst(rst | restart),
     .start(lay_start),
     .pos(lay_pos), .kv_pos(lay_kv_pos),
+    .layer_idx(5'd0),         // single-layer selftest: always layer 0
     .hidden_in_m(lay_hidden_in_m),
     .hidden_in_e(lay_hidden_in_e),
     .hidden_out_m(lay_hidden_out_m),
@@ -88,7 +89,7 @@ module smollm_layer_bfp_selftest #(
     if (rst | restart) begin
       lay_start  <= 1'b0;
       lay_pos    <= 11'd3;
-      lay_kv_pos <= 5'd3;
+      lay_kv_pos <= 7'd3;
       result_m   <= '0;
       result_e   <= '0;
       done       <= 1'b0;

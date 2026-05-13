@@ -25,6 +25,8 @@ module lint_bfp_swap (
     .restart  ( restart                     ),
     .wr_kind  ( {1'b0, scale_wr_kind_core}  ),
     .wr_addr  ( {2'b0, scale_wr_addr_core}  ),
+    // NB: the selftest pins layer_idx=0 internally.
+
     .wr_data  ( scale_wr_data_core          ),
     .wr_en    ( scale_wr_pulse_core         ),
     .result_m ( bfp_result_m                ),

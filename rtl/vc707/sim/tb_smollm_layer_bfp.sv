@@ -86,7 +86,8 @@ module tb_smollm_layer_bfp (
     .FFN(FFN), .MAX_CTX(MAX_CTX), .PREFIX("../generated/lbfp_")
   ) dut (
     .clk(clk), .rst(rst), .start(start_r),
-    .pos(11'd`LBFP_POS), .kv_pos(5'd`LBFP_KV_POS),
+    .pos(11'd`LBFP_POS), .kv_pos(7'd`LBFP_KV_POS),
+    .layer_idx(5'd0),
     .hidden_in_m(hin_m_bus), .hidden_in_e(hin_e_bus),
     .hidden_out_m(hout_m_bus), .hidden_out_e(hout_e_bus),
     .done(dut_done),

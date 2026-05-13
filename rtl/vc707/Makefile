@@ -142,7 +142,20 @@ $(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(lbfp_stamp
 bfp-sim: $(lbfp_stamp)
 	$(MAKE) -C sim bfp-layer
 
-.PHONY: bfp-sim
+# Full-scale: bake real SmolLM2-135M weights + run autoregressive token
+# loop in Verilator.  Pulls weights from HuggingFace (one-time download,
+# ~270 MB).  Bake-and-run takes ~10 min wall, then compares 18 generated
+# tokens against the Python BFP golden.
+lbfp_full_stamp := $(GENERATED_DIR)/.lbfp_full.stamp
+$(lbfp_full_stamp): host/gen_smollm_blockfp_full.py
+	@echo "=== baking SmolLM2-135M block-FP weights (30 layers, full dims) ==="
+	python3 host/gen_smollm_blockfp_full.py
+	@touch $@
+
+bfp-full: $(lbfp_full_stamp)
+	$(MAKE) -C sim bfp-full
+
+.PHONY: bfp-sim bfp-full
 
 $(ips): %.xci :
 	mkdir -p $(work-dir)

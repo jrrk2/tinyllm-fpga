@@ -11,7 +11,7 @@ VFLAGS    := -Wall -Wno-fatal -cc --exe --build -j 0 \
 
 SMOLLM_SRC := ../src/smollm
 
-.PHONY: all matvec rmsnorm rope swiglu swiglu_selftest softmax persist softmax_selftest weight_streamer smollm_layer_ddr3 multilayer_tm bfp-layer clean
+.PHONY: all matvec rmsnorm rope swiglu swiglu_selftest softmax persist softmax_selftest weight_streamer smollm_layer_ddr3 multilayer_tm bfp-layer bfp-full clean
 
 all: matvec rmsnorm rope swiglu softmax persist softmax_selftest
 
@@ -614,6 +614,47 @@ obj_dir/Vtb_smollm_layer_bfp: tb_smollm_layer_bfp.sv tb_smollm_layer_bfp.cpp \
 	    $(SMOLLM_SRC)/residual_bfp.sv \
 	    $(SMOLLM_SRC)/cordic_sincos.sv \
 	    -o Vtb_smollm_layer_bfp
+
+# ---------------------- tb_full_bfp (full SmolLM2 BFP token loop) ----------------------
+# 30 layers, real HuggingFace weights, decode head, embed lookup —
+# autoregressive token generation in Verilator.  Compares each emitted
+# token to the Python BFP golden (lbfp_full_GOLDEN_TOKENS.txt baked by
+# host/gen_smollm_blockfp_full.py).  Loads ~600 MB of $readmemh data;
+# expect ~30-90 seconds init + ~30-60 seconds per token step.
+bfp-full: obj_dir/Vtb_full_bfp
+	@echo "=== running tb_full_bfp (SmolLM2-135M BFP autoregress) ==="
+	@./obj_dir/Vtb_full_bfp
+
+obj_dir/Vtb_full_bfp: tb_full_bfp.sv tb_full_bfp.cpp \
+                     $(SMOLLM_SRC)/embed_lookup_bfp.sv \
+                     $(SMOLLM_SRC)/smollm_multilayer_tm_bfp.sv \
+                     $(SMOLLM_SRC)/smollm_decode_head_bfp.sv \
+                     $(SMOLLM_SRC)/smollm_layer_bfp.sv \
+                     $(SMOLLM_SRC)/matvec_bfp_engine.sv \
+                     $(SMOLLM_SRC)/rmsnorm_bfp.sv \
+                     $(SMOLLM_SRC)/rope_bfp.sv \
+                     $(SMOLLM_SRC)/swiglu_bfp.sv \
+                     $(SMOLLM_SRC)/softmax_bfp.sv \
+                     $(SMOLLM_SRC)/residual_bfp.sv \
+                     $(SMOLLM_SRC)/cordic_sincos.sv
+	$(VERILATOR) -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-fatal -cc --exe --build \
+	    -j 0 --x-assign 0 --x-initial 0 \
+	    -CFLAGS "-O2 -std=c++17" \
+	    --top-module tb_full_bfp \
+	    -I../generated -I$(SMOLLM_SRC) \
+	    tb_full_bfp.sv tb_full_bfp.cpp \
+	    $(SMOLLM_SRC)/embed_lookup_bfp.sv \
+	    $(SMOLLM_SRC)/smollm_multilayer_tm_bfp.sv \
+	    $(SMOLLM_SRC)/smollm_decode_head_bfp.sv \
+	    $(SMOLLM_SRC)/smollm_layer_bfp.sv \
+	    $(SMOLLM_SRC)/matvec_bfp_engine.sv \
+	    $(SMOLLM_SRC)/rmsnorm_bfp.sv \
+	    $(SMOLLM_SRC)/rope_bfp.sv \
+	    $(SMOLLM_SRC)/swiglu_bfp.sv \
+	    $(SMOLLM_SRC)/softmax_bfp.sv \
+	    $(SMOLLM_SRC)/residual_bfp.sv \
+	    $(SMOLLM_SRC)/cordic_sincos.sv \
+	    -o Vtb_full_bfp
 
 clean:
 	rm -rf obj_dir test_matvec.bin test_rmsnorm.bin test_rope.bin test_swiglu.bin test_softmax.bin
