@@ -62,6 +62,7 @@ set abs_generated [file normalize ../generated]
 set_property include_dirs [list \
     "../src/include" \
     "src" \
+    "src/smollm" \
     $abs_generated \
 ] [current_fileset]
 
@@ -112,6 +113,14 @@ read_verilog -sv { \
     src/smollm/smollm_layer_selftest.sv \
     src/smollm/smollm_multilayer_tm.sv \
     src/smollm/smollm_multilayer_tm_selftest.sv \
+    src/smollm/matvec_bfp_engine.sv \
+    src/smollm/rmsnorm_bfp.sv \
+    src/smollm/rope_bfp.sv \
+    src/smollm/swiglu_bfp.sv \
+    src/smollm/softmax_bfp.sv \
+    src/smollm/residual_bfp.sv \
+    src/smollm/smollm_layer_bfp.sv \
+    src/smollm/smollm_layer_bfp_selftest.sv \
 }
 
 # Generated brom_*.sv wrappers — explicit RAMB36E1 instances for the
