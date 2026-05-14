@@ -240,10 +240,14 @@ module embed_lookup_bfp #(
         done_axi    <= 1'b0;
         exp_beat    <= '0;
       end else begin
+        // done_axi is LATCHED in L_DONE and held until the next start_axi
+        // arrives.  Clearing it in L_IDLE (as before) made it a 5 ns
+        // pulse at 200 MHz ui_clk, which the 50 MHz core-clock 2FF
+        // sync missed — autoregress would stall in S_EMB_WAIT forever.
         case (lstate)
           L_IDLE: begin
-            done_axi <= 1'b0;
             if (start_axi) begin
+              done_axi  <= 1'b0;
               addr_m    <= ws_base_EMBED_LU_m + AXI_ADDR_WIDTH'(axi_tok) * AXI_ADDR_WIDTH'(ROW_M_BYTES);
               addr_e    <= ws_base_EMBED_LU_e + AXI_ADDR_WIDTH'(axi_tok) * AXI_ADDR_WIDTH'(AXI_DATA_WIDTH/8);
               mbeat_idx <= '0;
