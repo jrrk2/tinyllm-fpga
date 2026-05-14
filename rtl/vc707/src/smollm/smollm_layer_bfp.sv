@@ -351,8 +351,8 @@ module smollm_layer_bfp #(
     S_QMV_PRIME, S_QMV_DRIVE, S_QMV_DRAIN, S_QMV_REQ, S_QMV_NEXT,
     S_KMV_PRIME, S_KMV_DRIVE, S_KMV_DRAIN, S_KMV_REQ, S_KMV_NEXT,
     S_VMV_PRIME, S_VMV_DRIVE, S_VMV_DRAIN, S_VMV_REQ, S_VMV_NEXT,
-    S_ROPEQ, S_ROPEQ_WAIT, S_ROPEQ_RQ,
-    S_ROPEK, S_ROPEK_WAIT, S_ROPEK_RQ,
+    S_ROPEQ, S_ROPEQ_WAIT, S_ROPEQ_RQ_A, S_ROPEQ_RQ_B,
+    S_ROPEK, S_ROPEK_WAIT, S_ROPEK_RQ_A, S_ROPEK_RQ_B,
     S_KVWR_M, S_KVWR_E,
     S_QK_PRIME, S_QK_DRIVE, S_QK_DRAIN,
     S_SM_DRIVE, S_SM_WAIT,
@@ -1127,7 +1127,7 @@ module smollm_layer_bfp #(
           if (rp_done) begin
             if (head_idx == H_Q - 1) begin
               cnt   <= '0;
-              state <= S_ROPEQ_RQ;
+              state <= S_ROPEQ_RQ_A;
             end else begin
               head_idx <= head_idx + 1'b1; cnt <= '0;
               rp_start <= 1'b1; state <= S_ROPEQ;
@@ -1135,29 +1135,45 @@ module smollm_layer_bfp #(
           end
         end
 
-        // Re-tile-quantize q_rot (per-element exp) into per-tile q_m / q_e.
-        // For each tile: emax = max(q_rot_e in tile); for each elem in tile,
-        // q_m = q_rot_m >>> (emax - q_rot_e_i); q_e = emax.  cnt steps tile.
-        S_ROPEQ_RQ: begin
-          begin : rq_q
-            automatic logic signed [BFP_EXP_W-1:0] emax;
-            automatic int base;
-            base = cnt[$clog2(NT_D+1)-1:0] * BFP_TILE;
-            emax = -8'sd128;
-            for (ii = 0; ii < BFP_TILE; ii++)
-              if (base + ii < D)
-                if (q_rot_e[base + ii] > emax) emax = q_rot_e[base + ii];
-            for (ii = 0; ii < BFP_TILE; ii++) begin
-              if (base + ii < D)
-                q_m[base + ii] <= requant_mant(q_rot_m[base + ii],
-                                               q_rot_e[base + ii], emax);
-            end
-            q_e[cnt[$clog2(NT_D+1)-1:0]] <= emax;
+        // Re-tile-quantize q_rot — 2-stage pipeline.
+        // Stage A: scan the tile's q_rot_e[base..base+15], compute the
+        //          max of each 8-element half; latch into emax_h{0,1}_r.
+        // Stage B: final emax = max(halves); apply requant_mant to all
+        //          16 elements; write q_m + q_e; advance cnt.
+        S_ROPEQ_RQ_A: begin : rq_q_a
+          automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
+          automatic int base;
+          base = cnt[$clog2(NT_D+1)-1:0] * BFP_TILE;
+          e_lo = -8'sd128;
+          for (ii = 0; ii < 8; ii++)
+            if (base + ii < D)
+              if (q_rot_e[base + ii] > e_lo) e_lo = q_rot_e[base + ii];
+          e_hi = -8'sd128;
+          for (ii = 8; ii < BFP_TILE; ii++)
+            if (base + ii < D)
+              if (q_rot_e[base + ii] > e_hi) e_hi = q_rot_e[base + ii];
+          emax_h0_r <= e_lo;
+          emax_h1_r <= e_hi;
+          state <= S_ROPEQ_RQ_B;
+        end
+        S_ROPEQ_RQ_B: begin : rq_q_b
+          automatic logic signed [BFP_EXP_W-1:0] emax_f;
+          automatic int base;
+          base = cnt[$clog2(NT_D+1)-1:0] * BFP_TILE;
+          emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
+          for (ii = 0; ii < BFP_TILE; ii++) begin
+            if (base + ii < D)
+              q_m[base + ii] <= requant_mant(q_rot_m[base + ii],
+                                             q_rot_e[base + ii], emax_f);
           end
+          q_e[cnt[$clog2(NT_D+1)-1:0]] <= emax_f;
           if (cnt == NT_D - 1) begin
             head_idx <= '0; cnt <= '0;
             rp_start <= 1'b1; state <= S_ROPEK;
-          end else cnt <= cnt + 1'b1;
+          end else begin
+            cnt   <= cnt + 1'b1;
+            state <= S_ROPEQ_RQ_A;
+          end
         end
 
         // RoPE K — H_KV heads
@@ -1178,7 +1194,7 @@ module smollm_layer_bfp #(
           if (rp_done) begin
             if (head_idx == H_KV - 1) begin
               cnt   <= '0;
-              state <= S_ROPEK_RQ;
+              state <= S_ROPEK_RQ_A;
             end else begin
               head_idx <= head_idx + 1'b1; cnt <= '0;
               rp_start <= 1'b1; state <= S_ROPEK;
@@ -1186,28 +1202,41 @@ module smollm_layer_bfp #(
           end
         end
 
-        // Re-tile-quantize k_rot.  Writes back per-tile (m, e) into k_m / k_e
-        // — overwriting the pre-rope K vector since QK uses post-rope K only.
-        S_ROPEK_RQ: begin
-          begin : rq_k
-            automatic logic signed [BFP_EXP_W-1:0] emax;
-            automatic int base;
-            base = cnt[$clog2(NT_KV+1)-1:0] * BFP_TILE;
-            emax = -8'sd128;
-            for (ii = 0; ii < BFP_TILE; ii++)
-              if (base + ii < H_KV*HD)
-                if (k_rot_e[base + ii] > emax) emax = k_rot_e[base + ii];
-            for (ii = 0; ii < BFP_TILE; ii++) begin
-              if (base + ii < H_KV*HD)
-                k_m[base + ii] <= requant_mant(k_rot_m[base + ii],
-                                                k_rot_e[base + ii], emax);
-            end
-            k_e[cnt[$clog2(NT_KV+1)-1:0]] <= emax;
+        // Re-tile-quantize k_rot — 2-stage pipeline (mirror of S_ROPEQ_RQ).
+        S_ROPEK_RQ_A: begin : rq_k_a
+          automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
+          automatic int base;
+          base = cnt[$clog2(NT_KV+1)-1:0] * BFP_TILE;
+          e_lo = -8'sd128;
+          for (ii = 0; ii < 8; ii++)
+            if (base + ii < H_KV*HD)
+              if (k_rot_e[base + ii] > e_lo) e_lo = k_rot_e[base + ii];
+          e_hi = -8'sd128;
+          for (ii = 8; ii < BFP_TILE; ii++)
+            if (base + ii < H_KV*HD)
+              if (k_rot_e[base + ii] > e_hi) e_hi = k_rot_e[base + ii];
+          emax_h0_r <= e_lo;
+          emax_h1_r <= e_hi;
+          state <= S_ROPEK_RQ_B;
+        end
+        S_ROPEK_RQ_B: begin : rq_k_b
+          automatic logic signed [BFP_EXP_W-1:0] emax_f;
+          automatic int base;
+          base = cnt[$clog2(NT_KV+1)-1:0] * BFP_TILE;
+          emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
+          for (ii = 0; ii < BFP_TILE; ii++) begin
+            if (base + ii < H_KV*HD)
+              k_m[base + ii] <= requant_mant(k_rot_m[base + ii],
+                                              k_rot_e[base + ii], emax_f);
           end
+          k_e[cnt[$clog2(NT_KV+1)-1:0]] <= emax_f;
           if (cnt == NT_KV - 1) begin
             cnt <= '0;
             state <= S_KVWR_M;
-          end else cnt <= cnt + 1'b1;
+          end else begin
+            cnt   <= cnt + 1'b1;
+            state <= S_ROPEK_RQ_A;
+          end
         end
 
         // ===================================================================
