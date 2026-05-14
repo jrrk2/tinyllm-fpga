@@ -385,14 +385,36 @@ module smollm_layer_bfp #(
   // shift) into two ~7-LUT-level stages so each clock fits in the 20 ns
   // budget at 50 MHz core_clk.
   // ---------------------------------------------------------------------------
-  // (* keep *) prevents Vivado's resource-sharing pass from collapsing
-  // the pipeline back into a single-cycle 16-lane emax cascade — without
-  // it the synthesiser sees `emax_h{0,1}_r` are read 1 cycle later from
-  // a stable mv_out and merges the two stages, restoring the 58-LL chain.
-  (* keep = "true" *) logic signed [LANES*BFP_MANT_W-1:0] mv_out_m_drain_r;
-  (* keep = "true" *) logic signed [LANES*BFP_EXP_W -1:0] mv_out_e_drain_r;
-  (* keep = "true" *) logic signed [BFP_EXP_W-1:0]        emax_h0_r;
-  (* keep = "true" *) logic signed [BFP_EXP_W-1:0]        emax_h1_r;
+  logic signed [LANES*BFP_MANT_W-1:0] mv_out_m_drain_r;
+  logic signed [LANES*BFP_EXP_W -1:0] mv_out_e_drain_r;
+  logic signed [BFP_EXP_W-1:0]        emax_h0_r, emax_h1_r;
+
+  // ---------------------------------------------------------------------------
+  // Structural pipeline barrier — Vivado's retimer was pulling the
+  // FSM-gated emax pipeline backward into the matvec engine's MAC,
+  // producing a 27 ns cnt → q_m chain.  This module-scope always_ff
+  // latches the engine output ONCE more (1 extra cycle) with no
+  // FSM-state condition, so the synthesiser cannot collapse it as
+  // "redundant".  The S_*_DRAIN stages then consume the latched copies
+  // — chain becomes cnt → engine → mv_out_{m,e}_lat FF → emax FFs →
+  // requant FFs → q_m, with hard register barriers at each step.
+  // ---------------------------------------------------------------------------
+  logic                                       mv_out_valid_lat;
+  logic signed [LANES*BFP_MANT_W-1:0]         mv_out_m_lat;
+  logic signed [LANES*BFP_EXP_W -1:0]         mv_out_e_lat;
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      mv_out_valid_lat <= 1'b0;
+      mv_out_m_lat     <= '0;
+      mv_out_e_lat     <= '0;
+    end else begin
+      mv_out_valid_lat <= mv_out_valid;
+      if (mv_out_valid) begin
+        mv_out_m_lat <= mv_out_m;
+        mv_out_e_lat <= mv_out_e;
+      end
+    end
+  end
   // Comb-derived signed view of the matvec engine's lane-0 exp output.
   // The part-select mv_out_e[0+:8] is unsigned by SV rules, so explicit
   // re-typing is needed for signed comparisons against score_emax.
@@ -912,19 +934,19 @@ module smollm_layer_bfp #(
           if (cnt == D-1) state <= S_QMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_QMV_DRAIN: if (mv_out_valid) begin : qmv_pipeA
+        S_QMV_DRAIN: if (mv_out_valid_lat) begin : qmv_pipeA
           // Stage 1: latch + compute max of two 8-lane halves.
           automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
-          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          e_lo = $signed(mv_out_e_lat[0 +: BFP_EXP_W]);
           for (ii = 1; ii < 8; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
-              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e_lat[8*BFP_EXP_W +: BFP_EXP_W]);
           for (ii = 9; ii < LANES; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
-              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          mv_out_m_drain_r <= mv_out_m;
-          mv_out_e_drain_r <= mv_out_e;
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m_lat;
+          mv_out_e_drain_r <= mv_out_e_lat;
           emax_h0_r        <= e_lo;
           emax_h1_r        <= e_hi;
           state <= S_QMV_REQ;
@@ -983,18 +1005,18 @@ module smollm_layer_bfp #(
           if (cnt == D-1) state <= S_KMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_KMV_DRAIN: if (mv_out_valid) begin : kmv_pipeA
+        S_KMV_DRAIN: if (mv_out_valid_lat) begin : kmv_pipeA
           automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
-          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          e_lo = $signed(mv_out_e_lat[0 +: BFP_EXP_W]);
           for (ii = 1; ii < 8; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
-              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e_lat[8*BFP_EXP_W +: BFP_EXP_W]);
           for (ii = 9; ii < LANES; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
-              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          mv_out_m_drain_r <= mv_out_m;
-          mv_out_e_drain_r <= mv_out_e;
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m_lat;
+          mv_out_e_drain_r <= mv_out_e_lat;
           emax_h0_r        <= e_lo;
           emax_h1_r        <= e_hi;
           state <= S_KMV_REQ;
@@ -1048,18 +1070,18 @@ module smollm_layer_bfp #(
           if (cnt == D-1) state <= S_VMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_VMV_DRAIN: if (mv_out_valid) begin : vmv_pipeA
+        S_VMV_DRAIN: if (mv_out_valid_lat) begin : vmv_pipeA
           automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
-          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          e_lo = $signed(mv_out_e_lat[0 +: BFP_EXP_W]);
           for (ii = 1; ii < 8; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
-              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e_lat[8*BFP_EXP_W +: BFP_EXP_W]);
           for (ii = 9; ii < LANES; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
-              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          mv_out_m_drain_r <= mv_out_m;
-          mv_out_e_drain_r <= mv_out_e;
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m_lat;
+          mv_out_e_drain_r <= mv_out_e_lat;
           emax_h0_r        <= e_lo;
           emax_h1_r        <= e_hi;
           state <= S_VMV_REQ;
@@ -1368,18 +1390,18 @@ module smollm_layer_bfp #(
           if (cnt == BFP_TILE - 1) state <= S_AV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_AV_DRAIN: if (mv_out_valid) begin : av_pipeA
+        S_AV_DRAIN: if (mv_out_valid_lat) begin : av_pipeA
           automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
-          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          e_lo = $signed(mv_out_e_lat[0 +: BFP_EXP_W]);
           for (ii = 1; ii < 8; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
-              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e_lat[8*BFP_EXP_W +: BFP_EXP_W]);
           for (ii = 9; ii < LANES; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
-              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          mv_out_m_drain_r <= mv_out_m;
-          mv_out_e_drain_r <= mv_out_e;
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m_lat;
+          mv_out_e_drain_r <= mv_out_e_lat;
           emax_h0_r        <= e_lo;
           emax_h1_r        <= e_hi;
           state <= S_AV_REQ;
@@ -1443,18 +1465,18 @@ module smollm_layer_bfp #(
           if (cnt == D-1) state <= S_OMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_OMV_DRAIN: if (mv_out_valid) begin : omv_pipeA
+        S_OMV_DRAIN: if (mv_out_valid_lat) begin : omv_pipeA
           automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
-          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          e_lo = $signed(mv_out_e_lat[0 +: BFP_EXP_W]);
           for (ii = 1; ii < 8; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
-              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e_lat[8*BFP_EXP_W +: BFP_EXP_W]);
           for (ii = 9; ii < LANES; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
-              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          mv_out_m_drain_r <= mv_out_m;
-          mv_out_e_drain_r <= mv_out_e;
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m_lat;
+          mv_out_e_drain_r <= mv_out_e_lat;
           emax_h0_r        <= e_lo;
           emax_h1_r        <= e_hi;
           state <= S_OMV_REQ;
@@ -1575,18 +1597,18 @@ module smollm_layer_bfp #(
           if (cnt == D-1) state <= S_GMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_GMV_DRAIN: if (mv_out_valid) begin : gmv_pipeA
+        S_GMV_DRAIN: if (mv_out_valid_lat) begin : gmv_pipeA
           automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
-          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          e_lo = $signed(mv_out_e_lat[0 +: BFP_EXP_W]);
           for (ii = 1; ii < 8; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
-              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e_lat[8*BFP_EXP_W +: BFP_EXP_W]);
           for (ii = 9; ii < LANES; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
-              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          mv_out_m_drain_r <= mv_out_m;
-          mv_out_e_drain_r <= mv_out_e;
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m_lat;
+          mv_out_e_drain_r <= mv_out_e_lat;
           emax_h0_r        <= e_lo;
           emax_h1_r        <= e_hi;
           state <= S_GMV_REQ;
@@ -1640,18 +1662,18 @@ module smollm_layer_bfp #(
           if (cnt == D-1) state <= S_UMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_UMV_DRAIN: if (mv_out_valid) begin : umv_pipeA
+        S_UMV_DRAIN: if (mv_out_valid_lat) begin : umv_pipeA
           automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
-          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          e_lo = $signed(mv_out_e_lat[0 +: BFP_EXP_W]);
           for (ii = 1; ii < 8; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
-              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e_lat[8*BFP_EXP_W +: BFP_EXP_W]);
           for (ii = 9; ii < LANES; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
-              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          mv_out_m_drain_r <= mv_out_m;
-          mv_out_e_drain_r <= mv_out_e;
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m_lat;
+          mv_out_e_drain_r <= mv_out_e_lat;
           emax_h0_r        <= e_lo;
           emax_h1_r        <= e_hi;
           state <= S_UMV_REQ;
@@ -1733,18 +1755,18 @@ module smollm_layer_bfp #(
           if (cnt == FFN-1) state <= S_DMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_DMV_DRAIN: if (mv_out_valid) begin : dmv_pipeA
+        S_DMV_DRAIN: if (mv_out_valid_lat) begin : dmv_pipeA
           automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
-          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          e_lo = $signed(mv_out_e_lat[0 +: BFP_EXP_W]);
           for (ii = 1; ii < 8; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
-              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e_lat[8*BFP_EXP_W +: BFP_EXP_W]);
           for (ii = 9; ii < LANES; ii++)
-            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
-              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-          mv_out_m_drain_r <= mv_out_m;
-          mv_out_e_drain_r <= mv_out_e;
+            if ($signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e_lat[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m_lat;
+          mv_out_e_drain_r <= mv_out_e_lat;
           emax_h0_r        <= e_lo;
           emax_h1_r        <= e_hi;
           state <= S_DMV_REQ;
