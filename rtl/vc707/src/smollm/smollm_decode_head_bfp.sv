@@ -112,7 +112,9 @@ module smollm_decode_head_bfp #(
   typedef enum logic [3:0] {
     S_IDLE, S_LATCH,
     S_NORM, S_NORM_WAIT,
-    S_MV_PRIME, S_MV_DRIVE, S_MV_DRAIN, S_MV_NEXT,
+    S_MV_PRIME, S_MV_DRIVE, S_MV_DRAIN,
+    S_MV_LANE_CMP, S_MV_MERGE,
+    S_MV_NEXT,
     S_DONE
   } st_t;
   st_t state;
@@ -258,6 +260,16 @@ module smollm_decode_head_bfp #(
   logic signed [BFP_EXP_W -1:0] best_e;
   logic [15:0]                  best_idx;
 
+  // Pipelined argmax state — walking 1 lane per cycle so each clock
+  // sees one bfp_gt instead of 16 cascaded.  Replaces the 147-LUT-level
+  // combinational chain that blew the 50 MHz timing budget by 45 ns.
+  logic signed [LANES*BFP_MANT_W-1:0] mv_out_m_r;
+  logic signed [LANES*BFP_EXP_W -1:0] mv_out_e_r;
+  logic [3:0]                         lane_cnt;
+  logic signed [BFP_MANT_W-1:0]       local_best_m;
+  logic signed [BFP_EXP_W -1:0]       local_best_e;
+  logic [3:0]                         local_best_lane;
+
   // Compare (m_a, e_a) > (m_b, e_b) returning 1 if a is larger in real value.
   // Both signed.  Bring to common exp = max(e_a, e_b), align mantissas, compare.
   function automatic logic bfp_gt;
@@ -283,7 +295,6 @@ module smollm_decode_head_bfp #(
     end
   endfunction
 
-  integer ii;
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -308,6 +319,12 @@ module smollm_decode_head_bfp #(
       token_out  <= 16'd0;
       ws_load_req <= 1'b0;
       ws_phase    <= WSP_KICK;
+      mv_out_m_r      <= '0;
+      mv_out_e_r      <= '0;
+      lane_cnt        <= 4'd0;
+      local_best_m    <= 16'sh8000;
+      local_best_e    <= -8'sd128;
+      local_best_lane <= 4'd0;
     end else begin
       mv_start   <= 1'b0;
       mv_valid   <= 1'b0;
@@ -397,36 +414,41 @@ module smollm_decode_head_bfp #(
           else cnt <= cnt + 1'b1;
         end
 
-        S_MV_DRAIN: if (mv_out_valid) begin : drain_blk
-          // Two-pass argmax inside the chunk:
-          //   1) Sequentially track local_best across all 16 lanes (blocking,
-          //      so each iteration sees the running max).
-          //   2) Compare that single local_best against the global running
-          //      best_m / best_e via one non-blocking update.
-          // The previous one-pass loop wrote best_* via non-blocking inside
-          // every iteration that beat the OLD best — last-NBA-wins semantics
-          // meant the highest-index passing lane won, not the actual max.
-          automatic logic signed [BFP_MANT_W-1:0] local_m;
-          automatic logic signed [BFP_EXP_W -1:0] local_e;
-          automatic logic [3:0]                   local_lane;
-          local_m    = $signed(mv_out_m[0 +: BFP_MANT_W]);
-          local_e    = $signed(mv_out_e[0 +: BFP_EXP_W ]);
-          local_lane = 4'd0;
-          for (ii = 1; ii < LANES; ii++) begin
-            automatic logic signed [BFP_MANT_W-1:0] m_i;
-            automatic logic signed [BFP_EXP_W -1:0] e_i;
-            m_i = $signed(mv_out_m[ii*BFP_MANT_W +: BFP_MANT_W]);
-            e_i = $signed(mv_out_e[ii*BFP_EXP_W  +: BFP_EXP_W ]);
-            if (bfp_gt(m_i, e_i, local_m, local_e)) begin
-              local_m    = m_i;
-              local_e    = e_i;
-              local_lane = ii[3:0];
-            end
+        // S_MV_DRAIN: capture the engine's 16-lane output and seed
+        // local_best with lane 0.  Subsequent lanes 1..15 are compared
+        // one per cycle in S_MV_LANE_CMP, and S_MV_MERGE folds the
+        // chunk's best into the global best.  Pipelining is required
+        // for 50 MHz timing — the original one-shot 16-cascade was
+        // 147 LUT levels.
+        S_MV_DRAIN: if (mv_out_valid) begin
+          mv_out_m_r      <= mv_out_m;
+          mv_out_e_r      <= mv_out_e;
+          local_best_m    <= $signed(mv_out_m[0 +: BFP_MANT_W]);
+          local_best_e    <= $signed(mv_out_e[0 +: BFP_EXP_W ]);
+          local_best_lane <= 4'd0;
+          lane_cnt        <= 4'd1;
+          state           <= S_MV_LANE_CMP;
+        end
+
+        S_MV_LANE_CMP: begin : lane_cmp
+          automatic logic signed [BFP_MANT_W-1:0] m_i;
+          automatic logic signed [BFP_EXP_W -1:0] e_i;
+          m_i = $signed(mv_out_m_r[lane_cnt*BFP_MANT_W +: BFP_MANT_W]);
+          e_i = $signed(mv_out_e_r[lane_cnt*BFP_EXP_W  +: BFP_EXP_W ]);
+          if (bfp_gt(m_i, e_i, local_best_m, local_best_e)) begin
+            local_best_m    <= m_i;
+            local_best_e    <= e_i;
+            local_best_lane <= lane_cnt;
           end
-          if (bfp_gt(local_m, local_e, best_m, best_e)) begin
-            best_m   <= local_m;
-            best_e   <= local_e;
-            best_idx <= 16'(chunk * LANES + local_lane);
+          if (lane_cnt == 4'd15) state <= S_MV_MERGE;
+          else lane_cnt <= lane_cnt + 4'd1;
+        end
+
+        S_MV_MERGE: begin
+          if (bfp_gt(local_best_m, local_best_e, best_m, best_e)) begin
+            best_m   <= local_best_m;
+            best_e   <= local_best_e;
+            best_idx <= 16'(chunk * LANES + local_best_lane);
           end
           state <= S_MV_NEXT;
         end
