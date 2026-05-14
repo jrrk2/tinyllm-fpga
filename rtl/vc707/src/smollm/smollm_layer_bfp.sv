@@ -440,16 +440,37 @@ module smollm_layer_bfp #(
   // mv_w_m_eff / mv_w_e_eff: muxed weight bus presented to the matvec
   // engine.  In selftest mode (STREAM_WEIGHTS=0) these forward the
   // registered mv_w_m / mv_w_e values read from on-chip ROMs.  In
-  // streaming mode the engine sees the streamer's bank_m / bank_e
-  // outputs directly (combinational mux), with rd_col / rd_tile driven
-  // by the FSM's `cnt` so that the 1-cycle BRAM read latency lines up
-  // with mv_x_m's 1-cycle pipeline.
+  // streaming mode the streamer's bank_m / bank_e outputs replace
+  // them — but ONLY for the 7 W?_* matvecs (Q/K/V/O/G/U/DN).  QK and
+  // AV matvecs read kv_k_m / kv_v_m / k_m / v_m (BRAM-backed) and
+  // must keep mv_w_m as their weight source.  `is_stream_matvec` is
+  // set in each W?_PRIME and cleared in QK_PRIME / AV_PRIME, holding
+  // through DRIVE / DRAIN / REQ.
+  logic is_stream_matvec;
   wire signed [LANES*BFP_MANT_W-1:0]         mv_w_m_eff;
   wire signed [LANES*BFP_EXP_W -1:0]         mv_w_e_eff;
   wire        [255:0]                        ws_weight_m_out;
   wire        [127:0]                        ws_weight_e_out;
-  assign mv_w_m_eff = STREAM_WEIGHTS ? $signed(ws_weight_m_out) : mv_w_m;
-  assign mv_w_e_eff = STREAM_WEIGHTS ? $signed(ws_weight_e_out) : mv_w_e;
+  assign mv_w_m_eff = (STREAM_WEIGHTS && is_stream_matvec) ? $signed(ws_weight_m_out) : mv_w_m;
+  assign mv_w_e_eff = (STREAM_WEIGHTS && is_stream_matvec) ? $signed(ws_weight_e_out) : mv_w_e;
+
+  // is_stream_matvec: set when entering a W?_* matvec via its PRIME,
+  // cleared when entering QK_PRIME or AV_PRIME.  Held through DRIVE /
+  // DRAIN / REQ / NEXT so the engine consumes streamer data only when
+  // appropriate.  Always_ff is intentionally separate from the main
+  // FSM so the flag isn't tied to the existing case-table indentation.
+
+  always_ff @(posedge clk) begin
+    if (rst) is_stream_matvec <= 1'b0;
+    else begin
+      case (state)
+        S_QMV_PRIME, S_KMV_PRIME, S_VMV_PRIME, S_OMV_PRIME,
+        S_GMV_PRIME, S_UMV_PRIME, S_DMV_PRIME: is_stream_matvec <= 1'b1;
+        S_QK_PRIME, S_AV_PRIME:                is_stream_matvec <= 1'b0;
+        default: ;  // hold through DRIVE / DRAIN / REQ / NEXT
+      endcase
+    end
+  end
 
   matvec_bfp_engine #(.LANES(LANES)) i_mv (
     .clk(clk), .rst(rst | eng_rst),
