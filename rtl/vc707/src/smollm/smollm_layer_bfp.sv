@@ -385,9 +385,14 @@ module smollm_layer_bfp #(
   // shift) into two ~7-LUT-level stages so each clock fits in the 20 ns
   // budget at 50 MHz core_clk.
   // ---------------------------------------------------------------------------
-  logic signed [LANES*BFP_MANT_W-1:0] mv_out_m_drain_r;
-  logic signed [LANES*BFP_EXP_W -1:0] mv_out_e_drain_r;
-  logic signed [BFP_EXP_W-1:0]        emax_h0_r, emax_h1_r;
+  // (* keep *) prevents Vivado's resource-sharing pass from collapsing
+  // the pipeline back into a single-cycle 16-lane emax cascade — without
+  // it the synthesiser sees `emax_h{0,1}_r` are read 1 cycle later from
+  // a stable mv_out and merges the two stages, restoring the 58-LL chain.
+  (* keep = "true" *) logic signed [LANES*BFP_MANT_W-1:0] mv_out_m_drain_r;
+  (* keep = "true" *) logic signed [LANES*BFP_EXP_W -1:0] mv_out_e_drain_r;
+  (* keep = "true" *) logic signed [BFP_EXP_W-1:0]        emax_h0_r;
+  (* keep = "true" *) logic signed [BFP_EXP_W-1:0]        emax_h1_r;
   // Comb-derived signed view of the matvec engine's lane-0 exp output.
   // The part-select mv_out_e[0+:8] is unsigned by SV rules, so explicit
   // re-typing is needed for signed comparisons against score_emax.
