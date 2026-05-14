@@ -112,7 +112,7 @@ module smollm_layer_bfp #(
   input  wire [15:0]                         wr_data,
   input  wire                                wr_en,
   // Debug taps (synthesis-friendly — only used by sim testbench)
-  output logic [5:0]                         dbg_state,
+  output logic [6:0]                         dbg_state,
   output logic [11:0]                        dbg_cnt,
   output logic [6:0]                         dbg_chunk
 );
@@ -344,26 +344,26 @@ module smollm_layer_bfp #(
   // ---------------------------------------------------------------------------
   // FSM
   // ---------------------------------------------------------------------------
-  typedef enum logic [5:0] {
+  typedef enum logic [6:0] {
     S_IDLE,
     S_LATCH_IN,
     S_NORM1, S_NORM1_WAIT,
-    S_QMV_PRIME, S_QMV_DRIVE, S_QMV_DRAIN, S_QMV_NEXT,
-    S_KMV_PRIME, S_KMV_DRIVE, S_KMV_DRAIN, S_KMV_NEXT,
-    S_VMV_PRIME, S_VMV_DRIVE, S_VMV_DRAIN, S_VMV_NEXT,
+    S_QMV_PRIME, S_QMV_DRIVE, S_QMV_DRAIN, S_QMV_REQ, S_QMV_NEXT,
+    S_KMV_PRIME, S_KMV_DRIVE, S_KMV_DRAIN, S_KMV_REQ, S_KMV_NEXT,
+    S_VMV_PRIME, S_VMV_DRIVE, S_VMV_DRAIN, S_VMV_REQ, S_VMV_NEXT,
     S_ROPEQ, S_ROPEQ_WAIT, S_ROPEQ_RQ,
     S_ROPEK, S_ROPEK_WAIT, S_ROPEK_RQ,
     S_KVWR_M, S_KVWR_E,
     S_QK_PRIME, S_QK_DRIVE, S_QK_DRAIN,
     S_SM_DRIVE, S_SM_WAIT,
-    S_AV_PRIME, S_AV_DRIVE, S_AV_DRAIN, S_AV_NEXT,
-    S_OMV_PRIME, S_OMV_DRIVE, S_OMV_DRAIN, S_OMV_NEXT,
+    S_AV_PRIME, S_AV_DRIVE, S_AV_DRAIN, S_AV_REQ, S_AV_NEXT,
+    S_OMV_PRIME, S_OMV_DRIVE, S_OMV_DRAIN, S_OMV_REQ, S_OMV_NEXT,
     S_RES1, S_RES1_WAIT,
     S_NORM2, S_NORM2_WAIT,
-    S_GMV_PRIME, S_GMV_DRIVE, S_GMV_DRAIN, S_GMV_NEXT,
-    S_UMV_PRIME, S_UMV_DRIVE, S_UMV_DRAIN, S_UMV_NEXT,
+    S_GMV_PRIME, S_GMV_DRIVE, S_GMV_DRAIN, S_GMV_REQ, S_GMV_NEXT,
+    S_UMV_PRIME, S_UMV_DRIVE, S_UMV_DRAIN, S_UMV_REQ, S_UMV_NEXT,
     S_SWG, S_SWG_WAIT,
-    S_DMV_PRIME, S_DMV_DRIVE, S_DMV_DRAIN, S_DMV_NEXT,
+    S_DMV_PRIME, S_DMV_DRIVE, S_DMV_DRAIN, S_DMV_REQ, S_DMV_NEXT,
     S_RES2, S_RES2_WAIT,
     S_DONE
   } state_t;
@@ -375,6 +375,19 @@ module smollm_layer_bfp #(
   logic [4:0]       head_idx;
   logic [4:0]       kv_t;
   logic signed [BFP_EXP_W-1:0] score_emax;
+
+  // ---------------------------------------------------------------------------
+  // Per-matvec requant pipeline (2-stage).  S_*_DRAIN now latches the engine
+  // outputs and computes the max of the two 8-lane halves of mv_out_e; the
+  // next-cycle S_*_REQ takes that pair, finalises emax, applies
+  // requant_mant to all 16 lanes, and writes the chunk's mantissa+exp.
+  // Splits the original 58-LUT-level chain (15-deep emax cascade + barrel
+  // shift) into two ~7-LUT-level stages so each clock fits in the 20 ns
+  // budget at 50 MHz core_clk.
+  // ---------------------------------------------------------------------------
+  logic signed [LANES*BFP_MANT_W-1:0] mv_out_m_drain_r;
+  logic signed [LANES*BFP_EXP_W -1:0] mv_out_e_drain_r;
+  logic signed [BFP_EXP_W-1:0]        emax_h0_r, emax_h1_r;
   // Comb-derived signed view of the matvec engine's lane-0 exp output.
   // The part-select mv_out_e[0+:8] is unsigned by SV rules, so explicit
   // re-typing is needed for signed comparisons against score_emax.
@@ -757,6 +770,10 @@ module smollm_layer_bfp #(
       head_idx        <= '0;
       kv_t            <= '0;
       score_emax      <= -8'sd128;
+      mv_out_m_drain_r<= '0;
+      mv_out_e_drain_r<= '0;
+      emax_h0_r       <= -8'sd128;
+      emax_h1_r       <= -8'sd128;
       mv_start        <= 1'b0;
       mv_valid        <= 1'b0;
       mv_last         <= 1'b0;
@@ -890,20 +907,33 @@ module smollm_layer_bfp #(
           if (cnt == D-1) state <= S_QMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_QMV_DRAIN: if (mv_out_valid) begin
-          begin : qmv_requant
-            automatic logic signed [BFP_EXP_W-1:0] emax;
-            emax = $signed(mv_out_e[0 +: BFP_EXP_W]);
-            for (ii = 1; ii < LANES; ii++)
-              if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > emax)
-                emax = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-            for (ii = 0; ii < LANES; ii++)
-              q_m[chunk * LANES + ii] <= requant_mant(
-                mv_out_m[ii*BFP_MANT_W +: BFP_MANT_W],
-                mv_out_e[ii*BFP_EXP_W  +: BFP_EXP_W ],
-                emax);
-            q_e[chunk] <= emax;
-          end
+        S_QMV_DRAIN: if (mv_out_valid) begin : qmv_pipeA
+          // Stage 1: latch + compute max of two 8-lane halves.
+          automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
+          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          for (ii = 1; ii < 8; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+          for (ii = 9; ii < LANES; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m;
+          mv_out_e_drain_r <= mv_out_e;
+          emax_h0_r        <= e_lo;
+          emax_h1_r        <= e_hi;
+          state <= S_QMV_REQ;
+        end
+        S_QMV_REQ: begin : qmv_pipeB
+          // Stage 2: final max + 16-lane parallel requant + write.
+          automatic logic signed [BFP_EXP_W-1:0] emax_f;
+          emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
+          for (ii = 0; ii < LANES; ii++)
+            q_m[chunk * LANES + ii] <= requant_mant(
+              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
+              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
+              emax_f);
+          q_e[chunk] <= emax_f;
           state <= S_QMV_NEXT;
         end
         S_QMV_NEXT: begin
@@ -948,20 +978,31 @@ module smollm_layer_bfp #(
           if (cnt == D-1) state <= S_KMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_KMV_DRAIN: if (mv_out_valid) begin
-          begin : kmv_requant
-            automatic logic signed [BFP_EXP_W-1:0] emax;
-            emax = $signed(mv_out_e[0 +: BFP_EXP_W]);
-            for (ii = 1; ii < LANES; ii++)
-              if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > emax)
-                emax = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-            for (ii = 0; ii < LANES; ii++)
-              k_m[chunk * LANES + ii] <= requant_mant(
-                mv_out_m[ii*BFP_MANT_W +: BFP_MANT_W],
-                mv_out_e[ii*BFP_EXP_W  +: BFP_EXP_W ],
-                emax);
-            k_e[chunk] <= emax;
-          end
+        S_KMV_DRAIN: if (mv_out_valid) begin : kmv_pipeA
+          automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
+          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          for (ii = 1; ii < 8; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+          for (ii = 9; ii < LANES; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m;
+          mv_out_e_drain_r <= mv_out_e;
+          emax_h0_r        <= e_lo;
+          emax_h1_r        <= e_hi;
+          state <= S_KMV_REQ;
+        end
+        S_KMV_REQ: begin : kmv_pipeB
+          automatic logic signed [BFP_EXP_W-1:0] emax_f;
+          emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
+          for (ii = 0; ii < LANES; ii++)
+            k_m[chunk * LANES + ii] <= requant_mant(
+              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
+              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
+              emax_f);
+          k_e[chunk] <= emax_f;
           state <= S_KMV_NEXT;
         end
         S_KMV_NEXT: begin
@@ -1002,20 +1043,31 @@ module smollm_layer_bfp #(
           if (cnt == D-1) state <= S_VMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_VMV_DRAIN: if (mv_out_valid) begin
-          begin : vmv_requant
-            automatic logic signed [BFP_EXP_W-1:0] emax;
-            emax = $signed(mv_out_e[0 +: BFP_EXP_W]);
-            for (ii = 1; ii < LANES; ii++)
-              if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > emax)
-                emax = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-            for (ii = 0; ii < LANES; ii++)
-              v_m[chunk * LANES + ii] <= requant_mant(
-                mv_out_m[ii*BFP_MANT_W +: BFP_MANT_W],
-                mv_out_e[ii*BFP_EXP_W  +: BFP_EXP_W ],
-                emax);
-            v_e[chunk] <= emax;
-          end
+        S_VMV_DRAIN: if (mv_out_valid) begin : vmv_pipeA
+          automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
+          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          for (ii = 1; ii < 8; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+          for (ii = 9; ii < LANES; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m;
+          mv_out_e_drain_r <= mv_out_e;
+          emax_h0_r        <= e_lo;
+          emax_h1_r        <= e_hi;
+          state <= S_VMV_REQ;
+        end
+        S_VMV_REQ: begin : vmv_pipeB
+          automatic logic signed [BFP_EXP_W-1:0] emax_f;
+          emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
+          for (ii = 0; ii < LANES; ii++)
+            v_m[chunk * LANES + ii] <= requant_mant(
+              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
+              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
+              emax_f);
+          v_e[chunk] <= emax_f;
           state <= S_VMV_NEXT;
         end
         S_VMV_NEXT: begin
@@ -1311,20 +1363,31 @@ module smollm_layer_bfp #(
           if (cnt == BFP_TILE - 1) state <= S_AV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_AV_DRAIN: if (mv_out_valid) begin
-          begin : av_requant
-            automatic logic signed [BFP_EXP_W-1:0] emax;
-            emax = $signed(mv_out_e[0 +: BFP_EXP_W]);
-            for (ii = 1; ii < LANES; ii++)
-              if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > emax)
-                emax = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-            for (ii = 0; ii < LANES; ii++)
-              attn_m[av_row_base + chunk * LANES + ii] <= requant_mant(
-                mv_out_m[ii*BFP_MANT_W +: BFP_MANT_W],
-                mv_out_e[ii*BFP_EXP_W  +: BFP_EXP_W ],
-                emax);
-            attn_e[(av_row_base + chunk * LANES) / BFP_TILE] <= emax;
-          end
+        S_AV_DRAIN: if (mv_out_valid) begin : av_pipeA
+          automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
+          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          for (ii = 1; ii < 8; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+          for (ii = 9; ii < LANES; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m;
+          mv_out_e_drain_r <= mv_out_e;
+          emax_h0_r        <= e_lo;
+          emax_h1_r        <= e_hi;
+          state <= S_AV_REQ;
+        end
+        S_AV_REQ: begin : av_pipeB
+          automatic logic signed [BFP_EXP_W-1:0] emax_f;
+          emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
+          for (ii = 0; ii < LANES; ii++)
+            attn_m[av_row_base + chunk * LANES + ii] <= requant_mant(
+              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
+              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
+              emax_f);
+          attn_e[(av_row_base + chunk * LANES) / BFP_TILE] <= emax_f;
           state <= S_AV_NEXT;
         end
         S_AV_NEXT: begin
@@ -1375,20 +1438,31 @@ module smollm_layer_bfp #(
           if (cnt == D-1) state <= S_OMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_OMV_DRAIN: if (mv_out_valid) begin
-          begin : omv_requant
-            automatic logic signed [BFP_EXP_W-1:0] emax;
-            emax = $signed(mv_out_e[0 +: BFP_EXP_W]);
-            for (ii = 1; ii < LANES; ii++)
-              if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > emax)
-                emax = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-            for (ii = 0; ii < LANES; ii++)
-              o_m[chunk * LANES + ii] <= requant_mant(
-                mv_out_m[ii*BFP_MANT_W +: BFP_MANT_W],
-                mv_out_e[ii*BFP_EXP_W  +: BFP_EXP_W ],
-                emax);
-            o_e[chunk] <= emax;
-          end
+        S_OMV_DRAIN: if (mv_out_valid) begin : omv_pipeA
+          automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
+          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          for (ii = 1; ii < 8; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+          for (ii = 9; ii < LANES; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m;
+          mv_out_e_drain_r <= mv_out_e;
+          emax_h0_r        <= e_lo;
+          emax_h1_r        <= e_hi;
+          state <= S_OMV_REQ;
+        end
+        S_OMV_REQ: begin : omv_pipeB
+          automatic logic signed [BFP_EXP_W-1:0] emax_f;
+          emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
+          for (ii = 0; ii < LANES; ii++)
+            o_m[chunk * LANES + ii] <= requant_mant(
+              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
+              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
+              emax_f);
+          o_e[chunk] <= emax_f;
           state <= S_OMV_NEXT;
         end
         S_OMV_NEXT: begin
@@ -1496,20 +1570,31 @@ module smollm_layer_bfp #(
           if (cnt == D-1) state <= S_GMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_GMV_DRAIN: if (mv_out_valid) begin
-          begin : gmv_requant
-            automatic logic signed [BFP_EXP_W-1:0] emax;
-            emax = $signed(mv_out_e[0 +: BFP_EXP_W]);
-            for (ii = 1; ii < LANES; ii++)
-              if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > emax)
-                emax = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-            for (ii = 0; ii < LANES; ii++)
-              g_m[chunk * LANES + ii] <= requant_mant(
-                mv_out_m[ii*BFP_MANT_W +: BFP_MANT_W],
-                mv_out_e[ii*BFP_EXP_W  +: BFP_EXP_W ],
-                emax);
-            g_e[chunk] <= emax;
-          end
+        S_GMV_DRAIN: if (mv_out_valid) begin : gmv_pipeA
+          automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
+          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          for (ii = 1; ii < 8; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+          for (ii = 9; ii < LANES; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m;
+          mv_out_e_drain_r <= mv_out_e;
+          emax_h0_r        <= e_lo;
+          emax_h1_r        <= e_hi;
+          state <= S_GMV_REQ;
+        end
+        S_GMV_REQ: begin : gmv_pipeB
+          automatic logic signed [BFP_EXP_W-1:0] emax_f;
+          emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
+          for (ii = 0; ii < LANES; ii++)
+            g_m[chunk * LANES + ii] <= requant_mant(
+              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
+              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
+              emax_f);
+          g_e[chunk] <= emax_f;
           state <= S_GMV_NEXT;
         end
         S_GMV_NEXT: begin
@@ -1550,20 +1635,31 @@ module smollm_layer_bfp #(
           if (cnt == D-1) state <= S_UMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_UMV_DRAIN: if (mv_out_valid) begin
-          begin : umv_requant
-            automatic logic signed [BFP_EXP_W-1:0] emax;
-            emax = $signed(mv_out_e[0 +: BFP_EXP_W]);
-            for (ii = 1; ii < LANES; ii++)
-              if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > emax)
-                emax = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-            for (ii = 0; ii < LANES; ii++)
-              u_m[chunk * LANES + ii] <= requant_mant(
-                mv_out_m[ii*BFP_MANT_W +: BFP_MANT_W],
-                mv_out_e[ii*BFP_EXP_W  +: BFP_EXP_W ],
-                emax);
-            u_e[chunk] <= emax;
-          end
+        S_UMV_DRAIN: if (mv_out_valid) begin : umv_pipeA
+          automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
+          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          for (ii = 1; ii < 8; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+          for (ii = 9; ii < LANES; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m;
+          mv_out_e_drain_r <= mv_out_e;
+          emax_h0_r        <= e_lo;
+          emax_h1_r        <= e_hi;
+          state <= S_UMV_REQ;
+        end
+        S_UMV_REQ: begin : umv_pipeB
+          automatic logic signed [BFP_EXP_W-1:0] emax_f;
+          emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
+          for (ii = 0; ii < LANES; ii++)
+            u_m[chunk * LANES + ii] <= requant_mant(
+              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
+              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
+              emax_f);
+          u_e[chunk] <= emax_f;
           state <= S_UMV_NEXT;
         end
         S_UMV_NEXT: begin
@@ -1632,20 +1728,31 @@ module smollm_layer_bfp #(
           if (cnt == FFN-1) state <= S_DMV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
-        S_DMV_DRAIN: if (mv_out_valid) begin
-          begin : dmv_requant
-            automatic logic signed [BFP_EXP_W-1:0] emax;
-            emax = $signed(mv_out_e[0 +: BFP_EXP_W]);
-            for (ii = 1; ii < LANES; ii++)
-              if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > emax)
-                emax = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
-            for (ii = 0; ii < LANES; ii++)
-              d_m[chunk * LANES + ii] <= requant_mant(
-                mv_out_m[ii*BFP_MANT_W +: BFP_MANT_W],
-                mv_out_e[ii*BFP_EXP_W  +: BFP_EXP_W ],
-                emax);
-            d_e[chunk] <= emax;
-          end
+        S_DMV_DRAIN: if (mv_out_valid) begin : dmv_pipeA
+          automatic logic signed [BFP_EXP_W-1:0] e_lo, e_hi;
+          e_lo = $signed(mv_out_e[0 +: BFP_EXP_W]);
+          for (ii = 1; ii < 8; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_lo)
+              e_lo = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          e_hi = $signed(mv_out_e[8*BFP_EXP_W +: BFP_EXP_W]);
+          for (ii = 9; ii < LANES; ii++)
+            if ($signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]) > e_hi)
+              e_hi = $signed(mv_out_e[ii*BFP_EXP_W +: BFP_EXP_W]);
+          mv_out_m_drain_r <= mv_out_m;
+          mv_out_e_drain_r <= mv_out_e;
+          emax_h0_r        <= e_lo;
+          emax_h1_r        <= e_hi;
+          state <= S_DMV_REQ;
+        end
+        S_DMV_REQ: begin : dmv_pipeB
+          automatic logic signed [BFP_EXP_W-1:0] emax_f;
+          emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
+          for (ii = 0; ii < LANES; ii++)
+            d_m[chunk * LANES + ii] <= requant_mant(
+              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
+              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
+              emax_f);
+          d_e[chunk] <= emax_f;
           state <= S_DMV_NEXT;
         end
         S_DMV_NEXT: begin

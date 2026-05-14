@@ -77,7 +77,7 @@ module tb_smollm_layer_bfp (
   wire signed [D*BFP_MANT_W-1:0]   hout_m_bus;
   wire signed [NT_D*BFP_EXP_W-1:0] hout_e_bus;
   wire dut_done;
-  wire [5:0]  dbg_state;
+  wire [6:0]  dbg_state;
   wire [11:0] dbg_cnt;
   wire [6:0]  dbg_chunk;
 

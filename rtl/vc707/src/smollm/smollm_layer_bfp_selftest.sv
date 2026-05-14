@@ -47,7 +47,7 @@ module smollm_layer_bfp_selftest #(
   wire  signed [D*BFP_MANT_W-1:0]        lay_hidden_out_m;
   wire  signed [NT_D*BFP_EXP_W-1:0]      lay_hidden_out_e;
   logic                                  lay_done;
-  wire  [5:0]                            ignore_state;
+  wire  [6:0]                            ignore_state;
   wire  [11:0]                           ignore_cnt;
   wire  [6:0]                            ignore_chunk;
 
