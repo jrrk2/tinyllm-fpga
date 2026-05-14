@@ -359,16 +359,17 @@ module vc707_microgpt_eth (
   wire core_mmcm_fb_unbuf, core_mmcm_fb;
   wire core_mmcm_locked;
 
-  // core_clk = 50 MHz (CLKIN 125 × 8 / 20 = 1000 MHz VCO / 20).
-  // Was 56.25 MHz inherited from the DE1-SoC build, but on Virtex-7 the
-  // round-number ratios let Vivado's STA work faster and give us 20 ns
-  // budget per cycle (~3 ns slack for rmsnorm's 16.87 ns NR datapath).
+  // core_clk = 40 MHz (CLKIN 125 × 8 / 25 = 1000 MHz VCO / 25).
+  // Dropped from 50 → 40 MHz to give the BFP-streaming path an extra
+  // 5 ns slack per cycle while the remaining long combinational paths
+  // get further pipelined.  Revisit upward once the worst offenders
+  // are split.
   MMCME2_BASE #(
     .BANDWIDTH        ( "OPTIMIZED" ),
     .CLKIN1_PERIOD    ( 8.000       ),  // 125 MHz
     .CLKFBOUT_MULT_F  ( 8.000       ),  // VCO 1000 MHz
     .DIVCLK_DIVIDE    ( 1           ),
-    .CLKOUT0_DIVIDE_F ( 20.000      ),  // 50 MHz
+    .CLKOUT0_DIVIDE_F ( 25.000      ),  // 40 MHz
     .STARTUP_WAIT     ( "FALSE"     )
   ) i_core_mmcm (
     .CLKIN1   ( eth_clk            ),
