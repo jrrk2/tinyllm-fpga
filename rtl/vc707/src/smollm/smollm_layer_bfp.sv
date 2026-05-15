@@ -206,9 +206,17 @@ module smollm_layer_bfp #(
   (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] rom_G2_e [0:NL*NT_D-1];
 
   (* ram_style = "block" *) logic signed [BFP_MANT_W-1:0] kv_k_m [0:NL*MAX_CTX*H_KV*HD-1];
-  (* ram_style = "block" *) logic signed [BFP_MANT_W-1:0] kv_v_m [0:NL*MAX_CTX*H_KV*HD-1];
   (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] kv_k_e [0:NL*MAX_CTX*NT_KV-1];
   (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] kv_v_e [0:NL*MAX_CTX*NT_KV-1];
+
+  // kv_v_m is wide-packed (LANES mantissas per entry) so AV_DRIVE's
+  // 16-lane parallel read becomes a single BRAM read.  Original flat
+  // layout had 16 simultaneous reads → too many ports for BRAM inference,
+  // and at 5.9 Mbit total Vivado refused to dissolve to FFs (one Synth
+  // 8-3391 error per `make`).  Wide-packing keeps total bits the same
+  // but presents a 1-write + 1-read access pattern.
+  localparam int KVV_CHUNKS_PER_KVPOS = (H_KV * HD) / LANES;          // 12 for full SmolLM2
+  (* ram_style = "block" *) logic [LANES*BFP_MANT_W-1:0] kv_v_m_chk [0:NL*MAX_CTX*KVV_CHUNKS_PER_KVPOS-1];
 
   // When STREAM_WEIGHTS=1, the 14 weight $readmemh's are dropped (weights
   // come from DDR3 via the streamer below); gammas + KV cache continue
@@ -237,7 +245,8 @@ module smollm_layer_bfp #(
     $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "G1_e.hex"},  rom_G1_e);
     $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "G2_e.hex"},  rom_G2_e);
     $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "K_INIT_m.hex"}, kv_k_m);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "V_INIT_m.hex"}, kv_v_m);
+    // V_INIT_m no longer loaded — kv_v_m_chk is wide-packed; baker
+    // value is all-zero anyway and Vivado zero-inits BRAM on bitstream.
     $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "K_INIT_e.hex"}, kv_k_e);
     $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "V_INIT_e.hex"}, kv_v_e);
   end
@@ -264,7 +273,7 @@ module smollm_layer_bfp #(
     $readmemh({PREFIX, "G1_e.hex"},  rom_G1_e);
     $readmemh({PREFIX, "G2_e.hex"},  rom_G2_e);
     $readmemh({PREFIX, "K_INIT_m.hex"}, kv_k_m);
-    $readmemh({PREFIX, "V_INIT_m.hex"}, kv_v_m);
+    // V_INIT_m no longer loaded (see header note on kv_v_m_chk).
     $readmemh({PREFIX, "K_INIT_e.hex"}, kv_k_e);
     $readmemh({PREFIX, "V_INIT_e.hex"}, kv_v_e);
   end
@@ -356,7 +365,7 @@ module smollm_layer_bfp #(
     S_KVWR_M, S_KVWR_E,
     S_QK_PRIME, S_QK_DRIVE, S_QK_DRAIN,
     S_SM_DRIVE, S_SM_WAIT,
-    S_AV_PRIME, S_AV_DRIVE, S_AV_DRAIN, S_AV_REQ, S_AV_NEXT,
+    S_AV_PRIME, S_AV_EMAX_SCAN, S_AV_DRIVE, S_AV_DRAIN, S_AV_REQ, S_AV_NEXT,
     S_OMV_PRIME, S_OMV_DRIVE, S_OMV_DRAIN, S_OMV_REQ, S_OMV_NEXT,
     S_RES1, S_RES1_WAIT,
     S_NORM2, S_NORM2_WAIT,
@@ -804,6 +813,11 @@ module smollm_layer_bfp #(
   // Computed per-chunk in S_AV_PRIME; used by S_AV_DRIVE to align each
   // timestep's V mantissa before feeding the matvec engine.
   logic signed [BFP_EXP_W-1:0] av_emax;
+  // Sequential scan counter for AV_EMAX_SCAN — walks t=0..kv_pos-1
+  // (one cycle each) to compute av_emax from kv_v_e without a 64-port
+  // comb fan-in (which Vivado can't infer as BRAM and won't dissolve
+  // at full SmolLM2 dims).
+  logic [CW_CTX-1:0] av_scan_cnt;
   // Residual / SwiGLU output write-index — independent of cnt (which tracks
   // input drive) because the engines emit interleaved with loading.
   logic [11:0] out_cnt;
@@ -851,6 +865,7 @@ module smollm_layer_bfp #(
       probs_e_shared  <= '0;
       head_grp        <= '0;
       av_row_base     <= '0;
+      av_scan_cnt     <= '0;
       out_cnt         <= '0;
       ws_matvec_id    <= 3'd0;
       ws_load_req     <= 1'b0;
@@ -1267,9 +1282,19 @@ module smollm_layer_bfp #(
         // ===================================================================
         // After re-tile-quant, k_m/k_e is the post-rope K in per-tile BFP.
         // Just copy mantissas + per-tile exponents into the KV cache slot.
-        S_KVWR_M: begin
+        S_KVWR_M: begin : kvwr_m_blk
           kv_k_m[layer_idx * MAX_CTX * H_KV * HD + kv_pos * H_KV * HD + cnt[CW_KV-1:0]] <= k_m[cnt[CW_KV-1:0]];
-          kv_v_m[layer_idx * MAX_CTX * H_KV * HD + kv_pos * H_KV * HD + cnt[CW_KV-1:0]] <= v_m[cnt[CW_KV-1:0]];
+          // Write the wide-packed kv_v_m_chk entry every 16 cycles
+          // (once per chunk of 16 lanes).  The packed entry assembles
+          // v_m[chunk_base..chunk_base+15] combinationally from v_m
+          // (which is small FFs — 16-port read is cheap).
+          if (cnt[3:0] == 4'd15) begin
+            automatic logic [LANES*BFP_MANT_W-1:0] packed_v;
+            for (int gl = 0; gl < LANES; gl++)
+              packed_v[gl*BFP_MANT_W +: BFP_MANT_W] = v_m[cnt[CW_KV-1:4] * LANES + gl];
+            kv_v_m_chk[layer_idx * MAX_CTX * KVV_CHUNKS_PER_KVPOS
+                       + kv_pos * KVV_CHUNKS_PER_KVPOS + cnt[CW_KV-1:4]] <= packed_v;
+          end
           if (cnt == H_KV*HD - 1) begin
             cnt   <= '0; state <= S_KVWR_E;
           end else cnt <= cnt + 1'b1;
@@ -1378,22 +1403,33 @@ module smollm_layer_bfp #(
         // AV — for each chunk of HD outputs, matvec input = probs (length
         // kv_pos+1), weight row = V[grp, t, j_base..j_base+LANES-1].
         // ===================================================================
-        S_AV_PRIME: begin
-          mv_start <= 1'b1; cnt <= '0; state <= S_AV_DRIVE;
-          head_grp <= 5'(kv_grp_of(head_idx));
-          // Find max of kv_v_e for this head's V tile at chunk `chunk`,
-          // across timesteps 0..kv_pos.  For kv_t==kv_pos use v_e (current step
-          // didn't write back to the cache yet).
-          begin : av_emax_calc
-            automatic logic signed [BFP_EXP_W-1:0] em;
-            automatic int tile_idx;
-            tile_idx = (kv_grp_of(head_idx) * HD + chunk * LANES) / BFP_TILE;
-            em = $signed(v_e[tile_idx]);  // current-step contribution
-            for (int t = 0; t < MAX_CTX; t++)
-              if (t < kv_pos)
-                if ($signed(kv_v_e[layer_idx * MAX_CTX * NT_KV + t * NT_KV + tile_idx]) > em)
-                  em = $signed(kv_v_e[layer_idx * MAX_CTX * NT_KV + t * NT_KV + tile_idx]);
-            av_emax <= em;
+        // S_AV_PRIME: init head_grp + seed av_emax with the current-step
+        // V tile exponent.  Then S_AV_EMAX_SCAN walks past timesteps
+        // 0..kv_pos-1 one per cycle to fold each kv_v_e[t] into the max.
+        // Replaces the original MAX_CTX-wide combinational fan-in,
+        // which made kv_v_e_reg unsynthesizable at NL=30 / MAX_CTX=64.
+        S_AV_PRIME: begin : av_prime_blk
+          automatic int tile_idx;
+          tile_idx = (kv_grp_of(head_idx) * HD + chunk * LANES) / BFP_TILE;
+          head_grp    <= 5'(kv_grp_of(head_idx));
+          av_emax     <= $signed(v_e[tile_idx]);   // seed with current step
+          av_scan_cnt <= '0;
+          state       <= S_AV_EMAX_SCAN;
+        end
+        S_AV_EMAX_SCAN: begin : av_emax_scan
+          automatic logic signed [BFP_EXP_W-1:0] e_t;
+          automatic int tile_idx;
+          tile_idx = (head_grp * HD + chunk * LANES) / BFP_TILE;
+          if (av_scan_cnt < kv_pos) begin
+            e_t = $signed(kv_v_e[layer_idx * MAX_CTX * NT_KV
+                                  + av_scan_cnt[CW_CTX-1:0] * NT_KV + tile_idx]);
+            if (e_t > av_emax) av_emax <= e_t;
+            av_scan_cnt <= av_scan_cnt + 1'b1;
+          end else begin
+            // Scan complete; kick the engine and enter DRIVE next cycle.
+            mv_start <= 1'b1;
+            cnt      <= '0;
+            state    <= S_AV_DRIVE;
           end
         end
         // matvec engine requires input dim to be a multiple of TILE so that
@@ -1406,7 +1442,13 @@ module smollm_layer_bfp #(
           automatic int tile_idx;
           automatic logic signed [BFP_EXP_W-1:0] v_e_this;
           automatic logic signed [BFP_EXP_W-1:0] shamt;
+          // Read the full 16-lane wide-packed V chunk for this (t, head_grp, chunk).
+          // Slice lanes via combinational mux of the registered 256-bit value.
+          automatic logic [LANES*BFP_MANT_W-1:0] v_chk;
           tile_idx = (head_grp * HD + chunk * LANES) / BFP_TILE;
+          v_chk = kv_v_m_chk[layer_idx * MAX_CTX * KVV_CHUNKS_PER_KVPOS
+                             + cnt[CW_CTX-1:0] * KVV_CHUNKS_PER_KVPOS
+                             + head_grp * (HD/LANES) + chunk];
           mv_valid <= 1'b1;
           mv_x_e   <= probs_e_shared;
           if (cnt <= kv_pos) begin
@@ -1419,8 +1461,7 @@ module smollm_layer_bfp #(
               if (cnt[CW_CTX-1:0] == kv_pos)
                 m_raw = $signed(v_m[head_grp * HD + chunk * LANES + ii]);
               else
-                m_raw = $signed(
-                  kv_v_m[layer_idx * MAX_CTX * H_KV*HD + cnt[CW_CTX-1:0] * H_KV*HD + head_grp * HD + chunk * LANES + ii]);
+                m_raw = $signed(v_chk[ii*BFP_MANT_W +: BFP_MANT_W]);
               if (shamt >= 16)     mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <= '0;
               else if (shamt >= 0) mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <= m_raw >>> shamt[3:0];
               else                 mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <= m_raw;
