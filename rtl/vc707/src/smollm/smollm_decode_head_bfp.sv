@@ -67,35 +67,45 @@ module smollm_decode_head_bfp #(
   (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] rom_NW_e [0:NT_D-1];
 
   // ---------------------------------------------------------------------------
-  // EMBED (used as lm_head via tied embeddings).  Wide-packed BRAM:
-  //   rom_EMBED_m: CHUNKS_VOCAB * D entries of 256 bits each.
-  //   rom_EMBED_e: CHUNKS_VOCAB * NT_D entries of 128 bits each.
+  // EMBED (used as lm_head via tied embeddings).  Wide-packed BRAM
+  // (3072 × 256-b mantissa entries + 3072 × 128-b exp entries ≈ 1 Mb)
+  // — but only needed in STREAM_WEIGHTS=0 mode.  Gated behind a
+  // `generate if` so the array literally doesn't exist in stream
+  // mode, avoiding Vivado's "infer 3456 RAMB36" trap on 1.77 M-deep
+  // arrays.
   // ---------------------------------------------------------------------------
   localparam int LANE_M_W = LANES * BFP_MANT_W;
   localparam int LANE_E_W = LANES * BFP_EXP_W;
-  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_EMBED_m [0:CHUNKS_VOCAB*D-1];
-  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_EMBED_e [0:CHUNKS_VOCAB*NT_D-1];
 
-  // norm_w always BRAM-loaded (tiny: 576 × 2 B + 36 B).  EMBED gated.
+  // norm_w always BRAM-loaded (tiny: 576 × 2 B + 36 B).
 `ifdef MICROGPT_WEIGHT_DIR
   initial begin
     $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "NORM_W_m.hex"}, rom_NW_m);
     $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "NORM_W_e.hex"}, rom_NW_e);
-    if (!STREAM_WEIGHTS) begin
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "EMBED_m.hex"},  rom_EMBED_m);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "EMBED_e.hex"},  rom_EMBED_e);
-    end
   end
 `else
   initial begin
     $readmemh({PREFIX, "NORM_W_m.hex"}, rom_NW_m);
     $readmemh({PREFIX, "NORM_W_e.hex"}, rom_NW_e);
-    if (!STREAM_WEIGHTS) begin
-      $readmemh({PREFIX, "EMBED_m.hex"},  rom_EMBED_m);
-      $readmemh({PREFIX, "EMBED_e.hex"},  rom_EMBED_e);
-    end
   end
 `endif
+
+  // EMBED ROM only when STREAM_WEIGHTS=0.
+  generate if (!STREAM_WEIGHTS) begin : g_embed_rom
+    (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_EMBED_m [0:CHUNKS_VOCAB*D-1];
+    (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_EMBED_e [0:CHUNKS_VOCAB*NT_D-1];
+`ifdef MICROGPT_WEIGHT_DIR
+    initial begin
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "EMBED_m.hex"}, rom_EMBED_m);
+      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "EMBED_e.hex"}, rom_EMBED_e);
+    end
+`else
+    initial begin
+      $readmemh({PREFIX, "EMBED_m.hex"}, rom_EMBED_m);
+      $readmemh({PREFIX, "EMBED_e.hex"}, rom_EMBED_e);
+    end
+`endif
+  end endgenerate
 
   // ---------------------------------------------------------------------------
   // Latched hidden_in (BRAM-style)
@@ -407,8 +417,14 @@ module smollm_decode_head_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= hn_m[cnt[$clog2(D)-1:0]];
           mv_x_e   <= hn_e[cnt[$clog2(D)-1:0] / BFP_TILE];
-          mv_w_m   <= rom_EMBED_m[chunk * D    + cnt[$clog2(D)-1:0]];
-          mv_w_e   <= rom_EMBED_e[chunk * NT_D + cnt[$clog2(D)-1:0] / BFP_TILE];
+          // BRAM-mode weight read; only meaningful when STREAM_WEIGHTS=0.
+          // In stream mode mv_w_m_eff = ws_weight_m_out shadows mv_w_m,
+          // and the rom_EMBED_m generate block doesn't exist — Vivado
+          // drops the assignment entirely under the parameter fold.
+          if (!STREAM_WEIGHTS) begin
+            mv_w_m <= g_embed_rom.rom_EMBED_m[chunk * D    + cnt[$clog2(D)-1:0]];
+            mv_w_e <= g_embed_rom.rom_EMBED_e[chunk * NT_D + cnt[$clog2(D)-1:0] / BFP_TILE];
+          end
           mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_MV_DRAIN;
           else cnt <= cnt + 1'b1;
