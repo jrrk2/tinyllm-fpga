@@ -212,11 +212,60 @@ module smollm_layer_bfp #(
   // kv_v_m is wide-packed (LANES mantissas per entry) so AV_DRIVE's
   // 16-lane parallel read becomes a single BRAM read.  Original flat
   // layout had 16 simultaneous reads → too many ports for BRAM inference,
-  // and at 5.9 Mbit total Vivado refused to dissolve to FFs (one Synth
-  // 8-3391 error per `make`).  Wide-packing keeps total bits the same
-  // but presents a 1-write + 1-read access pattern.
+  // and at 5.9 Mbit total Vivado refused to dissolve to FFs.  Wide-
+  // packed access is 1-write + 1-read = simple-dual-port BRAM.
+  //
+  // The actual storage + access uses the *canonical* BRAM-inference
+  // pattern: write + registered read in a dedicated always_ff, driven
+  // by explicit comb signals (we / wr_addr / wr_data / rd_addr).  This
+  // is the textbook idiom Vivado guarantees to map to BRAM — much more
+  // reliable than the read-inside-the-FSM pattern, which left Vivado
+  // grinding for >1h trying to dissolve the array into LUTRAM.
   localparam int KVV_CHUNKS_PER_KVPOS = (H_KV * HD) / LANES;          // 12 for full SmolLM2
-  (* ram_style = "block" *) logic [LANES*BFP_MANT_W-1:0] kv_v_m_chk [0:NL*MAX_CTX*KVV_CHUNKS_PER_KVPOS-1];
+  localparam int KVV_DEPTH            = NL * MAX_CTX * KVV_CHUNKS_PER_KVPOS;
+  localparam int KVV_AW               = $clog2(KVV_DEPTH);
+  (* ram_style = "block" *)
+  logic [LANES*BFP_MANT_W-1:0]    kv_v_m_chk [0:KVV_DEPTH-1];
+  logic                           kv_v_chk_we;
+  logic [KVV_AW-1:0]              kv_v_chk_wr_addr;
+  logic [LANES*BFP_MANT_W-1:0]    kv_v_chk_wr_data;
+  logic [KVV_AW-1:0]              kv_v_chk_rd_addr;
+  logic [LANES*BFP_MANT_W-1:0]    kv_v_chk_rd_data;
+  always_ff @(posedge clk) begin
+    if (kv_v_chk_we) kv_v_m_chk[kv_v_chk_wr_addr] <= kv_v_chk_wr_data;
+    kv_v_chk_rd_data <= kv_v_m_chk[kv_v_chk_rd_addr];
+  end
+
+  // Comb drivers for the kv_v_m_chk BRAM ports.  Both wr and rd
+  // sides are driven entirely by state + cnt + layer_idx + kv_pos +
+  // head_grp + chunk + v_m so there's no FSM-internal write-decode
+  // tangle for Vivado to unpack.  rd_addr is issued ahead of cnt by
+  // one cycle (driven by `cnt`, which the AV_DRIVE pipeline advances
+  // every cycle); rd_data arrives one cycle later, consumed via
+  // consume_t = cnt - 1 in S_AV_DRIVE.
+  always_comb begin
+    kv_v_chk_we      = 1'b0;
+    kv_v_chk_wr_addr = '0;
+    kv_v_chk_wr_data = '0;
+    // KVWR_M writes the wide-packed entry once per 16-lane chunk
+    // (cnt[3:0]==15) — assemble lanes from v_m (small FF-backed array,
+    // 16-port read is cheap).
+    if (state == S_KVWR_M && cnt[3:0] == 4'd15) begin
+      kv_v_chk_we      = 1'b1;
+      kv_v_chk_wr_addr = KVV_AW'(layer_idx * MAX_CTX * KVV_CHUNKS_PER_KVPOS
+                                 + kv_pos * KVV_CHUNKS_PER_KVPOS
+                                 + cnt[CW_KV-1:4]);
+      for (int gl = 0; gl < LANES; gl++)
+        kv_v_chk_wr_data[gl*BFP_MANT_W +: BFP_MANT_W] =
+          v_m[cnt[CW_KV-1:4] * LANES + gl];
+    end
+    // Default rd_addr points at addr(cnt) using the current head_grp /
+    // chunk.  The S_AV_PREFETCH and S_AV_DRIVE states drive cnt so the
+    // BRAM receives the right address each cycle.
+    kv_v_chk_rd_addr = KVV_AW'(layer_idx * MAX_CTX * KVV_CHUNKS_PER_KVPOS
+                                + cnt[CW_CTX-1:0] * KVV_CHUNKS_PER_KVPOS
+                                + head_grp * (HD/LANES) + chunk);
+  end
 
   // When STREAM_WEIGHTS=1, the 14 weight $readmemh's are dropped (weights
   // come from DDR3 via the streamer below); gammas + KV cache continue
@@ -365,7 +414,7 @@ module smollm_layer_bfp #(
     S_KVWR_M, S_KVWR_E,
     S_QK_PRIME, S_QK_DRIVE, S_QK_DRAIN,
     S_SM_DRIVE, S_SM_WAIT,
-    S_AV_PRIME, S_AV_EMAX_SCAN, S_AV_DRIVE, S_AV_DRAIN, S_AV_REQ, S_AV_NEXT,
+    S_AV_PRIME, S_AV_EMAX_SCAN, S_AV_PREFETCH, S_AV_DRIVE, S_AV_DRAIN, S_AV_REQ, S_AV_NEXT,
     S_OMV_PRIME, S_OMV_DRIVE, S_OMV_DRAIN, S_OMV_REQ, S_OMV_NEXT,
     S_RES1, S_RES1_WAIT,
     S_NORM2, S_NORM2_WAIT,
@@ -1284,17 +1333,8 @@ module smollm_layer_bfp #(
         // Just copy mantissas + per-tile exponents into the KV cache slot.
         S_KVWR_M: begin : kvwr_m_blk
           kv_k_m[layer_idx * MAX_CTX * H_KV * HD + kv_pos * H_KV * HD + cnt[CW_KV-1:0]] <= k_m[cnt[CW_KV-1:0]];
-          // Write the wide-packed kv_v_m_chk entry every 16 cycles
-          // (once per chunk of 16 lanes).  The packed entry assembles
-          // v_m[chunk_base..chunk_base+15] combinationally from v_m
-          // (which is small FFs — 16-port read is cheap).
-          if (cnt[3:0] == 4'd15) begin
-            automatic logic [LANES*BFP_MANT_W-1:0] packed_v;
-            for (int gl = 0; gl < LANES; gl++)
-              packed_v[gl*BFP_MANT_W +: BFP_MANT_W] = v_m[cnt[CW_KV-1:4] * LANES + gl];
-            kv_v_m_chk[layer_idx * MAX_CTX * KVV_CHUNKS_PER_KVPOS
-                       + kv_pos * KVV_CHUNKS_PER_KVPOS + cnt[CW_KV-1:4]] <= packed_v;
-          end
+          // The wide-packed kv_v_m_chk write is fired by the comb
+          // driver block below — see kv_v_chk_we / _wr_addr / _wr_data.
           if (cnt == H_KV*HD - 1) begin
             cnt   <= '0; state <= S_KVWR_E;
           end else cnt <= cnt + 1'b1;
@@ -1426,11 +1466,25 @@ module smollm_layer_bfp #(
             if (e_t > av_emax) av_emax <= e_t;
             av_scan_cnt <= av_scan_cnt + 1'b1;
           end else begin
-            // Scan complete; kick the engine and enter DRIVE next cycle.
+            // Scan complete; pre-issue first BRAM read in S_AV_PREFETCH
+            // (rd_addr = addr(cnt=0)) so by the time S_AV_DRIVE's first
+            // consumption cycle hits, kv_v_chk_rd_data already holds
+            // data(t=0).  consume_t = cnt - 1 in DRIVE picks the
+            // matching probs / v_e exponent.
             mv_start <= 1'b1;
             cnt      <= '0;
-            state    <= S_AV_DRIVE;
+            state    <= S_AV_PREFETCH;
           end
+        end
+
+        S_AV_PREFETCH: begin
+          // rd_addr_comb is already driving addr(cnt=0) → xpm/BRAM
+          // latches it this cycle; data(0) is visible next cycle.
+          // Advance cnt to 1 so during the first DRIVE cycle:
+          //   - cnt = 1 → rd_addr_comb = addr(1) (prefetch for next)
+          //   - consume_t = cnt - 1 = 0 (process data(0) just arrived)
+          cnt   <= 'd1;
+          state <= S_AV_DRIVE;
         end
         // matvec engine requires input dim to be a multiple of TILE so that
         // tile_done can fire AND all 16 elements of a tile share one w_e.
@@ -1438,30 +1492,31 @@ module smollm_layer_bfp #(
         // we pre-shift each timestep's V mantissa to av_emax and feed av_emax
         // as the shared w_e for every cycle (including the post-kv_pos
         // padding zeros).
+        // cnt is the *prefetch* counter (drives kv_v_chk_rd_addr comb).
+        // consume_t = cnt - 1 is the timestep whose data we process this
+        // cycle (rd_data arrived from xpm/BRAM 1 cycle after the addr
+        // we drove last cycle).  PREFETCH bumped cnt to 1 so DRIVE
+        // starts at consume_t=0 with rd_data=data(0) already valid.
         S_AV_DRIVE: begin : av_drive_blk
           automatic int tile_idx;
           automatic logic signed [BFP_EXP_W-1:0] v_e_this;
           automatic logic signed [BFP_EXP_W-1:0] shamt;
-          // Read the full 16-lane wide-packed V chunk for this (t, head_grp, chunk).
-          // Slice lanes via combinational mux of the registered 256-bit value.
-          automatic logic [LANES*BFP_MANT_W-1:0] v_chk;
-          tile_idx = (head_grp * HD + chunk * LANES) / BFP_TILE;
-          v_chk = kv_v_m_chk[layer_idx * MAX_CTX * KVV_CHUNKS_PER_KVPOS
-                             + cnt[CW_CTX-1:0] * KVV_CHUNKS_PER_KVPOS
-                             + head_grp * (HD/LANES) + chunk];
+          automatic logic [CW_CTX-1:0] consume_t;
+          tile_idx  = (head_grp * HD + chunk * LANES) / BFP_TILE;
+          consume_t = cnt[CW_CTX-1:0] - 1'b1;
           mv_valid <= 1'b1;
           mv_x_e   <= probs_e_shared;
-          if (cnt <= kv_pos) begin
-            mv_x_m <= probs_m[cnt[CW_CTX-1:0]];
-            if (cnt[CW_CTX-1:0] == kv_pos) v_e_this = $signed(v_e[tile_idx]);
-            else v_e_this = $signed(kv_v_e[layer_idx * MAX_CTX * NT_KV + cnt[CW_CTX-1:0] * NT_KV + tile_idx]);
+          if (consume_t <= kv_pos) begin
+            mv_x_m <= probs_m[consume_t];
+            if (consume_t == kv_pos) v_e_this = $signed(v_e[tile_idx]);
+            else v_e_this = $signed(kv_v_e[layer_idx * MAX_CTX * NT_KV + consume_t * NT_KV + tile_idx]);
             shamt = av_emax - v_e_this;
             for (ii = 0; ii < LANES; ii++) begin
               automatic logic signed [BFP_MANT_W-1:0] m_raw;
-              if (cnt[CW_CTX-1:0] == kv_pos)
+              if (consume_t == kv_pos)
                 m_raw = $signed(v_m[head_grp * HD + chunk * LANES + ii]);
               else
-                m_raw = $signed(v_chk[ii*BFP_MANT_W +: BFP_MANT_W]);
+                m_raw = $signed(kv_v_chk_rd_data[ii*BFP_MANT_W +: BFP_MANT_W]);
               if (shamt >= 16)     mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <= '0;
               else if (shamt >= 0) mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <= m_raw >>> shamt[3:0];
               else                 mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <= m_raw;
@@ -1477,8 +1532,8 @@ module smollm_layer_bfp #(
               mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <= av_emax;
             end
           end
-          mv_last <= (cnt == BFP_TILE - 1);
-          if (cnt == BFP_TILE - 1) state <= S_AV_DRAIN;
+          mv_last <= (consume_t == BFP_TILE - 1);
+          if (consume_t == BFP_TILE - 1) state <= S_AV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
         S_AV_DRAIN: if (mv_out_valid_lat) begin : av_pipeA
