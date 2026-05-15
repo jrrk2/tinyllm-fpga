@@ -215,26 +215,33 @@ module smollm_layer_bfp #(
   // and at 5.9 Mbit total Vivado refused to dissolve to FFs.  Wide-
   // packed access is 1-write + 1-read = simple-dual-port BRAM.
   //
-  // The actual storage + access uses the *canonical* BRAM-inference
-  // pattern: write + registered read in a dedicated always_ff, driven
-  // by explicit comb signals (we / wr_addr / wr_data / rd_addr).  This
-  // is the textbook idiom Vivado guarantees to map to BRAM — much more
-  // reliable than the read-inside-the-FSM pattern, which left Vivado
-  // grinding for >1h trying to dissolve the array into LUTRAM.
+  // Storage uses an explicit XPM_MEMORY_SDPRAM primitive via bfp_sdpram.
+  // Vivado maps the XPM directly to RAMB36E1 tiles without running the
+  // generic memory-inference pass, eliminating the >1 h "deciding RAM
+  // shape" hangs we hit on the awkward 23040-deep array.  Read latency
+  // = 1 cycle (BRAM registered output); the AV pipeline absorbs that
+  // via consume_t = cnt - 1 and the S_AV_PREFETCH state.
   localparam int KVV_CHUNKS_PER_KVPOS = (H_KV * HD) / LANES;          // 12 for full SmolLM2
   localparam int KVV_DEPTH            = NL * MAX_CTX * KVV_CHUNKS_PER_KVPOS;
   localparam int KVV_AW               = $clog2(KVV_DEPTH);
-  (* ram_style = "block" *)
-  logic [LANES*BFP_MANT_W-1:0]    kv_v_m_chk [0:KVV_DEPTH-1];
   logic                           kv_v_chk_we;
   logic [KVV_AW-1:0]              kv_v_chk_wr_addr;
   logic [LANES*BFP_MANT_W-1:0]    kv_v_chk_wr_data;
   logic [KVV_AW-1:0]              kv_v_chk_rd_addr;
-  logic [LANES*BFP_MANT_W-1:0]    kv_v_chk_rd_data;
-  always_ff @(posedge clk) begin
-    if (kv_v_chk_we) kv_v_m_chk[kv_v_chk_wr_addr] <= kv_v_chk_wr_data;
-    kv_v_chk_rd_data <= kv_v_m_chk[kv_v_chk_rd_addr];
-  end
+  wire  [LANES*BFP_MANT_W-1:0]    kv_v_chk_rd_data;
+
+  bfp_sdpram #(
+    .DEPTH (KVV_DEPTH),
+    .WIDTH (LANES * BFP_MANT_W)
+  ) i_kv_v_chk_bram (
+    .clk     (clk),
+    .rst     (rst),
+    .we      (kv_v_chk_we),
+    .wr_addr (kv_v_chk_wr_addr),
+    .wr_data (kv_v_chk_wr_data),
+    .rd_addr (kv_v_chk_rd_addr),
+    .rd_data (kv_v_chk_rd_data)
+  );
 
   // Comb drivers for the kv_v_m_chk BRAM ports.  Both wr and rd
   // sides are driven entirely by state + cnt + layer_idx + kv_pos +

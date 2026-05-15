@@ -147,6 +147,7 @@ read_verilog -sv { \
     src/smollm/swiglu_bfp.sv \
     src/smollm/softmax_bfp.sv \
     src/smollm/residual_bfp.sv \
+    src/smollm/bfp_sdpram.sv \
     src/smollm/weight_streamer_bfp_mt.sv \
     src/smollm/smollm_layer_bfp.sv \
     src/smollm/smollm_layer_bfp_selftest.sv \
