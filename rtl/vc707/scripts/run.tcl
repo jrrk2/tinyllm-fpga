@@ -106,7 +106,8 @@ read_verilog -sv { \
     eth/sgmii_soc.sv \
 }
 
-# microgpt core (shared with the DE1-SoC build, sourced from ../src/)
+# microgpt BabyGPT core (used by vc707_microgpt_eth's microgpt_exact_core
+# instance — small char-level GPT, predates the SmolLM2 stack).  Stays.
 read_verilog -sv { \
     ../src/microgpt_categorical_sampler.sv \
     ../src/microgpt_exact_core.sv \
@@ -116,7 +117,17 @@ read_verilog -sv { \
 }
 
 # VC707 top + Ethernet bridge + DDR3 weight tile cache + DDR3 write master
-# + SmolLM2 building blocks (parse-validated; not yet wired into the top)
+# + SmolLM2 single-op selftests (small D=64 BRAMs) + BFP autoregress stack.
+#
+# Retired sources (the int8 SmolLM2 multilayer chain — 23040 × 16 caches
+# whose awkward depth was hanging Vivado's memory inferencer):
+#   smollm_layer.sv, smollm_multilayer_tm.sv,
+#   smollm_layer_selftest.sv, smollm_multilayer_tm_selftest.sv,
+#   matvec_int8_engine.sv, weight_streamer_brom.sv, weight_streamer_mt.sv,
+#   factor_ram.sv.
+# Their op-selftest siblings (matvec_selftest, rmsnorm_selftest, ...) and
+# the leaf modules they rely on (rmsnorm/rope/swiglu/softmax_q15) stay
+# because vc707_microgpt_eth still instantiates the per-op selftests.
 read_verilog -sv { \
     src/microgpt_eth_ctrl.sv \
     src/weight_stream_axi.sv \
@@ -134,13 +145,6 @@ read_verilog -sv { \
     src/smollm/swiglu_selftest.sv \
     src/smollm/softmax_q15.sv \
     src/smollm/softmax_selftest.sv \
-    src/smollm/weight_streamer_brom.sv \
-    src/smollm/weight_streamer_mt.sv \
-    src/smollm/factor_ram.sv \
-    src/smollm/smollm_layer.sv \
-    src/smollm/smollm_layer_selftest.sv \
-    src/smollm/smollm_multilayer_tm.sv \
-    src/smollm/smollm_multilayer_tm_selftest.sv \
     src/smollm/matvec_bfp_engine.sv \
     src/smollm/rmsnorm_bfp.sv \
     src/smollm/rope_bfp.sv \

@@ -23,8 +23,10 @@
 `define LBFP_DDR3_SVH
 
 // 32 B = 256 b mantissa entry; 16 B = 128 b exp entry; round up to 4 KB.
-`define LBFP_BYTES_M_PER_COL       32   // 16 mantissas × 16 b = 256 b
-`define LBFP_BYTES_E_PER_TILE      16   // 16 exps × 8 b = 128 b
+// 16 mantissas × 16 b = 256 b
+`define LBFP_BYTES_M_PER_COL       32
+// 16 exps × 8 b = 128 b
+`define LBFP_BYTES_E_PER_TILE      16
 `define LBFP_DDR3_ALIGN            4096
 
 // Per-matrix region sizes (NL=30 layers concatenated, computed below).
@@ -64,8 +66,10 @@
 // Gamma matrices: NL × D × 16 b mantissas + NL × NT_D × 8 b exps (narrow).
 // Padding matches host/gen_smollm_blockfp_ddr.py uniform 4 KB alignment.
 `define LBFP_BASE_G1_M        (`LBFP_BASE_WDN_E + 30'(`LBFP_REGION_SIZE_E(`LBFP_FULL_D, `LBFP_FULL_FFN)))
-`define LBFP_BASE_G1_E        (`LBFP_BASE_G1_M + 30'h0_9000)   // NL × D × 2 B = 34,560 → 36,864 (4 KB-aligned)
-`define LBFP_BASE_G2_M        (`LBFP_BASE_G1_E + 30'h0_1000)   // NL × NT_D × 1 B = 1,080 → 4,096
+// NL × D × 2 B = 34,560 → 36,864 (4 KB-aligned)
+`define LBFP_BASE_G1_E        (`LBFP_BASE_G1_M + 30'h0_9000)
+// NL × NT_D × 1 B = 1,080 → 4,096
+`define LBFP_BASE_G2_M        (`LBFP_BASE_G1_E + 30'h0_1000)
 `define LBFP_BASE_G2_E        (`LBFP_BASE_G2_M + 30'h0_9000)
 
 // EMBED table (49152 × 576): wide-packed for lm_head AND narrow row-wise
@@ -83,7 +87,8 @@
 
 // Total DDR3 image size in 128-bit entries (one entry per mock_axi_slave
 // mem[] slot).  Conservatively rounded up — extra entries init to 0.
-`define LBFP_DDR3_ENTRIES   (24 * 1024 * 1024)   // 24 Mi × 16 B = 384 MB
+// 24 Mi × 16 B = 384 MB
+`define LBFP_DDR3_ENTRIES   (24 * 1024 * 1024)
 
 // matvec_id encoding consumed by weight_streamer_bfp_mt.sv:
 //   0=Q, 1=K, 2=V, 3=O, 4=G, 5=U, 6=DN

@@ -881,79 +881,9 @@ module vc707_microgpt_eth (
     else              scale_wr_pulse_core <= scale_wr_edge_core;
   end
 
-`ifndef MICROGPT_USE_BFP
-  smollm_multilayer_tm_selftest i_lay_st (
-    .clk                ( core_clk         ),
-    .rst                ( ~core_resetn     ),
-    .restart            ( lay_restart_core ),
-    .result             ( lay_result       ),
-    .done               ( lay_done_core    ),
-    .snapshot_layer_sel ( snap_sel_core_s1 ),
-    .factor_wr_layer         ( factor_wr_layer_core         ),
-    .factor_wr_data          ( factor_wr_data_core          ),
-    .factor_wr_en_swiglu_lo  ( factor_wr_en_swiglu_lo_core  ),
-    .factor_wr_en_swiglu_mlp ( factor_wr_en_swiglu_mlp_core ),
-    .factor_wr_en_attn       ( factor_wr_en_attn_core       ),
-    .factor_rd_sel           ( factor_rd_sel_core           ),
-    .factor_rd_data          ( factor_rd_data_core          ),
-    .scale_wr_kind           ( scale_wr_kind_core           ),
-    .scale_wr_addr           ( scale_wr_addr_core           ),
-    .scale_wr_data           ( scale_wr_data_core           ),
-    .scale_wr_en             ( scale_wr_pulse_core          ),
-
-    .clk_axi ( ui_clk                                  ),
-    .rst_axi ( ui_clk_sync_rst | ~init_calib_complete  ),
-    .m_axi_arvalid ( m_axi_arvalid ),
-    .m_axi_arready ( m_axi_arready ),
-    .m_axi_arid    ( m_axi_arid    ),
-    .m_axi_araddr  ( m_axi_araddr  ),
-    .m_axi_arlen   ( m_axi_arlen   ),
-    .m_axi_arsize  ( m_axi_arsize  ),
-    .m_axi_arburst ( m_axi_arburst ),
-    .m_axi_arlock  ( m_axi_arlock  ),
-    .m_axi_arcache ( m_axi_arcache ),
-    .m_axi_arprot  ( m_axi_arprot  ),
-    .m_axi_arqos   ( m_axi_arqos   ),
-    .m_axi_rvalid  ( m_axi_rvalid  ),
-    .m_axi_rready  ( m_axi_rready  ),
-    .m_axi_rid     ( m_axi_rid     ),
-    .m_axi_rdata   ( m_axi_rdata   ),
-    .m_axi_rresp   ( m_axi_rresp   ),
-    .m_axi_rlast   ( m_axi_rlast   )
-`ifdef MICROGPT_LAYER_DEBUG
-    ,
-    .dbg_first_araddr   ( dbg_first_araddr   ),
-    .dbg_first_rdata    ( dbg_first_rdata    ),
-    .dbg_first_ar_seen  ( dbg_first_ar_seen  ),
-    .dbg_first_r_seen   ( dbg_first_r_seen   ),
-    .dbg_eng_w_packed   ( dbg_eng_w_packed   ),
-    .dbg_wd_packed      ( dbg_wd_packed      ),
-    .dbg_in_value_packed( dbg_in_value_packed),
-    .dbg_snap_done_o    ( dbg_snap_done      ),
-    .ila_state          ( ila_state          ),
-    .ila_mv_phase       ( ila_mv_phase       ),
-    .ila_cnt            ( ila_cnt            ),
-    .ila_chunk          ( ila_chunk          ),
-    .ila_ws_matvec_id   ( ila_ws_matvec_id   ),
-    .ila_ws_load_req    ( ila_ws_load_req    ),
-    .ila_ws_ready       ( ila_ws_ready       ),
-    .ila_ws_rd_addr     ( ila_ws_rd_addr     ),
-    .ila_ws_weight_data ( ila_ws_weight_data ),
-    .ila_eng_w          ( ila_eng_w          ),
-    .ila_eng_in_value   ( ila_eng_in_value   ),
-    .ila_eng_in_valid   ( ila_eng_in_valid   ),
-    .ila_eng_in_last    ( ila_eng_in_last    ),
-    .ila_eng_acc_clear  ( ila_eng_acc_clear  ),
-    .ila_eng_out_valid  ( ila_eng_out_valid  ),
-    .ila_ws_state_axi   ( ila_ws_state_axi   ),
-    .ila_start_load_axi ( ila_start_load_axi ),
-    .ila_tile_idx       ( ila_tile_idx       ),
-    .ila_beat_idx       ( ila_beat_idx       ),
-    .ila_ml_state       ( ila_ml_state       ),
-    .ila_ml_layer_idx   ( ila_ml_layer_idx   )
-`endif
-  );
-`else  // MICROGPT_USE_BFP
+// Int8 path retired — see git history (commit f6a5e9a-era and earlier)
+// for the smollm_multilayer_tm_selftest instantiation that lived here.
+// Now the BFP autoregress stack is the only model path.
 `include "lbfp_full_cfg.svh"   // LBFP_FULL_{D,HQ,HKV,HD,FFN,NL,MAX_CTX,VOCAB,NPROMPT,NGEN}
   // NB: scripts/run.tcl removes MICROGPT_LAYER_DEBUG / MICROGPT_DDR3_WEIGHTS /
   // MICROGPT_ILA from the define set when USE_BFP=1 (those defines drive
@@ -1076,7 +1006,6 @@ module vc707_microgpt_eth (
   // Factor read port returns zero in the BFP path (no swiglu/attn factors).
   // (factor_rd_data_core is wire-declared at module scope; drive to '0.)
   assign factor_rd_data_core = '0;
-`endif
 
   reg [1:0] lay_done_sync = 2'd0;
   always_ff @(posedge eth_clk) lay_done_sync <= {lay_done_sync[0], lay_done_core};
