@@ -41,7 +41,7 @@ module tb_autoregress_bfp_stream (
     .N_PROMPT(`LBFP_FULL_NPROMPT),
     .N_GEN   (`LBFP_FULL_NGEN),
     .PREFIX  ("../generated/lbfp_full_"),
-    .STREAM_WEIGHTS(1'b1), .STREAM_LOOKUP(1'b1),
+    .STREAM_LOOKUP(1'b1),
     .AXI_ADDR_WIDTH(30),   .AXI_ID_WIDTH(5)
   ) dut (
     .clk(clk), .rst(rst), .start(go),

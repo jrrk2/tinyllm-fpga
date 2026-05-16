@@ -831,47 +831,42 @@ module vc707_microgpt_eth (
   assign dbg_first_r_seen   = snap_r_seen_sync[1];
 
   // -------------------------------------------------------------------
-  // CRC32 accumulator on the BFP AXI master's R channel.
+  // Rolling XOR-with-rotate hash on the BFP AXI master's R channel.
   //
-  // Resets on the same edge as the snapshot arm (the lay_restart toggle
-  // CDC'd into ui_clk).  Accumulates over every 512-bit rdata beat the
-  // master receives.  After a single-shot autoregress run completes,
-  // the value is stable and exposed via regmap 0x04A.
+  // The unrolled CRC32-512 step (64 byte rounds) was a ~9 ns LUT chain
+  // and blew the 5 ns ui_clk budget by 750 ps.  Replaced with a much
+  // simpler hash that fits in 2-3 LUT levels: XOR all 16 32-bit words
+  // of each 512-bit beat into the accumulator, then rotate the
+  // accumulator left by 1 bit so byte order matters across beats.
   //
-  // Diagnostic use: compare hash across uploads.  Identical CRCs ⇒ the
-  // FPGA literally read the same byte sequence in both runs ⇒ DDR3
-  // contents are functionally identical from the autoregress's view.
+  // Not as strong as CRC32 (XOR has known collision modes — e.g., the
+  // same bit flipped twice cancels), but adequate for the comparative
+  // diagnostic: hash(Python upload) vs hash(C++ upload).  If two large
+  // weight images differ in any byte, the rolling hash differs with
+  // overwhelming probability.
+  //
+  // Resets on the lay_restart toggle CDC'd into ui_clk.  After a
+  // single-shot autoregress run completes, the value is stable and
+  // exposed via regmap 0x04A.
   // -------------------------------------------------------------------
-  function automatic [31:0] crc32_step_8 (input [31:0] crc_in,
-                                          input [7:0]  data_byte);
-    reg [31:0] c;
-    integer    i;
-    begin
-      c = crc_in ^ {24'h0, data_byte};
-      for (i = 0; i < 8; i = i + 1)
-        c = c[0] ? (c >> 1) ^ 32'hEDB88320 : (c >> 1);
-      crc32_step_8 = c;
-    end
-  endfunction
-
-  function automatic [31:0] crc32_step_512 (input [31:0]  crc_in,
-                                            input [511:0] data);
-    reg [31:0] c;
-    integer    i;
-    begin
-      c = crc_in;
-      for (i = 0; i < 64; i = i + 1)
-        c = crc32_step_8(c, data[i*8 +: 8]);
-      crc32_step_512 = c;
-    end
-  endfunction
+  wire [31:0] rdata_xor =
+        m_axi_rdata[ 31:  0] ^ m_axi_rdata[ 63: 32]
+      ^ m_axi_rdata[ 95: 64] ^ m_axi_rdata[127: 96]
+      ^ m_axi_rdata[159:128] ^ m_axi_rdata[191:160]
+      ^ m_axi_rdata[223:192] ^ m_axi_rdata[255:224]
+      ^ m_axi_rdata[287:256] ^ m_axi_rdata[319:288]
+      ^ m_axi_rdata[351:320] ^ m_axi_rdata[383:352]
+      ^ m_axi_rdata[415:384] ^ m_axi_rdata[447:416]
+      ^ m_axi_rdata[479:448] ^ m_axi_rdata[511:480];
 
   reg [31:0] bfp_rdata_crc_ui;
   always_ff @(posedge ui_clk) begin
     if (ui_clk_sync_rst || crc_reset_ui) begin
       bfp_rdata_crc_ui <= 32'hFFFFFFFF;
     end else if (m_axi_rvalid && m_axi_rready) begin
-      bfp_rdata_crc_ui <= crc32_step_512(bfp_rdata_crc_ui, m_axi_rdata);
+      // {rotl(crc, 1)} ^ word_xor — depth ~5 LUTs, fits 5 ns easily.
+      bfp_rdata_crc_ui <= {bfp_rdata_crc_ui[30:0], bfp_rdata_crc_ui[31]}
+                       ^ rdata_xor;
     end
   end
 
@@ -1685,10 +1680,12 @@ module vc707_microgpt_eth (
       // 0x049 [0] has_run — set when the single-shot autoregress run
       //              has completed since last restart pulse; cleared
       //              by writing to 0x1F1 (regular restart).
-      // 0x04A [31:0] bfp_rdata_crc — CRC32 of every 512-bit AXI rdata
-      //              beat seen by the BFP master since the last restart
-      //              pulse.  Compare across uploads as a cheap proof
-      //              that the autoregress saw byte-identical data.
+      // 0x04A [31:0] bfp_rdata_hash — rolling XOR-with-rotate hash over
+      //              every 512-bit AXI rdata beat seen by the BFP
+      //              master since the last restart pulse.  Cheaper than
+      //              CRC32 (one rotate + 17 XORs, fits 5 ns at 200 MHz);
+      //              adequate for the comparative diagnostic of
+      //              hash(Python upload) vs hash(C++ upload).
       10'h049: read_data_comb = {31'd0, has_run_eth};
       10'h04A: read_data_comb = bfp_rdata_crc_eth;
       // 0x019..0x01C: DDR3 write-path stage counters (eth_clk domain).

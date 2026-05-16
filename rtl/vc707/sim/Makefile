@@ -656,50 +656,10 @@ obj_dir/Vtb_full_bfp: tb_full_bfp.sv tb_full_bfp.cpp \
 	    $(SMOLLM_SRC)/cordic_sincos.sv \
 	    -o Vtb_full_bfp
 
-# ---------------------- tb_autoregress_bfp (on-chip autoregress demo) ----------------------
-# Wraps the BFP stack in an on-chip FSM that drives the token loop
-# internally (no C++ feedback).  Pulse `go` once; the design generates
-# N_GEN tokens then asserts `done`.  Verilator harness reads the packed
-# result_tokens bus and prints "RTL_TOKENS: …" — pipe through
-# host/decode_rtl_tokens.py to render English.
-bfp-autoregress: obj_dir/Vtb_autoregress_bfp
-	@echo "=== running tb_autoregress_bfp ==="
-	@./obj_dir/Vtb_autoregress_bfp | tee /tmp/vbfp_autoregress.out
-	@echo "=== decoded text ==="
-	@python3 ../host/decode_rtl_tokens.py /tmp/vbfp_autoregress.out
-
-obj_dir/Vtb_autoregress_bfp: tb_autoregress_bfp.sv tb_autoregress_bfp.cpp \
-                             $(SMOLLM_SRC)/autoregress_bfp_top.sv \
-                             $(SMOLLM_SRC)/embed_lookup_bfp.sv \
-                             $(SMOLLM_SRC)/smollm_multilayer_tm_bfp.sv \
-                             $(SMOLLM_SRC)/smollm_decode_head_bfp.sv \
-                             $(SMOLLM_SRC)/smollm_layer_bfp.sv \
-                             $(SMOLLM_SRC)/matvec_bfp_engine.sv \
-                             $(SMOLLM_SRC)/rmsnorm_bfp.sv \
-                             $(SMOLLM_SRC)/rope_bfp.sv \
-                             $(SMOLLM_SRC)/swiglu_bfp.sv \
-                             $(SMOLLM_SRC)/softmax_bfp.sv \
-                             $(SMOLLM_SRC)/residual_bfp.sv \
-                             $(SMOLLM_SRC)/cordic_sincos.sv
-	$(VERILATOR) -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-fatal -cc --exe --build \
-	    -j 0 --x-assign 0 --x-initial 0 \
-	    -CFLAGS "-O2 -std=c++17" \
-	    --top-module tb_autoregress_bfp \
-	    -I../generated -I$(SMOLLM_SRC) \
-	    tb_autoregress_bfp.sv tb_autoregress_bfp.cpp \
-	    $(SMOLLM_SRC)/autoregress_bfp_top.sv \
-	    $(SMOLLM_SRC)/embed_lookup_bfp.sv \
-	    $(SMOLLM_SRC)/smollm_multilayer_tm_bfp.sv \
-	    $(SMOLLM_SRC)/smollm_decode_head_bfp.sv \
-	    $(SMOLLM_SRC)/smollm_layer_bfp.sv \
-	    $(SMOLLM_SRC)/matvec_bfp_engine.sv \
-	    $(SMOLLM_SRC)/rmsnorm_bfp.sv \
-	    $(SMOLLM_SRC)/rope_bfp.sv \
-	    $(SMOLLM_SRC)/swiglu_bfp.sv \
-	    $(SMOLLM_SRC)/softmax_bfp.sv \
-	    $(SMOLLM_SRC)/residual_bfp.sv \
-	    $(SMOLLM_SRC)/cordic_sincos.sv \
-	    -o Vtb_autoregress_bfp
+# ---------------------- tb_autoregress_bfp -> alias to streaming -----------------------
+# The BRAM-mode tb was retired with STREAM_WEIGHTS=0; the streaming
+# testbench (mock_axi_slave-backed) is the only autoregress harness.
+bfp-autoregress: bfp-autoregress-stream
 
 # ---------------------- tb_autoregress_bfp_stream (streaming end-to-end) ----------------------
 # Same DUT but with STREAM_WEIGHTS=1 / STREAM_LOOKUP=1; weights served

@@ -857,8 +857,12 @@ int verify_sampled(Udp& u, const std::string& path, int n_samples) {
 // ---------------------------------------------------------------------
 // Subcommand: read-crc
 // ---------------------------------------------------------------------
-// Reads the FPGA's accumulated CRC32 over every 512-bit AXI rdata beat
-// the BFP master has seen since the last restart pulse.  After a
+// Reads the FPGA's rolling XOR-with-rotate hash over every 512-bit
+// AXI rdata beat the BFP master has seen since the last restart pulse.
+// (Was strict CRC32 originally, but the 64-byte unrolled XOR chain
+// blew the 5 ns ui_clk timing by 750 ps — swapped for a much shorter
+// rotate+XOR-tree that fits 5 ns easily.  Weaker collision properties
+// than CRC32 but adequate for the comparative diagnostic.)  After a
 // single-shot autoregress run completes (has_run=1), the value is
 // stable and represents a hash of *exactly the data the LLM consumed*.
 //
@@ -872,7 +876,7 @@ void print_crc(Udp& u) {
     uint32_t status = reg_read(u, REG_HAS_RUN, 1, 60)[0];
     uint32_t crc    = reg_read(u, REG_RDATA_CRC, 1, 61)[0];
     std::printf("has_run = %u\n", status & 1);
-    std::printf("CRC32   = 0x%08x\n", crc);
+    std::printf("rdata_hash = 0x%08x\n", crc);
 }
 
 // ---------------------------------------------------------------------
