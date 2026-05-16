@@ -46,6 +46,7 @@ module tb_autoregress_bfp_stream (
   ) dut (
     .clk(clk), .rst(rst), .start(go),
     .done(done), .result_tokens(result_tokens),
+    .weight_hash(/* unused in sim */),
     .ws_base_WQ_m       (`LBFP_BASE_WQ_M),
     .ws_base_WQ_e       (`LBFP_BASE_WQ_E),
     .ws_base_WK_m       (`LBFP_BASE_WK_M),

@@ -831,51 +831,17 @@ module vc707_microgpt_eth (
   assign dbg_first_r_seen   = snap_r_seen_sync[1];
 
   // -------------------------------------------------------------------
-  // Rolling XOR-with-rotate hash on the BFP AXI master's R channel.
-  //
-  // The unrolled CRC32-512 step (64 byte rounds) was a ~9 ns LUT chain
-  // and blew the 5 ns ui_clk budget by 750 ps.  Replaced with a much
-  // simpler hash that fits in 2-3 LUT levels: XOR all 16 32-bit words
-  // of each 512-bit beat into the accumulator, then rotate the
-  // accumulator left by 1 bit so byte order matters across beats.
-  //
-  // Not as strong as CRC32 (XOR has known collision modes — e.g., the
-  // same bit flipped twice cancels), but adequate for the comparative
-  // diagnostic: hash(Python upload) vs hash(C++ upload).  If two large
-  // weight images differ in any byte, the rolling hash differs with
-  // overwhelming probability.
-  //
-  // Resets on the lay_restart toggle CDC'd into ui_clk.  After a
-  // single-shot autoregress run completes, the value is stable and
-  // exposed via regmap 0x04A.
+  // Comparative hash: now lives in core_clk inside the autoregress
+  // layer, watching mv_w_m_eff || mv_w_e_eff (the weight bus into the
+  // matvec engine).  Same hash function (rolling XOR with rotate)
+  // but at 40 MHz / 25 ns budget instead of 200 MHz / 5 ns — easy
+  // timing and closer to "what the LLM actually consumes".  Only the
+  // CDC into eth_clk for regmap exposure lives here at the top.
   // -------------------------------------------------------------------
-  wire [31:0] rdata_xor =
-        m_axi_rdata[ 31:  0] ^ m_axi_rdata[ 63: 32]
-      ^ m_axi_rdata[ 95: 64] ^ m_axi_rdata[127: 96]
-      ^ m_axi_rdata[159:128] ^ m_axi_rdata[191:160]
-      ^ m_axi_rdata[223:192] ^ m_axi_rdata[255:224]
-      ^ m_axi_rdata[287:256] ^ m_axi_rdata[319:288]
-      ^ m_axi_rdata[351:320] ^ m_axi_rdata[383:352]
-      ^ m_axi_rdata[415:384] ^ m_axi_rdata[447:416]
-      ^ m_axi_rdata[479:448] ^ m_axi_rdata[511:480];
-
-  reg [31:0] bfp_rdata_crc_ui;
-  always_ff @(posedge ui_clk) begin
-    if (ui_clk_sync_rst || crc_reset_ui) begin
-      bfp_rdata_crc_ui <= 32'hFFFFFFFF;
-    end else if (m_axi_rvalid && m_axi_rready) begin
-      // {rotl(crc, 1)} ^ word_xor — depth ~5 LUTs, fits 5 ns easily.
-      bfp_rdata_crc_ui <= {bfp_rdata_crc_ui[30:0], bfp_rdata_crc_ui[31]}
-                       ^ rdata_xor;
-    end
-  end
-
-  // CDC the CRC into eth_clk for regmap exposure.  Value is quasi-
-  // static after the autoregress completes (no more rvalid pulses);
-  // 2FF sync is safe.
+  wire [31:0] bfp_weight_hash_core;
   (* ASYNC_REG = "TRUE" *) reg [31:0] crc_sync1, crc_sync2;
   always_ff @(posedge eth_clk) begin
-    crc_sync1 <= bfp_rdata_crc_ui;
+    crc_sync1 <= bfp_weight_hash_core;
     crc_sync2 <= crc_sync1;
   end
   wire [31:0] bfp_rdata_crc_eth = crc_sync2;
@@ -1091,6 +1057,7 @@ module vc707_microgpt_eth (
     .start        ( bfp_start_r       ),
     .done         ( lay_done_core     ),
     .result_tokens( bfp_result_tokens ),
+    .weight_hash  ( bfp_weight_hash_core ),
     // DDR3 region base offsets (lbfp_ddr3.svh).
     .ws_base_WQ_m       ( `LBFP_BASE_WQ_M     ),
     .ws_base_WQ_e       ( `LBFP_BASE_WQ_E     ),

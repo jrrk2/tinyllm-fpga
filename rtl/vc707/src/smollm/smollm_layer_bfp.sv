@@ -109,7 +109,14 @@ module smollm_layer_bfp #(
   // Debug taps (synthesis-friendly — only used by sim testbench)
   output logic [6:0]                         dbg_state,
   output logic [11:0]                        dbg_cnt,
-  output logic [6:0]                         dbg_chunk
+  output logic [6:0]                         dbg_chunk,
+  // Comparative hash of every weight beat the matvec engine consumes
+  // from the streamer (mv_w_m_eff || mv_w_e_eff captured each cycle
+  // mv_valid && is_stream_matvec).  Resets on `start` rising edge.
+  // 384-bit input per cycle, ~3 LUT levels of XOR-tree at 40 MHz — fits
+  // core_clk's 25 ns budget trivially.  Useful for cross-run comparison:
+  // hash(Python upload) vs hash(C++ upload).
+  output logic [31:0]                        weight_hash
 );
 
   // ---------------------------------------------------------------------------
@@ -529,6 +536,25 @@ module smollm_layer_bfp #(
         default: ;  // hold through DRIVE / DRAIN / REQ / NEXT
       endcase
     end
+  end
+
+  // Comparative hash on the streamed weight bus.  Folds 256 + 128 =
+  // 384 bits (mv_w_m_eff || mv_w_e_eff) into a 32-bit accumulator
+  // each cycle the engine is consuming streamer-sourced data.  Each
+  // 32-bit chunk of the bus is XOR-tree'd into the accumulator after a
+  // 1-bit rotate so order matters.  Resets when `start` is asserted
+  // (one new run per restart).
+  wire [31:0] mv_w_xor =
+        mv_w_m_eff[ 31:  0] ^ mv_w_m_eff[ 63: 32]
+      ^ mv_w_m_eff[ 95: 64] ^ mv_w_m_eff[127: 96]
+      ^ mv_w_m_eff[159:128] ^ mv_w_m_eff[191:160]
+      ^ mv_w_m_eff[223:192] ^ mv_w_m_eff[255:224]
+      ^ mv_w_e_eff[ 31:  0] ^ mv_w_e_eff[ 63: 32]
+      ^ mv_w_e_eff[ 95: 64] ^ mv_w_e_eff[127: 96];
+  always_ff @(posedge clk) begin
+    if (rst || start) weight_hash <= 32'hFFFFFFFF;
+    else if (mv_valid && is_stream_matvec)
+      weight_hash <= {weight_hash[30:0], weight_hash[31]} ^ mv_w_xor;
   end
 
   matvec_bfp_engine #(.LANES(LANES)) i_mv (

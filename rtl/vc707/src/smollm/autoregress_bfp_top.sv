@@ -38,6 +38,7 @@ module autoregress_bfp_top #(
   input  wire                          start,
   output logic                         done,
   output logic [N_STEPS*16-1:0]        result_tokens,
+  output wire  [31:0]                  weight_hash,
   // Layer-0 / region base offsets — caller patches in lbfp_ddr3.svh
   // constants.  Ignored when neither stream is enabled.
   input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WQ_m,
@@ -198,6 +199,7 @@ module autoregress_bfp_top #(
     .hidden_in_m(lay_in_m), .hidden_in_e(lay_in_e),
     .hidden_out_m(lay_out_m), .hidden_out_e(lay_out_e),
     .done(lay_done),
+    .weight_hash(weight_hash),
     .ws_base_WQ_m(ws_base_WQ_m),   .ws_base_WQ_e(ws_base_WQ_e),
     .ws_base_WK_m(ws_base_WK_m),   .ws_base_WK_e(ws_base_WK_e),
     .ws_base_WV_m(ws_base_WV_m),   .ws_base_WV_e(ws_base_WV_e),

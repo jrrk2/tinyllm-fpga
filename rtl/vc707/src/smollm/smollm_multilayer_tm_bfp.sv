@@ -37,6 +37,7 @@ module smollm_multilayer_tm_bfp #(
   output logic signed [D*BFP_MANT_W-1:0]            hidden_out_m,
   output logic signed [(D/BFP_TILE)*BFP_EXP_W-1:0]  hidden_out_e,
   output logic                                      done,
+  output wire  [31:0]                               weight_hash,
   // DDR3 streamer ports.  Layer-0 base addresses for each weight
   // matrix — this module derives per-layer bases as `base + lay_idx
   // × W?_*_PL` internally.
@@ -174,7 +175,8 @@ module smollm_multilayer_tm_bfp #(
     .m_axi_rdata  (m_axi_rdata),
     .m_axi_rresp  (m_axi_rresp),
     .m_axi_rlast  (m_axi_rlast),
-    .dbg_state(ignore_state), .dbg_cnt(ignore_cnt), .dbg_chunk(ignore_chunk)
+    .dbg_state(ignore_state), .dbg_cnt(ignore_cnt), .dbg_chunk(ignore_chunk),
+    .weight_hash(weight_hash)
   );
 
   // ---------------------------------------------------------------------------
