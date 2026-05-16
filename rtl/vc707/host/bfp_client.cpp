@@ -32,6 +32,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -78,6 +79,8 @@ constexpr uint16_t REG_DDR_WR_RX     = 0x019;   // FT_DDR_WRITE frames accepted
 constexpr uint16_t REG_DDR_WR_DONE   = 0x01A;   // ddr_wr_req toggles (writes dispatched)
 constexpr uint16_t REG_DDR_WR_ACK    = 0x01B;   // MIG ack toggles seen
 constexpr uint16_t REG_DDR_WR_TX     = 0x01C;   // FT_ACK frames dispatched back
+constexpr uint16_t REG_HAS_RUN       = 0x049;   // bit 0: single-shot run complete
+constexpr uint16_t REG_RDATA_CRC     = 0x04A;   // CRC32 over BFP master's R beats
 constexpr uint16_t REG_BUILD_VERSION = 0x10F;
 constexpr uint16_t REG_RESULT        = 0x1D0;
 constexpr uint16_t REG_DONE          = 0x1F0;   // {30'd0, lay_done_latched, lay_done}
@@ -742,6 +745,137 @@ std::string decode_tokens(const Vocab& v, const std::vector<uint16_t>& tokens) {
 }
 
 // ---------------------------------------------------------------------
+// Subcommand: verify-sampled
+// ---------------------------------------------------------------------
+// Sample N random AR/R pairs from the BFP autoregress's natural DDR3
+// read traffic (via the re-armable snapshot at 0x048 / 0x012 /
+// 0x013 / 0x014..0x023) and compare each 64-byte burst beat against
+// the local weight image.  The autoregress is in a perpetual loop, so
+// each arm catches whatever read it issues next — over many samples
+// we cover the bulk of the weight address space.
+//
+// IMPORTANT: the current snapshot captures the first AR and first R
+// AFTER arm independently; the streamer uses bursts up to 256 beats
+// with arid=0, so a captured (araddr, rdata) pair is only correlated
+// when we arm during an idle window between bursts.  Mid-burst arms
+// produce desync'd pairs that LOOK like mismatches.  Run the verify
+// against Python-uploaded DDR3 first to measure the noise floor, then
+// against C++-uploaded DDR3 — a significant divergence is real
+// corruption; a similar mismatch rate is just AR/R desync.
+struct VerifySample {
+    uint32_t addr;
+    std::array<uint8_t, 64> rdata;
+    bool matches;
+};
+
+int verify_sampled(Udp& u, const std::string& path, int n_samples) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("cannot open " + path);
+    std::streamsize n_bytes = f.tellg();
+    f.seekg(0);
+    std::vector<uint8_t> blob(static_cast<size_t>(n_bytes));
+    if (!f.read(reinterpret_cast<char*>(blob.data()), n_bytes))
+        throw std::runtime_error("read failed");
+
+    std::printf("[verify] %d samples against %s (%lld bytes)\n",
+                n_samples, path.c_str(), (long long)n_bytes);
+
+    int matched = 0, mismatched = 0, oob = 0, timeouts = 0;
+    std::vector<VerifySample> mismatch_log;
+
+    uint8_t seq = 100;
+    for (int i = 0; i < n_samples; ++i) {
+        // Arm: any write to 0x048 toggles the arm flop.
+        reg_write(u, 0x048, 1, seq++);
+        // Poll status until ar_seen AND r_seen both set.
+        auto deadline = std::chrono::steady_clock::now()
+                      + std::chrono::milliseconds(500);
+        uint32_t status = 0;
+        while (std::chrono::steady_clock::now() < deadline) {
+            status = reg_read(u, REG_DBG_STATUS, 1, seq++)[0];
+            if (((status >> 1) & 1) && ((status >> 2) & 1)) break;
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+        if (!(((status >> 1) & 1) && ((status >> 2) & 1))) {
+            ++timeouts;
+            continue;
+        }
+        // Fetch addr + 16 words of rdata (0x013, 0x014..0x023).
+        uint32_t addr = reg_read(u, REG_DBG_ARADDR, 1, seq++)[0] & 0x3fffffff;
+        auto words = reg_read(u, REG_DBG_RDATA0, 16, seq++);
+        if (words.size() != 16) { ++timeouts; continue; }
+        std::array<uint8_t, 64> got{};
+        for (int j = 0; j < 16; ++j)
+            std::memcpy(&got[j * 4], &words[j], 4);
+
+        if ((size_t)addr + 64 > blob.size()) { ++oob; continue; }
+        // Trustworthy byte ranges: regmap addrs 0x014..0x016 + 0x01D..0x023
+        // are pure dbg_first_rdata; 0x017..0x01C are other diagnostic
+        // registers (ila / eth_ring / ddr_wr_*) and steal slots within
+        // the rdata window.  So bytes 0..11 (words 0..2) and bytes 36..63
+        // (words 9..15) are clean; bytes 12..35 (words 3..8) are noise.
+        // Total trustworthy: 12 + 28 = 40 of 64 bytes per sample.
+        bool match_lo = std::memcmp(&got[0],  blob.data() + addr,      12) == 0;
+        bool match_hi = std::memcmp(&got[36], blob.data() + addr + 36, 28) == 0;
+        bool match = match_lo && match_hi;
+        if (match) ++matched; else {
+            ++mismatched;
+            if (mismatch_log.size() < 8)
+                mismatch_log.push_back({addr, got, false});
+        }
+
+        if ((i + 1) % 100 == 0) {
+            std::printf("  %5d/%-5d  matched=%d  mismatched=%d  "
+                        "timeouts=%d  oob=%d\r",
+                        i + 1, n_samples, matched, mismatched, timeouts, oob);
+            std::fflush(stdout);
+        }
+    }
+    std::printf("\n[verify] done: %d/%d matched (%.1f%%), "
+                "%d mismatched, %d timeouts, %d out-of-range\n",
+                matched, n_samples, 100.0 * matched / std::max(1, n_samples),
+                mismatched, timeouts, oob);
+
+    if (!mismatch_log.empty()) {
+        std::printf("[verify] first %zu mismatches (showing trustworthy bytes only):\n",
+                    mismatch_log.size());
+        for (auto& s : mismatch_log) {
+            std::printf("  addr 0x%08x:\n    bytes 0..11  expected", s.addr);
+            for (int j = 0; j < 12; ++j) std::printf(" %02x", blob[s.addr + j]);
+            std::printf("\n                 got     ");
+            for (int j = 0; j < 12; ++j) std::printf(" %02x", s.rdata[j]);
+            std::printf("\n    bytes 36..63 expected");
+            for (int j = 36; j < 64; ++j) std::printf(" %02x", blob[s.addr + j]);
+            std::printf("\n                 got     ");
+            for (int j = 36; j < 64; ++j) std::printf(" %02x", s.rdata[j]);
+            std::printf("\n");
+        }
+    }
+    return mismatched == 0 ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------
+// Subcommand: read-crc
+// ---------------------------------------------------------------------
+// Reads the FPGA's accumulated CRC32 over every 512-bit AXI rdata beat
+// the BFP master has seen since the last restart pulse.  After a
+// single-shot autoregress run completes (has_run=1), the value is
+// stable and represents a hash of *exactly the data the LLM consumed*.
+//
+// Compare across runs:
+//   - Same CRC after Python vs C++ upload ⇒ both uploads delivered
+//     byte-identical data to the autoregress's view; any token
+//     divergence is downstream of DDR3.
+//   - Different CRC ⇒ DDR3 contents really differ between the two
+//     upload paths even where verify-sampled couldn't see it.
+void print_crc(Udp& u) {
+    uint32_t status = reg_read(u, REG_HAS_RUN, 1, 60)[0];
+    uint32_t crc    = reg_read(u, REG_RDATA_CRC, 1, 61)[0];
+    std::printf("has_run = %u\n", status & 1);
+    std::printf("CRC32   = 0x%08x\n", crc);
+}
+
+// ---------------------------------------------------------------------
 // Subcommand: tokens
 // ---------------------------------------------------------------------
 std::vector<uint16_t> fetch_tokens(Udp& u, int n_steps) {
@@ -800,9 +934,16 @@ void usage() {
         "                     /24 around -p's IP (default %s) if not found\n"
         "  upload  <bin>      bulk-write the weight image to DDR3 base 0\n"
         "  verify  <bin>      restart, capture first AR, compare 64 B\n"
+        "  verify-sampled <bin> [-N count]\n"
+        "                     sample N (default 1000) random reads from the\n"
+        "                     autoregress's natural DDR3 traffic and compare\n"
+        "                     each to <bin>.  Note: bursts cause AR/R desync\n"
+        "                     mismatches; measure noise floor first.\n"
         "  restart            pulse restart, poll until done (or 60 s)\n"
         "  tokens             read 10 result words from 0x1D0\n"
         "                     (with -v: also print decoded text)\n"
+        "  read-crc           read FPGA CRC32 of every AXI rdata beat the\n"
+        "                     BFP master has seen since last restart\n"
         "  all     <bin>      upload → verify → restart → tokens\n",
         FPGA_MAC, DEFAULT_PEER_IP);
 }
@@ -820,6 +961,7 @@ int main(int argc, char** argv) {
     double      target_mbps = 2.0;     // matches Python's measured 1.96 MB/s
     int         backlog_limit = 32;    // pause sender when parser→MIG backlog > this
     int         n_steps    = N_STEPS_DEFAULT;
+    int         verify_count = 1000;   // -N for verify-sampled
 
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-') {
@@ -847,6 +989,8 @@ int main(int argc, char** argv) {
             }
         } else if (a == "-B" && argi + 1 < argc) {
             backlog_limit = std::atoi(argv[++argi]);
+        } else if (a == "-N" && argi + 1 < argc) {
+            verify_count = std::atoi(argv[++argi]);
         } else if (a == "-n" && argi + 1 < argc) {
             n_steps = std::atoi(argv[++argi]);
             if (n_steps < 1 || n_steps > N_STEPS_MAX) {
@@ -921,6 +1065,10 @@ int main(int argc, char** argv) {
             if (argi >= argc) { usage(); return 2; }
             return verify_first_read(u, argv[argi]) ? 0 : 1;
         }
+        if (cmd == "verify-sampled") {
+            if (argi >= argc) { usage(); return 2; }
+            return verify_sampled(u, argv[argi], verify_count);
+        }
         if (cmd == "restart") {
             bool ok = restart_and_wait_done(u);
             std::printf("[restart] %s\n", ok ? "done" : "TIMEOUT");
@@ -928,6 +1076,10 @@ int main(int argc, char** argv) {
         }
         if (cmd == "tokens") {
             print_tokens(u, vocab.get(), n_steps);
+            return 0;
+        }
+        if (cmd == "read-crc") {
+            print_crc(u);
             return 0;
         }
         if (cmd == "all") {
@@ -952,6 +1104,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             print_tokens(u, vocab.get(), n_steps);
+            print_crc(u);
             return 0;
         }
 

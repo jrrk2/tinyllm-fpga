@@ -781,13 +781,22 @@ module vc707_microgpt_eth (
   always_ff @(posedge ui_clk) arm_sync_ui <= {arm_sync_ui[1:0], axi_snap_arm_eth};
   wire arm_edge_ui = arm_sync_ui[2] ^ arm_sync_ui[1];
 
+  // Same pattern for the restart toggle (lay_rst_tog_eth) so both the
+  // snapshot and the CRC also reset at the start of a new autoregress
+  // run (host write to 0x1F1).
+  (* ASYNC_REG = "TRUE" *) reg [2:0] restart_sync_ui;
+  always_ff @(posedge ui_clk) restart_sync_ui <= {restart_sync_ui[1:0], lay_rst_tog_eth};
+  wire restart_edge_ui = restart_sync_ui[2] ^ restart_sync_ui[1];
+
+  wire crc_reset_ui = arm_edge_ui | restart_edge_ui;
+
   // Sampler proper: lives in ui_clk domain alongside the AXI bus.
   reg [29:0]  snap_araddr_ui = '0;
   reg [511:0] snap_rdata_ui  = '0;
   reg         snap_ar_seen_ui = 1'b0;
   reg         snap_r_seen_ui  = 1'b0;
   always_ff @(posedge ui_clk) begin
-    if (ui_clk_sync_rst || arm_edge_ui) begin
+    if (ui_clk_sync_rst || crc_reset_ui) begin
       snap_ar_seen_ui <= 1'b0;
       snap_r_seen_ui  <= 1'b0;
     end else begin
@@ -820,6 +829,66 @@ module vc707_microgpt_eth (
   assign dbg_first_rdata    = snap_rdata_sync2;
   assign dbg_first_ar_seen  = snap_ar_seen_sync[1];
   assign dbg_first_r_seen   = snap_r_seen_sync[1];
+
+  // -------------------------------------------------------------------
+  // CRC32 accumulator on the BFP AXI master's R channel.
+  //
+  // Resets on the same edge as the snapshot arm (the lay_restart toggle
+  // CDC'd into ui_clk).  Accumulates over every 512-bit rdata beat the
+  // master receives.  After a single-shot autoregress run completes,
+  // the value is stable and exposed via regmap 0x04A.
+  //
+  // Diagnostic use: compare hash across uploads.  Identical CRCs ⇒ the
+  // FPGA literally read the same byte sequence in both runs ⇒ DDR3
+  // contents are functionally identical from the autoregress's view.
+  // -------------------------------------------------------------------
+  function automatic [31:0] crc32_step_8 (input [31:0] crc_in,
+                                          input [7:0]  data_byte);
+    reg [31:0] c;
+    integer    i;
+    begin
+      c = crc_in ^ {24'h0, data_byte};
+      for (i = 0; i < 8; i = i + 1)
+        c = c[0] ? (c >> 1) ^ 32'hEDB88320 : (c >> 1);
+      crc32_step_8 = c;
+    end
+  endfunction
+
+  function automatic [31:0] crc32_step_512 (input [31:0]  crc_in,
+                                            input [511:0] data);
+    reg [31:0] c;
+    integer    i;
+    begin
+      c = crc_in;
+      for (i = 0; i < 64; i = i + 1)
+        c = crc32_step_8(c, data[i*8 +: 8]);
+      crc32_step_512 = c;
+    end
+  endfunction
+
+  reg [31:0] bfp_rdata_crc_ui;
+  always_ff @(posedge ui_clk) begin
+    if (ui_clk_sync_rst || crc_reset_ui) begin
+      bfp_rdata_crc_ui <= 32'hFFFFFFFF;
+    end else if (m_axi_rvalid && m_axi_rready) begin
+      bfp_rdata_crc_ui <= crc32_step_512(bfp_rdata_crc_ui, m_axi_rdata);
+    end
+  end
+
+  // CDC the CRC into eth_clk for regmap exposure.  Value is quasi-
+  // static after the autoregress completes (no more rvalid pulses);
+  // 2FF sync is safe.
+  (* ASYNC_REG = "TRUE" *) reg [31:0] crc_sync1, crc_sync2;
+  always_ff @(posedge eth_clk) begin
+    crc_sync1 <= bfp_rdata_crc_ui;
+    crc_sync2 <= crc_sync1;
+  end
+  wire [31:0] bfp_rdata_crc_eth = crc_sync2;
+
+  // has_run is in core_clk; sync to eth_clk for the regmap status bit.
+  (* ASYNC_REG = "TRUE" *) reg [1:0] has_run_sync;
+  always_ff @(posedge eth_clk) has_run_sync <= {has_run_sync[0], has_run};
+  wire has_run_eth = has_run_sync[1];
   assign dbg_eng_w_packed   = '0;
   assign dbg_wd_packed      = '0;
   assign dbg_in_value_packed= '0;
@@ -972,17 +1041,28 @@ module vc707_microgpt_eth (
   localparam int LBFP_NSTEPS = `LBFP_FULL_NPROMPT + `LBFP_FULL_NGEN;   // 19
   wire [LBFP_NSTEPS*16-1:0] bfp_result_tokens;
 
-  // One-shot start: assert after reset / restart and hold until `done`.
-  // The autoregress FSM only samples start in S_IDLE, so a level-held
-  // signal is fine.
+  // Single-shot start: exactly one autoregress run per (reset OR restart
+  // pulse).  Earlier perpetual auto-restart hammered MIG with reads
+  // during uploads, contended with ddr_wr_master, and made it hard to
+  // know whether a given run's result_tokens reflected fully-uploaded
+  // weights or a mid-upload snapshot.  has_run latches at lay_done and
+  // suppresses re-fire until the next restart pulse clears it.
   reg bfp_start_r;
+  reg has_run;
   always_ff @(posedge core_clk) begin
-    if (~core_resetn | lay_restart_core) begin
+    if (~core_resetn) begin
       bfp_start_r <= 1'b0;
-    end else if (!lay_done_core) begin
-      bfp_start_r <= 1'b1;
+      has_run     <= 1'b0;
+    end else if (lay_restart_core) begin
+      bfp_start_r <= 1'b0;
+      has_run     <= 1'b0;       // re-arm for next run
+    end else if (lay_done_core) begin
+      bfp_start_r <= 1'b0;
+      has_run     <= 1'b1;       // run complete — stay parked
+    end else if (!has_run) begin
+      bfp_start_r <= 1'b1;       // pre-completion: start signal held high
     end else begin
-      bfp_start_r <= 1'b0;
+      bfp_start_r <= 1'b0;       // post-completion: idle
     end
   end
 
@@ -1602,6 +1682,15 @@ module vc707_microgpt_eth (
       // Depth = (nextbuf - firstbuf) & 31; saturation at lastbuf means
       // the eth FIFO has stalled and incoming frames are being refused.
       10'h018: read_data_comb = {17'd0, fr_lastbuf, fr_nextbuf, fr_firstbuf};
+      // 0x049 [0] has_run — set when the single-shot autoregress run
+      //              has completed since last restart pulse; cleared
+      //              by writing to 0x1F1 (regular restart).
+      // 0x04A [31:0] bfp_rdata_crc — CRC32 of every 512-bit AXI rdata
+      //              beat seen by the BFP master since the last restart
+      //              pulse.  Compare across uploads as a cheap proof
+      //              that the autoregress saw byte-identical data.
+      10'h049: read_data_comb = {31'd0, has_run_eth};
+      10'h04A: read_data_comb = bfp_rdata_crc_eth;
       // 0x019..0x01C: DDR3 write-path stage counters (eth_clk domain).
       //   0x019 ddr_wr_rx_count   = FT_DDR_WRITE frames accepted by parser
       //   0x01A ddr_wr_done_count = ddr_wr_req toggles (write dispatched)
