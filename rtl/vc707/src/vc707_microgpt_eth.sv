@@ -129,8 +129,16 @@ module vc707_microgpt_eth (
     .phy_mdio_oe    ( phy_mdio_oe       ),
     .phy_mdc        ( eth_mdc           ),
     .eth_irq        ( eth_irq           ),
-    .eth_clk_o      ( eth_clk           )
+    .eth_clk_o      ( eth_clk           ),
+    .dbg_firstbuf   ( fr_firstbuf       ),
+    .dbg_nextbuf    ( fr_nextbuf        ),
+    .dbg_lastbuf    ( fr_lastbuf        )
   );
+  wire [4:0] fr_firstbuf;
+  wire [4:0] fr_nextbuf;
+  wire [4:0] fr_lastbuf;
+  // No CDC: framing_top's msoc_clk IS eth_clk_o, and the JTAG regmap
+  // dispatch already runs in eth_clk, so fr_*_buf are sampled in-domain.
 
   // ----- Reset sync into eth_clk (125 MHz) domain
   logic [3:0] eth_rst_sr = 4'hF;
@@ -749,11 +757,69 @@ module vc707_microgpt_eth (
   wire [4:0] ila_ml_layer_idx;
 
 `ifndef MICROGPT_LAYER_DEBUG
-  // No-debug build: tie off all dbg/ila wires so regmap reads return 0.
-  assign dbg_first_araddr   = '0;
-  assign dbg_first_rdata    = '0;
-  assign dbg_first_ar_seen  = 1'b0;
-  assign dbg_first_r_seen   = 1'b0;
+  // Re-armable BFP AXI-master sampler.  Watches the top-level AXI
+  // master (which carries embed_lookup + smollm_layer + decode_head
+  // reads, all merged); captures the first AR address and the first
+  // R data after the arm flop toggles.  Host arms via regmap *write*
+  // to 0x048 (any value) and reads back at 0x013 (addr) and
+  // 0x014..0x023 (16 × 32-bit words = 512-bit rdata).  Status flags
+  // appear at 0x012 [1] = ar_seen, [2] = r_seen.
+  reg axi_snap_arm_eth = 1'b0;
+  always_ff @(posedge eth_clk) begin
+    if (~core_resetn) begin
+      axi_snap_arm_eth <= 1'b0;
+    end else if (jtag_master_write && jtag_word_addr == 10'h048) begin
+      // Edge-pulse: any write to 0x048 toggles the arm flop, which
+      // crosses CDC into ui_clk and clears the snapshot.  Pick an
+      // address outside the dbg_eng_w / dbg_wd packed-read ranges
+      // (0x024-0x043 are taken on the read side).
+      axi_snap_arm_eth <= ~axi_snap_arm_eth;
+    end
+  end
+  // CDC: toggle-based sync into ui_clk (where the BFP AXI master is).
+  (* ASYNC_REG = "TRUE" *) reg [2:0] arm_sync_ui;
+  always_ff @(posedge ui_clk) arm_sync_ui <= {arm_sync_ui[1:0], axi_snap_arm_eth};
+  wire arm_edge_ui = arm_sync_ui[2] ^ arm_sync_ui[1];
+
+  // Sampler proper: lives in ui_clk domain alongside the AXI bus.
+  reg [29:0]  snap_araddr_ui = '0;
+  reg [511:0] snap_rdata_ui  = '0;
+  reg         snap_ar_seen_ui = 1'b0;
+  reg         snap_r_seen_ui  = 1'b0;
+  always_ff @(posedge ui_clk) begin
+    if (ui_clk_sync_rst || arm_edge_ui) begin
+      snap_ar_seen_ui <= 1'b0;
+      snap_r_seen_ui  <= 1'b0;
+    end else begin
+      if (m_axi_arvalid && m_axi_arready && !snap_ar_seen_ui) begin
+        snap_araddr_ui  <= m_axi_araddr;
+        snap_ar_seen_ui <= 1'b1;
+      end
+      if (m_axi_rvalid && m_axi_rready && !snap_r_seen_ui) begin
+        snap_rdata_ui  <= m_axi_rdata;
+        snap_r_seen_ui <= 1'b1;
+      end
+    end
+  end
+  // CDC the captured values back to eth_clk for the regmap.  Address
+  // + data are quasi-static (only change once per arm cycle), so 2FF
+  // sync is safe; the seen-flags are sticky until next arm, so toggle
+  // detection isn't needed.
+  (* ASYNC_REG = "TRUE" *) reg [29:0]  snap_araddr_sync1, snap_araddr_sync2;
+  (* ASYNC_REG = "TRUE" *) reg [511:0] snap_rdata_sync1,  snap_rdata_sync2;
+  (* ASYNC_REG = "TRUE" *) reg [1:0]   snap_ar_seen_sync, snap_r_seen_sync;
+  always_ff @(posedge eth_clk) begin
+    snap_araddr_sync1 <= snap_araddr_ui;
+    snap_araddr_sync2 <= snap_araddr_sync1;
+    snap_rdata_sync1  <= snap_rdata_ui;
+    snap_rdata_sync2  <= snap_rdata_sync1;
+    snap_ar_seen_sync <= {snap_ar_seen_sync[0], snap_ar_seen_ui};
+    snap_r_seen_sync  <= {snap_r_seen_sync[0],  snap_r_seen_ui};
+  end
+  assign dbg_first_araddr   = snap_araddr_sync2;
+  assign dbg_first_rdata    = snap_rdata_sync2;
+  assign dbg_first_ar_seen  = snap_ar_seen_sync[1];
+  assign dbg_first_r_seen   = snap_r_seen_sync[1];
   assign dbg_eng_w_packed   = '0;
   assign dbg_wd_packed      = '0;
   assign dbg_in_value_packed= '0;
@@ -1529,6 +1595,13 @@ module vc707_microgpt_eth (
       //       [27:17] ila_cnt
       10'h017: read_data_comb = {4'd0, ila_cnt, ila_mv_phase, ila_state,
                                  lay_done_core, ila_ml_layer_idx, ila_ml_state};
+      // 0x018: framing_top ring-buffer pointers between MAC and parser.
+      //   [4:0]   firstbuf  (read pointer, advanced after parse)
+      //   [9:5]   nextbuf   (write pointer, advanced by MAC)
+      //   [14:10] lastbuf   (configured max depth)
+      // Depth = (nextbuf - firstbuf) & 31; saturation at lastbuf means
+      // the eth FIFO has stalled and incoming frames are being refused.
+      10'h018: read_data_comb = {17'd0, fr_lastbuf, fr_nextbuf, fr_firstbuf};
       // 0x019..0x01C: DDR3 write-path stage counters (eth_clk domain).
       //   0x019 ddr_wr_rx_count   = FT_DDR_WRITE frames accepted by parser
       //   0x01A ddr_wr_done_count = ddr_wr_req toggles (write dispatched)
