@@ -18,7 +18,6 @@ module smollm_decode_head_bfp #(
   parameter int D     = 576,
   parameter int VOCAB = 49152,         // assumed LANES-aligned (baker pads)
   parameter     PREFIX = "lbfp_full_",
-  parameter bit STREAM_WEIGHTS = 1'b0,
   parameter int AXI_ADDR_WIDTH = 30,
   parameter int AXI_ID_WIDTH   = 5
 )(
@@ -29,10 +28,10 @@ module smollm_decode_head_bfp #(
   input  wire signed [(D/BFP_TILE)*BFP_EXP_W-1:0]   hidden_in_e,
   output logic [15:0]                               token_out,
   output logic                                      done,
-  // DDR3 streamer interface (active iff STREAM_WEIGHTS=1).  The EMBED
-  // matrix is wide-packed exactly like a W?_* weight matrix, so it
-  // reuses weight_streamer_bfp_mt with the same chunk_idx (=chunk) and
-  // in_dim=D semantics.  Norm gamma stays on-chip BRAM.
+  // DDR3 streamer interface.  The EMBED matrix is wide-packed exactly
+  // like a W?_* weight matrix, so it reuses weight_streamer_bfp_mt
+  // with the same chunk_idx (=chunk) and in_dim=D semantics.  Norm
+  // gamma stays on-chip BRAM.
   input  wire [AXI_ADDR_WIDTH-1:0]                  ws_base_EMBED_m,
   input  wire [AXI_ADDR_WIDTH-1:0]                  ws_base_EMBED_e,
   input  wire                                       clk_axi,
@@ -66,17 +65,6 @@ module smollm_decode_head_bfp #(
   (* ram_style = "block" *) logic signed [BFP_MANT_W-1:0] rom_NW_m [0:D-1];
   (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] rom_NW_e [0:NT_D-1];
 
-  // ---------------------------------------------------------------------------
-  // EMBED (used as lm_head via tied embeddings).  Wide-packed BRAM
-  // (3072 × 256-b mantissa entries + 3072 × 128-b exp entries ≈ 1 Mb)
-  // — but only needed in STREAM_WEIGHTS=0 mode.  Gated behind a
-  // `generate if` so the array literally doesn't exist in stream
-  // mode, avoiding Vivado's "infer 3456 RAMB36" trap on 1.77 M-deep
-  // arrays.
-  // ---------------------------------------------------------------------------
-  localparam int LANE_M_W = LANES * BFP_MANT_W;
-  localparam int LANE_E_W = LANES * BFP_EXP_W;
-
   // norm_w always BRAM-loaded (tiny: 576 × 2 B + 36 B).
 `ifdef MICROGPT_WEIGHT_DIR
   initial begin
@@ -89,23 +77,6 @@ module smollm_decode_head_bfp #(
     $readmemh({PREFIX, "NORM_W_e.hex"}, rom_NW_e);
   end
 `endif
-
-  // EMBED ROM only when STREAM_WEIGHTS=0.
-  generate if (!STREAM_WEIGHTS) begin : g_embed_rom
-    (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_EMBED_m [0:CHUNKS_VOCAB*D-1];
-    (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_EMBED_e [0:CHUNKS_VOCAB*NT_D-1];
-`ifdef MICROGPT_WEIGHT_DIR
-    initial begin
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "EMBED_m.hex"}, rom_EMBED_m);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "EMBED_e.hex"}, rom_EMBED_e);
-    end
-`else
-    initial begin
-      $readmemh({PREFIX, "EMBED_m.hex"}, rom_EMBED_m);
-      $readmemh({PREFIX, "EMBED_e.hex"}, rom_EMBED_e);
-    end
-`endif
-  end endgenerate
 
   // ---------------------------------------------------------------------------
   // Latched hidden_in (BRAM-style)
@@ -156,19 +127,16 @@ module smollm_decode_head_bfp #(
   logic                                       mv_eng_rst;
   logic signed [BFP_MANT_W-1:0]               mv_x_m;
   logic signed [BFP_EXP_W -1:0]               mv_x_e;
-  logic signed [LANES*BFP_MANT_W-1:0]         mv_w_m;
-  logic signed [LANES*BFP_EXP_W -1:0]         mv_w_e;
   wire  signed [LANES*BFP_MANT_W-1:0]         mv_out_m;
   wire  signed [LANES*BFP_EXP_W -1:0]         mv_out_e;
   wire                                        mv_out_valid;
 
-  // mv_w_*_eff — comb mux selecting streamer outputs in streaming mode.
   wire signed [LANES*BFP_MANT_W-1:0]          mv_w_m_eff;
   wire signed [LANES*BFP_EXP_W -1:0]          mv_w_e_eff;
   wire        [255:0]                         ws_weight_m_out;
   wire        [127:0]                         ws_weight_e_out;
-  assign mv_w_m_eff = STREAM_WEIGHTS ? $signed(ws_weight_m_out) : mv_w_m;
-  assign mv_w_e_eff = STREAM_WEIGHTS ? $signed(ws_weight_e_out) : mv_w_e;
+  assign mv_w_m_eff = $signed(ws_weight_m_out);
+  assign mv_w_e_eff = $signed(ws_weight_e_out);
 
   matvec_bfp_engine #(.LANES(LANES)) i_mv (
     .clk(clk), .rst(rst | mv_eng_rst),
@@ -180,7 +148,7 @@ module smollm_decode_head_bfp #(
   );
 
   // ---------------------------------------------------------------------------
-  // DDR3 weight streamer (EMBED matrix, used iff STREAM_WEIGHTS=1).
+  // DDR3 weight streamer (EMBED matrix).
   // chunk_idx = layer FSM `chunk`, in_dim = D.
   // ---------------------------------------------------------------------------
   logic                             ws_load_req;
@@ -193,73 +161,48 @@ module smollm_decode_head_bfp #(
   always_comb ws_rd_col  = cnt;
   always_comb ws_rd_tile = cnt >> 4;
 
-  generate
-    if (STREAM_WEIGHTS) begin : g_stream
-      weight_streamer_bfp_mt #(
-        .AXI_DATA_WIDTH (512),
-        .AXI_ADDR_WIDTH (AXI_ADDR_WIDTH),
-        .AXI_ID_WIDTH   (AXI_ID_WIDTH),
-        .IN_DIM_MAX     (D),
-        .IN_DIM_BITS    (12),
-        .CHUNK_BITS     ($clog2(CHUNKS_VOCAB > 0 ? CHUNKS_VOCAB : 1))
-      ) i_ws (
-        .clk_core      (clk),
-        .rst_core      (rst),
-        .matrix_base_m (ws_base_EMBED_m),
-        .matrix_base_e (ws_base_EMBED_e),
-        .chunk_idx     (chunk),
-        .in_dim        (12'(D)),
-        .in_dim_tiles  (12'(NT_D)),
-        .load_req      (ws_load_req),
-        .ready         (ws_ready),
-        .busy          (ws_busy_unused),
-        .rd_col        (ws_rd_col),
-        .weight_m_out  (ws_weight_m_out),
-        .rd_tile       (ws_rd_tile),
-        .weight_e_out  (ws_weight_e_out),
-        .clk_axi       (clk_axi),
-        .rst_axi       (rst_axi),
-        .m_axi_arvalid (m_axi_arvalid),
-        .m_axi_arready (m_axi_arready),
-        .m_axi_arid    (m_axi_arid),
-        .m_axi_araddr  (m_axi_araddr),
-        .m_axi_arlen   (m_axi_arlen),
-        .m_axi_arsize  (m_axi_arsize),
-        .m_axi_arburst (m_axi_arburst),
-        .m_axi_arlock  (m_axi_arlock),
-        .m_axi_arcache (m_axi_arcache),
-        .m_axi_arprot  (m_axi_arprot),
-        .m_axi_arqos   (m_axi_arqos),
-        .m_axi_rvalid  (m_axi_rvalid),
-        .m_axi_rready  (m_axi_rready),
-        .m_axi_rid     (m_axi_rid),
-        .m_axi_rdata   (m_axi_rdata),
-        .m_axi_rresp   (m_axi_rresp),
-        .m_axi_rlast   (m_axi_rlast)
-      );
-    end else begin : g_no_stream
-      assign m_axi_arvalid = 1'b0;
-      assign m_axi_arid    = '0;
-      assign m_axi_araddr  = '0;
-      assign m_axi_arlen   = '0;
-      assign m_axi_arsize  = 3'd6;
-      assign m_axi_arburst = 2'b01;
-      assign m_axi_arlock  = 1'b0;
-      assign m_axi_arcache = 4'b0011;
-      assign m_axi_arprot  = 3'b000;
-      assign m_axi_arqos   = 4'b0000;
-      assign m_axi_rready  = 1'b1;
-      assign ws_weight_m_out = '0;
-      assign ws_weight_e_out = '0;
-      assign ws_ready        = 1'b1;
-      assign ws_busy_unused  = 1'b0;
-      /* verilator lint_off UNUSEDSIGNAL */
-      wire _unused_axi = &{1'b0, m_axi_arready, m_axi_rvalid, m_axi_rid,
-                           m_axi_rdata, m_axi_rresp, m_axi_rlast, clk_axi,
-                           rst_axi, ws_base_EMBED_m, ws_base_EMBED_e, 1'b0};
-      /* verilator lint_on UNUSEDSIGNAL */
-    end
-  endgenerate
+  weight_streamer_bfp_mt #(
+    .AXI_DATA_WIDTH (512),
+    .AXI_ADDR_WIDTH (AXI_ADDR_WIDTH),
+    .AXI_ID_WIDTH   (AXI_ID_WIDTH),
+    .IN_DIM_MAX     (D),
+    .IN_DIM_BITS    (12),
+    .CHUNK_BITS     ($clog2(CHUNKS_VOCAB > 0 ? CHUNKS_VOCAB : 1))
+  ) i_ws (
+    .clk_core      (clk),
+    .rst_core      (rst),
+    .matrix_base_m (ws_base_EMBED_m),
+    .matrix_base_e (ws_base_EMBED_e),
+    .chunk_idx     (chunk),
+    .in_dim        (12'(D)),
+    .in_dim_tiles  (12'(NT_D)),
+    .load_req      (ws_load_req),
+    .ready         (ws_ready),
+    .busy          (ws_busy_unused),
+    .rd_col        (ws_rd_col),
+    .weight_m_out  (ws_weight_m_out),
+    .rd_tile       (ws_rd_tile),
+    .weight_e_out  (ws_weight_e_out),
+    .clk_axi       (clk_axi),
+    .rst_axi       (rst_axi),
+    .m_axi_arvalid (m_axi_arvalid),
+    .m_axi_arready (m_axi_arready),
+    .m_axi_arid    (m_axi_arid),
+    .m_axi_araddr  (m_axi_araddr),
+    .m_axi_arlen   (m_axi_arlen),
+    .m_axi_arsize  (m_axi_arsize),
+    .m_axi_arburst (m_axi_arburst),
+    .m_axi_arlock  (m_axi_arlock),
+    .m_axi_arcache (m_axi_arcache),
+    .m_axi_arprot  (m_axi_arprot),
+    .m_axi_arqos   (m_axi_arqos),
+    .m_axi_rvalid  (m_axi_rvalid),
+    .m_axi_rready  (m_axi_rready),
+    .m_axi_rid     (m_axi_rid),
+    .m_axi_rdata   (m_axi_rdata),
+    .m_axi_rresp   (m_axi_rresp),
+    .m_axi_rlast   (m_axi_rlast)
+  );
 
   // ---------------------------------------------------------------------------
   // Counters / argmax tracking
@@ -354,7 +297,7 @@ module smollm_decode_head_bfp #(
           best_m   <= 16'sh8000;
           best_e   <= -8'sd128;
           best_idx <= '0;
-          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
+          ws_phase <= WSP_KICK;
         end
 
         // Copy hidden_in bus into BRAM array (1 elem/cycle for BRAM inference)
@@ -399,7 +342,7 @@ module smollm_decode_head_bfp #(
 
         // ---- lm_head matvec: CHUNKS_VOCAB chunks of LANES outputs each ----
         S_MV_PRIME: begin
-          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+          if (ws_phase != WSP_READY) begin
             unique case (ws_phase)
               WSP_KICK: begin
                 ws_load_req <= 1'b1;
@@ -417,14 +360,6 @@ module smollm_decode_head_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= hn_m[cnt[$clog2(D)-1:0]];
           mv_x_e   <= hn_e[cnt[$clog2(D)-1:0] / BFP_TILE];
-          // BRAM-mode weight read; only meaningful when STREAM_WEIGHTS=0.
-          // In stream mode mv_w_m_eff = ws_weight_m_out shadows mv_w_m,
-          // and the rom_EMBED_m generate block doesn't exist — Vivado
-          // drops the assignment entirely under the parameter fold.
-          if (!STREAM_WEIGHTS) begin
-            mv_w_m <= g_embed_rom.rom_EMBED_m[chunk * D    + cnt[$clog2(D)-1:0]];
-            mv_w_e <= g_embed_rom.rom_EMBED_e[chunk * NT_D + cnt[$clog2(D)-1:0] / BFP_TILE];
-          end
           mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_MV_DRAIN;
           else cnt <= cnt + 1'b1;
@@ -470,7 +405,7 @@ module smollm_decode_head_bfp #(
         end
 
         S_MV_NEXT: begin
-          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
+          ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_VOCAB - 1) begin
             token_out <= best_idx;
             state     <= S_DONE;

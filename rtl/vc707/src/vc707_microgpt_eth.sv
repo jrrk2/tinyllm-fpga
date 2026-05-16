@@ -921,21 +921,11 @@ module vc707_microgpt_eth (
   end
 
   // ----------------------------------------------------------------------
-  // STREAM_WEIGHTS / STREAM_LOOKUP — gated by build define.  When
-  // MICROGPT_BFP_STREAM is set, autoregress_bfp_top owns the AXI master
-  // and reads weights from the lbfp_full_DDR3.bin image that the host
-  // must have uploaded to DDR3 before pulsing `start`.  Otherwise the
-  // path stays on $readmemh BRAMs (current Verilator-validated mode);
-  // the sub-modules still receive base offsets and AXI ports but their
-  // internal streamers are elaborated away.
+  // Weights stream from the lbfp_full_DDR3.bin image that the host
+  // must have uploaded to DDR3 before pulsing `start`.  STREAM_LOOKUP
+  // (EMBED row-fetch via AXI) follows the same path.
   // ----------------------------------------------------------------------
-`ifdef MICROGPT_BFP_STREAM
-  localparam bit LBFP_STREAM_WEIGHTS = 1'b1;
   localparam bit LBFP_STREAM_LOOKUP  = 1'b1;
-`else
-  localparam bit LBFP_STREAM_WEIGHTS = 1'b0;
-  localparam bit LBFP_STREAM_LOOKUP  = 1'b0;
-`endif
 
 `include "smollm/lbfp_ddr3.svh"
 
@@ -951,7 +941,6 @@ module vc707_microgpt_eth (
     .N_PROMPT(`LBFP_FULL_NPROMPT),
     .N_GEN   (`LBFP_FULL_NGEN),
     .PREFIX  ("lbfp_full_"),
-    .STREAM_WEIGHTS (LBFP_STREAM_WEIGHTS),
     .STREAM_LOOKUP  (LBFP_STREAM_LOOKUP),
     .AXI_ADDR_WIDTH (30),
     .AXI_ID_WIDTH   (5)

@@ -154,7 +154,6 @@ read_verilog -sv { \
     src/smollm/bfp_sdpram.sv \
     src/smollm/weight_streamer_bfp_mt.sv \
     src/smollm/smollm_layer_bfp.sv \
-    src/smollm/smollm_layer_bfp_selftest.sv \
     src/smollm/embed_lookup_bfp.sv \
     src/smollm/smollm_multilayer_tm_bfp.sv \
     src/smollm/smollm_decode_head_bfp.sv \

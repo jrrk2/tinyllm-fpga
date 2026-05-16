@@ -6,10 +6,10 @@
 // hidden_in.  The KV cache inside the layer persists per-layer because
 // the layer owns the per-layer cache slice indexed by {layer_idx,…}.
 //
-// When STREAM_WEIGHTS=1, the caller passes the 14 layer-0 matrix base
-// addresses (W?_m / W?_e); this wrapper computes per-layer offsets
-// (base + lay_idx × per-layer bytes) and feeds them to the inner layer
-// each S_PULSE so the streamer fetches that layer's slice from DDR3.
+// The caller passes the 14 layer-0 matrix base addresses (W?_m / W?_e);
+// this wrapper computes per-layer offsets (base + lay_idx × per-layer
+// bytes) and feeds them to the inner layer each S_PULSE so the streamer
+// fetches that layer's slice from DDR3.
 
 `include "bfp_format.svh"
 
@@ -24,7 +24,6 @@ module smollm_multilayer_tm_bfp #(
   parameter int    MAX_CTX = 64,
   parameter int    NL      = 30,
   parameter        PREFIX  = "lbfp_full_",
-  parameter bit    STREAM_WEIGHTS = 1'b0,
   parameter int    AXI_ADDR_WIDTH = 30,
   parameter int    AXI_ID_WIDTH   = 5
 )(
@@ -38,9 +37,9 @@ module smollm_multilayer_tm_bfp #(
   output logic signed [D*BFP_MANT_W-1:0]            hidden_out_m,
   output logic signed [(D/BFP_TILE)*BFP_EXP_W-1:0]  hidden_out_e,
   output logic                                      done,
-  // DDR3 streamer ports (active iff STREAM_WEIGHTS=1).  Layer-0 base
-  // addresses for each weight matrix — this module derives per-layer
-  // bases as `base + lay_idx × W?_*_PL` internally.
+  // DDR3 streamer ports.  Layer-0 base addresses for each weight
+  // matrix — this module derives per-layer bases as `base + lay_idx
+  // × W?_*_PL` internally.
   input  wire [AXI_ADDR_WIDTH-1:0]                  ws_base_WQ_m,
   input  wire [AXI_ADDR_WIDTH-1:0]                  ws_base_WQ_e,
   input  wire [AXI_ADDR_WIDTH-1:0]                  ws_base_WK_m,
@@ -139,7 +138,6 @@ module smollm_multilayer_tm_bfp #(
   smollm_layer_bfp #(
     .D(D), .H_Q(H_Q), .H_KV(H_KV), .HD(HD),
     .FFN(FFN), .MAX_CTX(MAX_CTX), .NL(NL), .PREFIX(PREFIX),
-    .STREAM_WEIGHTS(STREAM_WEIGHTS),
     .AXI_ADDR_WIDTH(AXI_ADDR_WIDTH),
     .AXI_ID_WIDTH(AXI_ID_WIDTH)
   ) i_lay (

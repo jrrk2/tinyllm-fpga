@@ -4,9 +4,9 @@
 // tokens.  Suitable as the FPGA top-level instantiation for the SmolLM2
 // BFP path.
 //
-// When STREAM_WEIGHTS=1 (with STREAM_LOOKUP=1), the three sub-modules
-// each own an AXI master that fetches their slice of the weight set
-// from DDR3.  Because the model stages are strictly sequential —
+// The three sub-modules each own an AXI master that fetches their
+// slice of the weight set from DDR3.  Because the model stages are
+// strictly sequential —
 // EMBED → NL × LAYER → DECODE — only one master is active at a time,
 // so this module collapses the three onto a single AR/R channel via a
 // priority OR-mux (the source whose arvalid is high wins, and rvalid
@@ -29,7 +29,6 @@ module autoregress_bfp_top #(
   parameter int N_GEN    = 15,
   parameter int N_STEPS  = N_PROMPT + N_GEN,
   parameter     PREFIX   = "lbfp_full_",
-  parameter bit STREAM_WEIGHTS = 1'b0,
   parameter bit STREAM_LOOKUP  = 1'b0,
   parameter int AXI_ADDR_WIDTH = 30,
   parameter int AXI_ID_WIDTH   = 5
@@ -191,7 +190,6 @@ module autoregress_bfp_top #(
   smollm_multilayer_tm_bfp #(
     .D(D), .H_Q(H_Q), .H_KV(H_KV), .HD(HD),
     .FFN(FFN), .MAX_CTX(MAX_CTX), .NL(NL), .PREFIX(PREFIX),
-    .STREAM_WEIGHTS(STREAM_WEIGHTS),
     .AXI_ADDR_WIDTH(AXI_ADDR_WIDTH),
     .AXI_ID_WIDTH(AXI_ID_WIDTH)
   ) i_lay (
@@ -238,7 +236,6 @@ module autoregress_bfp_top #(
 
   smollm_decode_head_bfp #(
     .D(D), .VOCAB(VOCAB), .PREFIX(PREFIX),
-    .STREAM_WEIGHTS(STREAM_WEIGHTS),
     .AXI_ADDR_WIDTH(AXI_ADDR_WIDTH),
     .AXI_ID_WIDTH(AXI_ID_WIDTH)
   ) i_dec (

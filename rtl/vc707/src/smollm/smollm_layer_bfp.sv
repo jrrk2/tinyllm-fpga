@@ -38,11 +38,6 @@ module smollm_layer_bfp #(
   // ROM bank.  KV cache likewise scales by NL.
   parameter int    NL      = 1,
   parameter        PREFIX  = "lbfp_",
-  // When STREAM_WEIGHTS=1, the 7 weight matrices are served by an
-  // internal weight_streamer_bfp_mt instance that fetches chunks from
-  // DDR3 via the AXI master ports below.  $readmemh ROMs are dropped.
-  // Gammas + KV cache remain on-chip (small).  Default 0 = selftest.
-  parameter bit    STREAM_WEIGHTS = 1'b0,
   parameter int    AXI_ADDR_WIDTH = 30,
   parameter int    AXI_ID_WIDTH   = 5
 )(
@@ -58,11 +53,11 @@ module smollm_layer_bfp #(
   output logic signed [(D/BFP_TILE)*BFP_EXP_W-1:0] hidden_out_e,
   output logic                               done,
   // -------------------------------------------------------------------
-  // DDR3 streamer interface (used iff STREAM_WEIGHTS=1).
-  // Caller (autoregress_bfp_top / multilayer_tm) computes the layer-
-  // qualified byte base for each of the 7 matrices and presents them
-  // here; the layer applies chunk_idx * in_dim_bytes internally via the
-  // streamer.  AXI master ports route to MIG ui_clk domain.
+  // DDR3 streamer interface.  Caller (autoregress_bfp_top / multilayer_
+  // tm) computes the layer-qualified byte base for each of the 7
+  // matrices and presents them here; the layer applies chunk_idx *
+  // in_dim_bytes internally via the streamer.  AXI master ports route
+  // to MIG ui_clk domain.
   // -------------------------------------------------------------------
   input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WQ_m,
   input  wire [AXI_ADDR_WIDTH-1:0]           ws_base_WQ_e,
@@ -142,62 +137,6 @@ module smollm_layer_bfp #(
   // RAMB18/36 primitives for.  The previous per-lane unpacked array was
   // a 16-port read (one address per lane), which Vivado refuses to BRAM-
   // infer (max 2 read ports) and is too big for distributed RAM (>128 Kb).
-  localparam int LANE_M_W = LANES * BFP_MANT_W;     // 256
-  localparam int LANE_E_W = LANES * BFP_EXP_W;      // 128
-
-  // Number of wide entries per layer (one entry per col / per tile, not
-  // per lane).  Total ROM size = NL * per-layer.
-  localparam int WQ_M_PL   = CHUNKS_D   * D;
-  localparam int WK_M_PL   = CHUNKS_KV  * D;
-  localparam int WV_M_PL   = CHUNKS_KV  * D;
-  localparam int WO_M_PL   = CHUNKS_D   * D;
-  localparam int WG_M_PL   = CHUNKS_FFN * D;
-  localparam int WU_M_PL   = CHUNKS_FFN * D;
-  localparam int WDN_M_PL  = CHUNKS_D   * FFN;
-  localparam int WQ_E_PL   = CHUNKS_D   * NT_D;
-  localparam int WK_E_PL   = CHUNKS_KV  * NT_D;
-  localparam int WV_E_PL   = CHUNKS_KV  * NT_D;
-  localparam int WO_E_PL   = CHUNKS_D   * NT_D;
-  localparam int WG_E_PL   = CHUNKS_FFN * NT_D;
-  localparam int WU_E_PL   = CHUNKS_FFN * NT_D;
-  localparam int WDN_E_PL  = CHUNKS_D   * NT_FFN;
-
-  localparam int WQ_M_ENT  = NL * WQ_M_PL;
-  localparam int WK_M_ENT  = NL * WK_M_PL;
-  localparam int WV_M_ENT  = NL * WV_M_PL;
-  localparam int WO_M_ENT  = NL * WO_M_PL;
-  localparam int WG_M_ENT  = NL * WG_M_PL;
-  localparam int WU_M_ENT  = NL * WU_M_PL;
-  localparam int WDN_M_ENT = NL * WDN_M_PL;
-  localparam int WQ_E_ENT  = NL * WQ_E_PL;
-  localparam int WK_E_ENT  = NL * WK_E_PL;
-  localparam int WV_E_ENT  = NL * WV_E_PL;
-  localparam int WO_E_ENT  = NL * WO_E_PL;
-  localparam int WG_E_ENT  = NL * WG_E_PL;
-  localparam int WU_E_ENT  = NL * WU_E_PL;
-  localparam int WDN_E_ENT = NL * WDN_E_PL;
-
-  // ---------------------------------------------------------------------------
-  // Weight ROMs.  `ram_style = "block"` forces Vivado to use RAMB18/RAMB36
-  // primitives (cascaded for the 256-bit-wide mantissa output / 128-bit
-  // exponent output) rather than dissolving to FFs.
-  // ---------------------------------------------------------------------------
-  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_WQ_m  [0:WQ_M_ENT-1];
-  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_WK_m  [0:WK_M_ENT-1];
-  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_WV_m  [0:WV_M_ENT-1];
-  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_WO_m  [0:WO_M_ENT-1];
-  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_WG_m  [0:WG_M_ENT-1];
-  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_WU_m  [0:WU_M_ENT-1];
-  (* ram_style = "block" *) logic [LANE_M_W-1:0] rom_WDN_m [0:WDN_M_ENT-1];
-
-  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_WQ_e  [0:WQ_E_ENT-1];
-  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_WK_e  [0:WK_E_ENT-1];
-  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_WV_e  [0:WV_E_ENT-1];
-  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_WO_e  [0:WO_E_ENT-1];
-  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_WG_e  [0:WG_E_ENT-1];
-  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_WU_e  [0:WU_E_ENT-1];
-  (* ram_style = "block" *) logic [LANE_E_W-1:0] rom_WDN_e [0:WDN_E_ENT-1];
-
   // Gamma / KV cache: scaled by NL for multilayer time-mux.  Indexed
   // by {layer_idx, position, lane}.
   (* ram_style = "block" *) logic signed [BFP_MANT_W-1:0] rom_G1_m [0:NL*D-1];
@@ -205,22 +144,17 @@ module smollm_layer_bfp #(
   (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] rom_G1_e [0:NL*NT_D-1];
   (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] rom_G2_e [0:NL*NT_D-1];
 
-  (* ram_style = "block" *) logic signed [BFP_MANT_W-1:0] kv_k_m [0:NL*MAX_CTX*H_KV*HD-1];
-  (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] kv_k_e [0:NL*MAX_CTX*NT_KV-1];
-  (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] kv_v_e [0:NL*MAX_CTX*NT_KV-1];
-
-  // kv_v_m is wide-packed (LANES mantissas per entry) so AV_DRIVE's
-  // 16-lane parallel read becomes a single BRAM read.  Original flat
-  // layout had 16 simultaneous reads → too many ports for BRAM inference,
-  // and at 5.9 Mbit total Vivado refused to dissolve to FFs.  Wide-
-  // packed access is 1-write + 1-read = simple-dual-port BRAM.
+  // kv_k_m / kv_k_e / kv_v_e / kv_v_m_chk all live in explicit RAMB36E1
+  // primitives via bfp_sdpram.  Vivado's inferencer refused BRAM for the
+  // three kv_k_*/kv_v_e arrays ("Infeasible attribute ram_style=block")
+  // because their reads were buried in conditional muxes inside the main
+  // FSM always_ff (the `if (kv_t == kv_pos) k_m else kv_k_m` pattern),
+  // which the pattern-matcher couldn't unpick — falling back to LUTRAM
+  // (~92K cells for kv_k_m alone, blowing the 130800 RAMD64E budget).
   //
-  // Storage uses an explicit XPM_MEMORY_SDPRAM primitive via bfp_sdpram.
-  // Vivado maps the XPM directly to RAMB36E1 tiles without running the
-  // generic memory-inference pass, eliminating the >1 h "deciding RAM
-  // shape" hangs we hit on the awkward 23040-deep array.  Read latency
-  // = 1 cycle (BRAM registered output); the AV pipeline absorbs that
-  // via consume_t = cnt - 1 and the S_AV_PREFETCH state.
+  // Explicit primitives sidestep inference entirely.  Read latency is
+  // 1 cycle (RAMB output register); FSM consumers prefetch rd_addr one
+  // cycle ahead and use consume_t = cnt-1 to pick the matching xs.
   localparam int KVV_CHUNKS_PER_KVPOS = (H_KV * HD) / LANES;          // 12 for full SmolLM2
   localparam int KVV_DEPTH            = NL * MAX_CTX * KVV_CHUNKS_PER_KVPOS;
   localparam int KVV_AW               = $clog2(KVV_DEPTH);
@@ -274,64 +208,127 @@ module smollm_layer_bfp #(
                                 + head_grp * (HD/LANES) + chunk);
   end
 
-  // When STREAM_WEIGHTS=1, the 14 weight $readmemh's are dropped (weights
-  // come from DDR3 via the streamer below); gammas + KV cache continue
-  // to load from hex.  The W?_? rom_* arrays are still declared above
-  // for elaboration symmetry but go unused (synthesis prunes them).
+  // Comb drivers for kv_k_m / kv_k_e / kv_v_e BRAM ports.  Writes
+  // mirror the in-FSM stores during S_KVWR_M / S_KVWR_E; rd_addr is
+  // driven from the current FSM cursor a cycle ahead of consumption
+  // (consume_t = cnt - 1 in the DRIVE states).
+  always_comb begin
+    kv_k_m_we      = 1'b0;
+    kv_k_m_wr_addr = '0;
+    kv_k_m_wr_data = '0;
+    if (state == S_KVWR_M) begin
+      kv_k_m_we      = 1'b1;
+      kv_k_m_wr_addr = KKM_AW'(layer_idx * MAX_CTX * H_KV * HD
+                                + kv_pos * H_KV * HD
+                                + cnt[CW_KV-1:0]);
+      kv_k_m_wr_data = k_m[cnt[CW_KV-1:0]];
+    end
+    // Default rd_addr: QK_DRIVE pattern (kv_t × stride + head_grp × HD + cnt).
+    // S_QK_PREFETCH sets cnt=0 so addr(t=kv_t, j=0) is latched; DRIVE
+    // bumps cnt to 1..HD and consumes rd_data at consume_j = cnt-1.
+    kv_k_m_rd_addr = KKM_AW'(layer_idx * MAX_CTX * H_KV * HD
+                              + kv_t * H_KV * HD
+                              + head_grp * HD
+                              + cnt[CW_HD-1:0]);
+  end
+
+  always_comb begin
+    kv_k_e_we      = 1'b0;
+    kv_k_e_wr_addr = '0;
+    kv_k_e_wr_data = '0;
+    kv_v_e_we      = 1'b0;
+    kv_v_e_wr_addr = '0;
+    kv_v_e_wr_data = '0;
+    if (state == S_KVWR_E) begin
+      kv_k_e_we      = 1'b1;
+      kv_k_e_wr_addr = KVE_AW'(layer_idx * MAX_CTX * NT_KV
+                                + kv_pos * NT_KV + cnt[CW_KV-1:0]);
+      kv_k_e_wr_data = k_e[cnt[CW_KV-1:0]];
+      kv_v_e_we      = 1'b1;
+      kv_v_e_wr_addr = KVE_AW'(layer_idx * MAX_CTX * NT_KV
+                                + kv_pos * NT_KV + cnt[CW_KV-1:0]);
+      kv_v_e_wr_data = v_e[cnt[CW_KV-1:0]];
+    end
+    // kv_k_e read addr: tracks QK_DRIVE lane-0 pattern.
+    kv_k_e_rd_addr = KVE_AW'(layer_idx * MAX_CTX * NT_KV
+                              + kv_t * NT_KV
+                              + (head_grp * HD + cnt[CW_HD-1:0]) / BFP_TILE);
+    // kv_v_e read addr: two contexts.
+    //   S_AV_EMAX_SCAN: walk t = av_scan_cnt, looking at the tile for
+    //     (head_grp*HD + chunk*LANES) / BFP_TILE.
+    //   Otherwise (S_AV_PREFETCH / S_AV_DRIVE): tracks cnt (= prefetch
+    //     index) for the same tile.
+    if (state == S_AV_PRIME || state == S_AV_EMAX_PREFETCH
+                            || state == S_AV_EMAX_SCAN) begin
+      kv_v_e_rd_addr = KVE_AW'(layer_idx * MAX_CTX * NT_KV
+                                + av_scan_cnt[CW_CTX-1:0] * NT_KV
+                                + (head_grp * HD + chunk * LANES) / BFP_TILE);
+    end else begin
+      kv_v_e_rd_addr = KVE_AW'(layer_idx * MAX_CTX * NT_KV
+                                + cnt[CW_CTX-1:0] * NT_KV
+                                + (head_grp * HD + chunk * LANES) / BFP_TILE);
+    end
+  end
+
+  // ---------------------------------------------------------------------------
+  // kv_k_m: per-mantissa K cache.  Writes 1 entry/cycle during S_KVWR_M,
+  // reads 1 entry/cycle during S_QK_DRIVE (lane 0 of mv_w_m).
+  // ---------------------------------------------------------------------------
+  localparam int KKM_DEPTH = NL * MAX_CTX * H_KV * HD;
+  localparam int KKM_AW    = $clog2(KKM_DEPTH);
+  logic                       kv_k_m_we;
+  logic [KKM_AW-1:0]          kv_k_m_wr_addr;
+  logic [BFP_MANT_W-1:0]      kv_k_m_wr_data;
+  logic [KKM_AW-1:0]          kv_k_m_rd_addr;
+  wire  [BFP_MANT_W-1:0]      kv_k_m_rd_data;
+  bfp_sdpram #(.DEPTH(KKM_DEPTH), .WIDTH(BFP_MANT_W))
+    i_kv_k_m_bram (.clk(clk), .rst(rst),
+                   .we(kv_k_m_we), .wr_addr(kv_k_m_wr_addr), .wr_data(kv_k_m_wr_data),
+                   .rd_addr(kv_k_m_rd_addr), .rd_data(kv_k_m_rd_data));
+
+  // ---------------------------------------------------------------------------
+  // kv_k_e / kv_v_e: per-tile K/V exponent caches.  Writes 1 entry/cycle
+  // during S_KVWR_E.  kv_k_e read during S_QK_DRIVE; kv_v_e read during
+  // S_AV_EMAX_SCAN and S_AV_DRIVE.
+  // ---------------------------------------------------------------------------
+  localparam int KVE_DEPTH = NL * MAX_CTX * NT_KV;
+  localparam int KVE_AW    = $clog2(KVE_DEPTH);
+  logic                       kv_k_e_we;
+  logic [KVE_AW-1:0]          kv_k_e_wr_addr;
+  logic [BFP_EXP_W-1:0]       kv_k_e_wr_data;
+  logic [KVE_AW-1:0]          kv_k_e_rd_addr;
+  wire  [BFP_EXP_W-1:0]       kv_k_e_rd_data;
+  bfp_sdpram #(.DEPTH(KVE_DEPTH), .WIDTH(BFP_EXP_W))
+    i_kv_k_e_bram (.clk(clk), .rst(rst),
+                   .we(kv_k_e_we), .wr_addr(kv_k_e_wr_addr), .wr_data(kv_k_e_wr_data),
+                   .rd_addr(kv_k_e_rd_addr), .rd_data(kv_k_e_rd_data));
+
+  logic                       kv_v_e_we;
+  logic [KVE_AW-1:0]          kv_v_e_wr_addr;
+  logic [BFP_EXP_W-1:0]       kv_v_e_wr_data;
+  logic [KVE_AW-1:0]          kv_v_e_rd_addr;
+  wire  [BFP_EXP_W-1:0]       kv_v_e_rd_data;
+  bfp_sdpram #(.DEPTH(KVE_DEPTH), .WIDTH(BFP_EXP_W))
+    i_kv_v_e_bram (.clk(clk), .rst(rst),
+                   .we(kv_v_e_we), .wr_addr(kv_v_e_wr_addr), .wr_data(kv_v_e_wr_data),
+                   .rd_addr(kv_v_e_rd_addr), .rd_data(kv_v_e_rd_data));
+
+  // Weights come from DDR3 via the streamer below; gammas continue to
+  // load from hex.  KV caches are zero-initialised by Vivado's bitstream
+  // (no $readmemh) — autoregress writes each kv_pos before reading it.
 `ifdef MICROGPT_WEIGHT_DIR
   initial begin
-    if (!STREAM_WEIGHTS) begin
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WQ_m.hex"},  rom_WQ_m);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WK_m.hex"},  rom_WK_m);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WV_m.hex"},  rom_WV_m);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WO_m.hex"},  rom_WO_m);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WG_m.hex"},  rom_WG_m);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WU_m.hex"},  rom_WU_m);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WDN_m.hex"}, rom_WDN_m);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WQ_e.hex"},  rom_WQ_e);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WK_e.hex"},  rom_WK_e);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WV_e.hex"},  rom_WV_e);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WO_e.hex"},  rom_WO_e);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WG_e.hex"},  rom_WG_e);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WU_e.hex"},  rom_WU_e);
-      $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "WDN_e.hex"}, rom_WDN_e);
-    end
     $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "G1_m.hex"},  rom_G1_m);
     $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "G2_m.hex"},  rom_G2_m);
     $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "G1_e.hex"},  rom_G1_e);
     $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "G2_e.hex"},  rom_G2_e);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "K_INIT_m.hex"}, kv_k_m);
-    // V_INIT_m no longer loaded — kv_v_m_chk is wide-packed; baker
-    // value is all-zero anyway and Vivado zero-inits BRAM on bitstream.
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "K_INIT_e.hex"}, kv_k_e);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "V_INIT_e.hex"}, kv_v_e);
   end
 `else
   initial begin
-    if (!STREAM_WEIGHTS) begin
-      $readmemh({PREFIX, "WQ_m.hex"},  rom_WQ_m);
-      $readmemh({PREFIX, "WK_m.hex"},  rom_WK_m);
-      $readmemh({PREFIX, "WV_m.hex"},  rom_WV_m);
-      $readmemh({PREFIX, "WO_m.hex"},  rom_WO_m);
-      $readmemh({PREFIX, "WG_m.hex"},  rom_WG_m);
-      $readmemh({PREFIX, "WU_m.hex"},  rom_WU_m);
-      $readmemh({PREFIX, "WDN_m.hex"}, rom_WDN_m);
-      $readmemh({PREFIX, "WQ_e.hex"},  rom_WQ_e);
-      $readmemh({PREFIX, "WK_e.hex"},  rom_WK_e);
-      $readmemh({PREFIX, "WV_e.hex"},  rom_WV_e);
-      $readmemh({PREFIX, "WO_e.hex"},  rom_WO_e);
-      $readmemh({PREFIX, "WG_e.hex"},  rom_WG_e);
-      $readmemh({PREFIX, "WU_e.hex"},  rom_WU_e);
-      $readmemh({PREFIX, "WDN_e.hex"}, rom_WDN_e);
-    end
     $readmemh({PREFIX, "G1_m.hex"},  rom_G1_m);
     $readmemh({PREFIX, "G2_m.hex"},  rom_G2_m);
     $readmemh({PREFIX, "G1_e.hex"},  rom_G1_e);
     $readmemh({PREFIX, "G2_e.hex"},  rom_G2_e);
-    $readmemh({PREFIX, "K_INIT_m.hex"}, kv_k_m);
-    // V_INIT_m no longer loaded (see header note on kv_v_m_chk).
-    $readmemh({PREFIX, "K_INIT_e.hex"}, kv_k_e);
-    $readmemh({PREFIX, "V_INIT_e.hex"}, kv_v_e);
   end
 `endif
 
@@ -419,9 +416,9 @@ module smollm_layer_bfp #(
     S_ROPEQ, S_ROPEQ_WAIT, S_ROPEQ_RQ_A, S_ROPEQ_RQ_B,
     S_ROPEK, S_ROPEK_WAIT, S_ROPEK_RQ_A, S_ROPEK_RQ_B,
     S_KVWR_M, S_KVWR_E,
-    S_QK_PRIME, S_QK_DRIVE, S_QK_DRAIN,
+    S_QK_PRIME, S_QK_PREFETCH, S_QK_DRIVE, S_QK_DRAIN,
     S_SM_DRIVE, S_SM_WAIT,
-    S_AV_PRIME, S_AV_EMAX_SCAN, S_AV_PREFETCH, S_AV_DRIVE, S_AV_DRAIN, S_AV_REQ, S_AV_NEXT,
+    S_AV_PRIME, S_AV_EMAX_PREFETCH, S_AV_EMAX_SCAN, S_AV_PREFETCH, S_AV_DRIVE, S_AV_DRAIN, S_AV_REQ, S_AV_NEXT,
     S_OMV_PRIME, S_OMV_DRIVE, S_OMV_DRAIN, S_OMV_REQ, S_OMV_NEXT,
     S_RES1, S_RES1_WAIT,
     S_NORM2, S_NORM2_WAIT,
@@ -503,21 +500,18 @@ module smollm_layer_bfp #(
   wire                                       mv_out_valid;
 
   // mv_w_m_eff / mv_w_e_eff: muxed weight bus presented to the matvec
-  // engine.  In selftest mode (STREAM_WEIGHTS=0) these forward the
-  // registered mv_w_m / mv_w_e values read from on-chip ROMs.  In
-  // streaming mode the streamer's bank_m / bank_e outputs replace
-  // them — but ONLY for the 7 W?_* matvecs (Q/K/V/O/G/U/DN).  QK and
-  // AV matvecs read kv_k_m / kv_v_m / k_m / v_m (BRAM-backed) and
-  // must keep mv_w_m as their weight source.  `is_stream_matvec` is
-  // set in each W?_PRIME and cleared in QK_PRIME / AV_PRIME, holding
-  // through DRIVE / DRAIN / REQ.
+  // engine.  For the 7 W?_* matvecs (Q/K/V/O/G/U/DN) the streamer's
+  // bank_m / bank_e outputs drive the engine.  QK and AV matvecs read
+  // kv_k_m / kv_v_m / k_m / v_m (BRAM-backed) and use mv_w_m instead.
+  // `is_stream_matvec` is set in each W?_PRIME and cleared in QK_PRIME
+  // / AV_PRIME, holding through DRIVE / DRAIN / REQ.
   logic is_stream_matvec;
   wire signed [LANES*BFP_MANT_W-1:0]         mv_w_m_eff;
   wire signed [LANES*BFP_EXP_W -1:0]         mv_w_e_eff;
   wire        [255:0]                        ws_weight_m_out;
   wire        [127:0]                        ws_weight_e_out;
-  assign mv_w_m_eff = (STREAM_WEIGHTS && is_stream_matvec) ? $signed(ws_weight_m_out) : mv_w_m;
-  assign mv_w_e_eff = (STREAM_WEIGHTS && is_stream_matvec) ? $signed(ws_weight_e_out) : mv_w_e;
+  assign mv_w_m_eff = is_stream_matvec ? $signed(ws_weight_m_out) : mv_w_m;
+  assign mv_w_e_eff = is_stream_matvec ? $signed(ws_weight_e_out) : mv_w_e;
 
   // is_stream_matvec: set when entering a W?_* matvec via its PRIME,
   // cleared when entering QK_PRIME or AV_PRIME.  Held through DRIVE /
@@ -729,7 +723,7 @@ module smollm_layer_bfp #(
   endfunction
 
   // ---------------------------------------------------------------------------
-  // DDR3 weight streamer (used iff STREAM_WEIGHTS=1).
+  // DDR3 weight streamer.
   //
   //   Active matvec is identified by ws_matvec_id:
   //     0=Q  1=K  2=V  3=O  4=G  5=U  6=DN
@@ -788,74 +782,48 @@ module smollm_layer_bfp #(
     endcase
   end
 
-  generate
-    if (STREAM_WEIGHTS) begin : g_stream
-      weight_streamer_bfp_mt #(
-        .AXI_DATA_WIDTH (512),
-        .AXI_ADDR_WIDTH (AXI_ADDR_WIDTH),
-        .AXI_ID_WIDTH   (AXI_ID_WIDTH),
-        .IN_DIM_MAX     (FFN > D ? FFN : D),
-        .IN_DIM_BITS    (12),
-        .CHUNK_BITS     (7)
-      ) i_ws (
-        .clk_core      (clk),
-        .rst_core      (rst),
-        .matrix_base_m (ws_base_m_mux),
-        .matrix_base_e (ws_base_e_mux),
-        .chunk_idx     (chunk),                // declared below; alias
-        .in_dim        (ws_in_dim_mux),
-        .in_dim_tiles  (ws_in_dim_tiles_mux),
-        .load_req      (ws_load_req),
-        .ready         (ws_ready),
-        .busy          (ws_busy_unused),
-        .rd_col        (ws_rd_col),
-        .weight_m_out  (ws_weight_m_out),
-        .rd_tile       (ws_rd_tile),
-        .weight_e_out  (ws_weight_e_out),
-        .clk_axi       (clk_axi),
-        .rst_axi       (rst_axi),
-        .m_axi_arvalid (m_axi_arvalid),
-        .m_axi_arready (m_axi_arready),
-        .m_axi_arid    (m_axi_arid),
-        .m_axi_araddr  (m_axi_araddr),
-        .m_axi_arlen   (m_axi_arlen),
-        .m_axi_arsize  (m_axi_arsize),
-        .m_axi_arburst (m_axi_arburst),
-        .m_axi_arlock  (m_axi_arlock),
-        .m_axi_arcache (m_axi_arcache),
-        .m_axi_arprot  (m_axi_arprot),
-        .m_axi_arqos   (m_axi_arqos),
-        .m_axi_rvalid  (m_axi_rvalid),
-        .m_axi_rready  (m_axi_rready),
-        .m_axi_rid     (m_axi_rid),
-        .m_axi_rdata   (m_axi_rdata),
-        .m_axi_rresp   (m_axi_rresp),
-        .m_axi_rlast   (m_axi_rlast)
-      );
-    end else begin : g_no_stream
-      // Tie off AXI master ports — no streamer, no traffic.
-      assign m_axi_arvalid = 1'b0;
-      assign m_axi_arid    = '0;
-      assign m_axi_araddr  = '0;
-      assign m_axi_arlen   = '0;
-      assign m_axi_arsize  = 3'd6;
-      assign m_axi_arburst = 2'b01;
-      assign m_axi_arlock  = 1'b0;
-      assign m_axi_arcache = 4'b0011;
-      assign m_axi_arprot  = 3'b000;
-      assign m_axi_arqos   = 4'b0000;
-      assign m_axi_rready  = 1'b1;
-      assign ws_weight_m_out = '0;
-      assign ws_weight_e_out = '0;
-      assign ws_ready        = 1'b1;     // never gates the FSM
-      assign ws_busy_unused  = 1'b0;
-      /* verilator lint_off UNUSEDSIGNAL */
-      wire _unused_axi = &{1'b0, m_axi_arready, m_axi_rvalid, m_axi_rid,
-                           m_axi_rdata, m_axi_rresp, m_axi_rlast, clk_axi,
-                           rst_axi, 1'b0};
-      /* verilator lint_on UNUSEDSIGNAL */
-    end
-  endgenerate
+  weight_streamer_bfp_mt #(
+    .AXI_DATA_WIDTH (512),
+    .AXI_ADDR_WIDTH (AXI_ADDR_WIDTH),
+    .AXI_ID_WIDTH   (AXI_ID_WIDTH),
+    .IN_DIM_MAX     (FFN > D ? FFN : D),
+    .IN_DIM_BITS    (12),
+    .CHUNK_BITS     (7)
+  ) i_ws (
+    .clk_core      (clk),
+    .rst_core      (rst),
+    .matrix_base_m (ws_base_m_mux),
+    .matrix_base_e (ws_base_e_mux),
+    .chunk_idx     (chunk),
+    .in_dim        (ws_in_dim_mux),
+    .in_dim_tiles  (ws_in_dim_tiles_mux),
+    .load_req      (ws_load_req),
+    .ready         (ws_ready),
+    .busy          (ws_busy_unused),
+    .rd_col        (ws_rd_col),
+    .weight_m_out  (ws_weight_m_out),
+    .rd_tile       (ws_rd_tile),
+    .weight_e_out  (ws_weight_e_out),
+    .clk_axi       (clk_axi),
+    .rst_axi       (rst_axi),
+    .m_axi_arvalid (m_axi_arvalid),
+    .m_axi_arready (m_axi_arready),
+    .m_axi_arid    (m_axi_arid),
+    .m_axi_araddr  (m_axi_araddr),
+    .m_axi_arlen   (m_axi_arlen),
+    .m_axi_arsize  (m_axi_arsize),
+    .m_axi_arburst (m_axi_arburst),
+    .m_axi_arlock  (m_axi_arlock),
+    .m_axi_arcache (m_axi_arcache),
+    .m_axi_arprot  (m_axi_arprot),
+    .m_axi_arqos   (m_axi_arqos),
+    .m_axi_rvalid  (m_axi_rvalid),
+    .m_axi_rready  (m_axi_rready),
+    .m_axi_rid     (m_axi_rid),
+    .m_axi_rdata   (m_axi_rdata),
+    .m_axi_rresp   (m_axi_rresp),
+    .m_axi_rlast   (m_axi_rlast)
+  );
 
   // ---------------------------------------------------------------------------
   // Main FSM — all writes use non-blocking assignment; engine inputs are
@@ -950,7 +918,7 @@ module smollm_layer_bfp #(
           state   <= S_LATCH_IN;
           cnt     <= '0;
           eng_rst <= 1'b1;
-          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
+          ws_phase <= WSP_KICK;
         end
 
         // Copy hidden_in bus into BRAM-style arrays one element/cycle.
@@ -999,7 +967,7 @@ module smollm_layer_bfp #(
         // Q matvec — 7 phases (PRIME/DRIVE/DRAIN/NEXT) — input dim = D, out_dim = D
         // ===================================================================
         S_QMV_PRIME: begin
-          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+          if (ws_phase != WSP_READY) begin
             unique case (ws_phase)
               WSP_KICK: begin
                 ws_matvec_id <= 3'd0;
@@ -1020,8 +988,6 @@ module smollm_layer_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= n1_m[cnt[CW_D-1:0]];
           mv_x_e   <= n1_e[cnt[CW_D-1:0] / BFP_TILE];
-          mv_w_m   <= rom_WQ_m[layer_idx * WQ_M_PL + chunk * D    + cnt[CW_D-1:0]];
-          mv_w_e   <= rom_WQ_e[layer_idx * WQ_E_PL + chunk * NT_D + cnt[CW_D-1:0] / BFP_TILE];
           mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_QMV_DRAIN;
           else cnt <= cnt + 1'b1;
@@ -1056,7 +1022,7 @@ module smollm_layer_bfp #(
           state <= S_QMV_NEXT;
         end
         S_QMV_NEXT: begin
-          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
+          ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_D - 1) begin
             chunk   <= '0;
             eng_rst <= 1'b1;
@@ -1072,7 +1038,7 @@ module smollm_layer_bfp #(
         // K matvec
         // ===================================================================
         S_KMV_PRIME: begin
-          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+          if (ws_phase != WSP_READY) begin
             unique case (ws_phase)
               WSP_KICK: begin
                 ws_matvec_id <= 3'd1;
@@ -1091,8 +1057,6 @@ module smollm_layer_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= n1_m[cnt[CW_D-1:0]];
           mv_x_e   <= n1_e[cnt[CW_D-1:0] / BFP_TILE];
-          mv_w_m   <= rom_WK_m[layer_idx * WK_M_PL + chunk * D    + cnt[CW_D-1:0]];
-          mv_w_e   <= rom_WK_e[layer_idx * WK_E_PL + chunk * NT_D + cnt[CW_D-1:0] / BFP_TILE];
           mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_KMV_DRAIN;
           else cnt <= cnt + 1'b1;
@@ -1125,7 +1089,7 @@ module smollm_layer_bfp #(
           state <= S_KMV_NEXT;
         end
         S_KMV_NEXT: begin
-          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
+          ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_KV - 1) begin
             chunk <= '0; eng_rst <= 1'b1; state <= S_VMV_PRIME;
           end else begin
@@ -1137,7 +1101,7 @@ module smollm_layer_bfp #(
         // V matvec
         // ===================================================================
         S_VMV_PRIME: begin
-          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+          if (ws_phase != WSP_READY) begin
             unique case (ws_phase)
               WSP_KICK: begin
                 ws_matvec_id <= 3'd2;
@@ -1156,8 +1120,6 @@ module smollm_layer_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= n1_m[cnt[CW_D-1:0]];
           mv_x_e   <= n1_e[cnt[CW_D-1:0] / BFP_TILE];
-          mv_w_m   <= rom_WV_m[layer_idx * WV_M_PL + chunk * D    + cnt[CW_D-1:0]];
-          mv_w_e   <= rom_WV_e[layer_idx * WV_E_PL + chunk * NT_D + cnt[CW_D-1:0] / BFP_TILE];
           mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_VMV_DRAIN;
           else cnt <= cnt + 1'b1;
@@ -1190,7 +1152,7 @@ module smollm_layer_bfp #(
           state <= S_VMV_NEXT;
         end
         S_VMV_NEXT: begin
-          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
+          ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_KV - 1) begin
             chunk <= '0; head_idx <= '0; cnt <= '0;
             eng_rst <= 1'b1; rp_start <= 1'b1; state <= S_ROPEQ;
@@ -1339,16 +1301,13 @@ module smollm_layer_bfp #(
         // After re-tile-quant, k_m/k_e is the post-rope K in per-tile BFP.
         // Just copy mantissas + per-tile exponents into the KV cache slot.
         S_KVWR_M: begin : kvwr_m_blk
-          kv_k_m[layer_idx * MAX_CTX * H_KV * HD + kv_pos * H_KV * HD + cnt[CW_KV-1:0]] <= k_m[cnt[CW_KV-1:0]];
-          // The wide-packed kv_v_m_chk write is fired by the comb
-          // driver block below — see kv_v_chk_we / _wr_addr / _wr_data.
+          // kv_k_m / kv_v_m_chk writes fired by comb drivers above.
           if (cnt == H_KV*HD - 1) begin
             cnt   <= '0; state <= S_KVWR_E;
           end else cnt <= cnt + 1'b1;
         end
         S_KVWR_E: begin
-          kv_k_e[layer_idx * MAX_CTX * NT_KV + kv_pos * NT_KV + cnt[CW_KV-1:0]] <= k_e[cnt[CW_KV-1:0]];
-          kv_v_e[layer_idx * MAX_CTX * NT_KV + kv_pos * NT_KV + cnt[CW_KV-1:0]] <= v_e[cnt[CW_KV-1:0]];
+          // kv_k_e / kv_v_e writes fired by comb drivers above.
           if (cnt == NT_KV - 1) begin
             cnt <= '0; head_idx <= '0; kv_t <= '0;
             score_emax <= -8'sd128;
@@ -1362,29 +1321,38 @@ module smollm_layer_bfp #(
         // Q[head] mantissas, with K[grp,t] mantissas on lane 0 (other lanes 0).
         // ===================================================================
         S_QK_PRIME: begin
+          // Latch the new head_grp; PREFETCH the cycle after then sees
+          // it and issues kv_k_m/e rd_addr for cnt=0.
           head_grp <= 5'(kv_grp_of(head_idx));
-          mv_start <= 1'b1; cnt <= '0; state <= S_QK_DRIVE;
+          mv_start <= 1'b1; cnt <= '0; state <= S_QK_PREFETCH;
         end
-        S_QK_DRIVE: begin
+        S_QK_PREFETCH: begin
+          // Comb driver issues rd_addr=addr(kv_t, head_grp, cnt=0); the
+          // BRAM internal register latches it.  Advance cnt to 1 so the
+          // first DRIVE cycle's rd_addr = addr(j=1) while we consume
+          // rd_data for j=0.
+          cnt <= 'd1;
+          state <= S_QK_DRIVE;
+        end
+        S_QK_DRIVE: begin : qk_drive_blk
+          // consume_j tracks the index whose rd_data the BRAM just
+          // delivered (issued by the comb driver one cycle earlier).
+          automatic logic [CW_HD-1:0] consume_j;
+          consume_j = cnt[CW_HD-1:0] - 1'b1;
           mv_valid <= 1'b1;
-          mv_x_m   <= q_m[head_idx * HD + cnt[CW_HD-1:0]];
-          mv_x_e   <= q_e[(head_idx * HD + cnt[CW_HD-1:0]) / BFP_TILE];
-          mv_last  <= (cnt == HD-1);
-          for (ii = 0; ii < LANES; ii++) begin
-            if (ii == 0) begin
-              if (kv_t == kv_pos) begin
-                mv_w_m[0 +: BFP_MANT_W] <= k_m[head_grp * HD + cnt[CW_HD-1:0]];
-                mv_w_e[0 +: BFP_EXP_W ] <= k_e[(head_grp * HD + cnt[CW_HD-1:0]) / BFP_TILE];
-              end else begin
-                mv_w_m[0 +: BFP_MANT_W] <= kv_k_m[layer_idx * MAX_CTX * H_KV*HD + kv_t * H_KV*HD + head_grp * HD + cnt[CW_HD-1:0]];
-                mv_w_e[0 +: BFP_EXP_W ] <= kv_k_e[layer_idx * MAX_CTX * NT_KV  + kv_t * NT_KV + (head_grp * HD + cnt[CW_HD-1:0]) / BFP_TILE];
-              end
-            end else begin
-              mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <= '0;
-              mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <= '0;
-            end
+          mv_x_m   <= q_m[head_idx * HD + consume_j];
+          mv_x_e   <= q_e[(head_idx * HD + consume_j) / BFP_TILE];
+          mv_last  <= (consume_j == HD-1);
+          // Lane 0: K from kv_k_m / kv_k_e BRAMs.  Since S_KVWR_M wrote
+          // kv_k_m[kv_pos] = k_m before reaching here, the kv_t==kv_pos
+          // path no longer needs the FF fallback.
+          mv_w_m[0 +: BFP_MANT_W] <= kv_k_m_rd_data;
+          mv_w_e[0 +: BFP_EXP_W ] <= kv_k_e_rd_data;
+          for (ii = 1; ii < LANES; ii++) begin
+            mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <= '0;
+            mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <= '0;
           end
-          if (cnt == HD-1) state <= S_QK_DRAIN;
+          if (consume_j == HD-1) state <= S_QK_DRAIN;
           else cnt <= cnt + 1'b1;
         end
         S_QK_DRAIN: if (mv_out_valid) begin
@@ -1461,23 +1429,34 @@ module smollm_layer_bfp #(
           head_grp    <= 5'(kv_grp_of(head_idx));
           av_emax     <= $signed(v_e[tile_idx]);   // seed with current step
           av_scan_cnt <= '0;
+          state       <= S_AV_EMAX_PREFETCH;
+        end
+        S_AV_EMAX_PREFETCH: begin
+          // Comb driver issues kv_v_e rd_addr=addr(av_scan_cnt=0); BRAM
+          // latches it.  Bump av_scan_cnt to 1 so the SCAN loop's first
+          // cycle sees consume_av_t=0 with rd_data already valid.
+          av_scan_cnt <= 'd1;
           state       <= S_AV_EMAX_SCAN;
         end
         S_AV_EMAX_SCAN: begin : av_emax_scan
           automatic logic signed [BFP_EXP_W-1:0] e_t;
-          automatic int tile_idx;
-          tile_idx = (head_grp * HD + chunk * LANES) / BFP_TILE;
-          if (av_scan_cnt < kv_pos) begin
-            e_t = $signed(kv_v_e[layer_idx * MAX_CTX * NT_KV
-                                  + av_scan_cnt[CW_CTX-1:0] * NT_KV + tile_idx]);
-            if (e_t > av_emax) av_emax <= e_t;
+          automatic logic [CW_CTX-1:0] consume_av_t;
+          consume_av_t = av_scan_cnt[CW_CTX-1:0] - 1'b1;
+          if (av_scan_cnt <= kv_pos) begin
+            // rd_data on the kv_v_e BRAM is kv_v_e[t = consume_av_t]
+            // (issued by comb driver the prior cycle when av_scan_cnt
+            // was consume_av_t).  Fold it into the running max if that
+            // timestep is < kv_pos (the current-step exponent was
+            // already seeded into av_emax by S_AV_PRIME via v_e).
+            e_t = $signed(kv_v_e_rd_data);
+            if (consume_av_t < kv_pos && e_t > av_emax) av_emax <= e_t;
             av_scan_cnt <= av_scan_cnt + 1'b1;
           end else begin
-            // Scan complete; pre-issue first BRAM read in S_AV_PREFETCH
-            // (rd_addr = addr(cnt=0)) so by the time S_AV_DRIVE's first
-            // consumption cycle hits, kv_v_chk_rd_data already holds
-            // data(t=0).  consume_t = cnt - 1 in DRIVE picks the
-            // matching probs / v_e exponent.
+            // Scan complete; pre-issue first kv_v_m_chk read in
+            // S_AV_PREFETCH (rd_addr = addr(cnt=0)) so by the time
+            // S_AV_DRIVE's first consumption cycle hits, kv_v_chk_rd_data
+            // already holds data(t=0).  consume_t = cnt - 1 in DRIVE
+            // picks the matching probs / v_e exponent.
             mv_start <= 1'b1;
             cnt      <= '0;
             state    <= S_AV_PREFETCH;
@@ -1516,7 +1495,7 @@ module smollm_layer_bfp #(
           if (consume_t <= kv_pos) begin
             mv_x_m <= probs_m[consume_t];
             if (consume_t == kv_pos) v_e_this = $signed(v_e[tile_idx]);
-            else v_e_this = $signed(kv_v_e[layer_idx * MAX_CTX * NT_KV + consume_t * NT_KV + tile_idx]);
+            else v_e_this = $signed(kv_v_e_rd_data);
             shamt = av_emax - v_e_this;
             for (ii = 0; ii < LANES; ii++) begin
               automatic logic signed [BFP_MANT_W-1:0] m_raw;
@@ -1593,7 +1572,7 @@ module smollm_layer_bfp #(
         // O matvec (D inputs, D outputs)
         // ===================================================================
         S_OMV_PRIME: begin
-          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+          if (ws_phase != WSP_READY) begin
             unique case (ws_phase)
               WSP_KICK: begin
                 ws_matvec_id <= 3'd3;
@@ -1612,8 +1591,6 @@ module smollm_layer_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= attn_m[cnt[CW_D-1:0]];
           mv_x_e   <= attn_e[cnt[CW_D-1:0] / BFP_TILE];
-          mv_w_m   <= rom_WO_m[layer_idx * WO_M_PL + chunk * D    + cnt[CW_D-1:0]];
-          mv_w_e   <= rom_WO_e[layer_idx * WO_E_PL + chunk * NT_D + cnt[CW_D-1:0] / BFP_TILE];
           mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_OMV_DRAIN;
           else cnt <= cnt + 1'b1;
@@ -1646,7 +1623,7 @@ module smollm_layer_bfp #(
           state <= S_OMV_NEXT;
         end
         S_OMV_NEXT: begin
-          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
+          ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_D - 1) begin
             chunk   <= '0; cnt <= '0; out_cnt <= '0;
             eng_rst <= 1'b1; rs_start <= 1'b1; state <= S_RES1;
@@ -1725,7 +1702,7 @@ module smollm_layer_bfp #(
         // Gate matvec (D in, FFN out)
         // ===================================================================
         S_GMV_PRIME: begin
-          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+          if (ws_phase != WSP_READY) begin
             unique case (ws_phase)
               WSP_KICK: begin
                 ws_matvec_id <= 3'd4;
@@ -1744,8 +1721,6 @@ module smollm_layer_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= n2_m[cnt[CW_D-1:0]];
           mv_x_e   <= n2_e[cnt[CW_D-1:0] / BFP_TILE];
-          mv_w_m   <= rom_WG_m[layer_idx * WG_M_PL + chunk * D    + cnt[CW_D-1:0]];
-          mv_w_e   <= rom_WG_e[layer_idx * WG_E_PL + chunk * NT_D + cnt[CW_D-1:0] / BFP_TILE];
           mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_GMV_DRAIN;
           else cnt <= cnt + 1'b1;
@@ -1778,7 +1753,7 @@ module smollm_layer_bfp #(
           state <= S_GMV_NEXT;
         end
         S_GMV_NEXT: begin
-          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
+          ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_FFN - 1) begin
             chunk <= '0; eng_rst <= 1'b1; state <= S_UMV_PRIME;
           end else begin
@@ -1790,7 +1765,7 @@ module smollm_layer_bfp #(
         // Up matvec (D in, FFN out)
         // ===================================================================
         S_UMV_PRIME: begin
-          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+          if (ws_phase != WSP_READY) begin
             unique case (ws_phase)
               WSP_KICK: begin
                 ws_matvec_id <= 3'd5;
@@ -1809,8 +1784,6 @@ module smollm_layer_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= n2_m[cnt[CW_D-1:0]];
           mv_x_e   <= n2_e[cnt[CW_D-1:0] / BFP_TILE];
-          mv_w_m   <= rom_WU_m[layer_idx * WU_M_PL + chunk * D    + cnt[CW_D-1:0]];
-          mv_w_e   <= rom_WU_e[layer_idx * WU_E_PL + chunk * NT_D + cnt[CW_D-1:0] / BFP_TILE];
           mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_UMV_DRAIN;
           else cnt <= cnt + 1'b1;
@@ -1843,7 +1816,7 @@ module smollm_layer_bfp #(
           state <= S_UMV_NEXT;
         end
         S_UMV_NEXT: begin
-          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
+          ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_FFN - 1) begin
             chunk <= '0; cnt <= '0; out_cnt <= '0;
             eng_rst <= 1'b1; sg_start <= 1'b1; state <= S_SWG;
@@ -1883,7 +1856,7 @@ module smollm_layer_bfp #(
         // Down matvec (FFN in, D out)
         // ===================================================================
         S_DMV_PRIME: begin
-          if (STREAM_WEIGHTS && ws_phase != WSP_READY) begin
+          if (ws_phase != WSP_READY) begin
             unique case (ws_phase)
               WSP_KICK: begin
                 ws_matvec_id <= 3'd6;
@@ -1902,8 +1875,6 @@ module smollm_layer_bfp #(
           mv_valid <= 1'b1;
           mv_x_m   <= mlp_m[cnt[CW_FFN-1:0]];
           mv_x_e   <= mlp_e[cnt[CW_FFN-1:0] / BFP_TILE];
-          mv_w_m   <= rom_WDN_m[layer_idx * WDN_M_PL + chunk * FFN    + cnt[CW_FFN-1:0]];
-          mv_w_e   <= rom_WDN_e[layer_idx * WDN_E_PL + chunk * NT_FFN + cnt[CW_FFN-1:0] / BFP_TILE];
           mv_last  <= (cnt == FFN-1);
           if (cnt == FFN-1) state <= S_DMV_DRAIN;
           else cnt <= cnt + 1'b1;
@@ -1936,7 +1907,7 @@ module smollm_layer_bfp #(
           state <= S_DMV_NEXT;
         end
         S_DMV_NEXT: begin
-          if (STREAM_WEIGHTS) ws_phase <= WSP_KICK;
+          ws_phase <= WSP_KICK;
           if (chunk == CHUNKS_D - 1) begin
             chunk    <= '0; cnt <= '0; out_cnt <= '0;
             eng_rst  <= 1'b1; rs_start <= 1'b1; state <= S_RES2;
