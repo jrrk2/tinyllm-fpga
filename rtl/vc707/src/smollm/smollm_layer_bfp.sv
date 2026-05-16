@@ -551,8 +551,13 @@ module smollm_layer_bfp #(
       ^ mv_w_m_eff[223:192] ^ mv_w_m_eff[255:224]
       ^ mv_w_e_eff[ 31:  0] ^ mv_w_e_eff[ 63: 32]
       ^ mv_w_e_eff[ 95: 64] ^ mv_w_e_eff[127: 96];
+  // NB: do NOT reset on `start` — the multilayer pulses start once per
+  // (layer × step), 570 times in a full SmolLM2-135M run.  Resetting
+  // here would leave weight_hash holding only the *last* layer's reads,
+  // not the whole run.  rst is driven from ~core_resetn | lay_restart_core
+  // at the top, so the host's restart pulse cleanly re-arms it.
   always_ff @(posedge clk) begin
-    if (rst || start) weight_hash <= 32'hFFFFFFFF;
+    if (rst) weight_hash <= 32'hFFFFFFFF;
     else if (mv_valid && is_stream_matvec)
       weight_hash <= {weight_hash[30:0], weight_hash[31]} ^ mv_w_xor;
   end

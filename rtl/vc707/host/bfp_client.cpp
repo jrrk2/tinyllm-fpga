@@ -1010,9 +1010,29 @@ int main(int argc, char** argv) {
     }
     if (argi >= argc) { usage(); return 2; }
 
+    // Auto-discover the vocab: if -v wasn't given, try sensible default
+    // paths next to the binary so `bfp_client tokens` decodes by default
+    // instead of speaking in raw token IDs.  Silent if no vocab is found.
+    if (vocab_path.empty()) {
+        const char* candidates[] = {
+            "host/bfp_vocab.bin",
+            "bfp_vocab.bin",
+            "release/bfp_vocab.bin",
+            "../host/bfp_vocab.bin",
+        };
+        for (const char* p : candidates) {
+            std::ifstream probe(p, std::ios::binary);
+            if (probe) { vocab_path = p; break; }
+        }
+    }
     std::unique_ptr<Vocab> vocab;
-    if (!vocab_path.empty())
-        vocab = std::make_unique<Vocab>(Vocab::load(vocab_path));
+    if (!vocab_path.empty()) {
+        try { vocab = std::make_unique<Vocab>(Vocab::load(vocab_path)); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "[vocab] load failed (%s): %s — tokens "
+                         "will print raw IDs only\n", vocab_path.c_str(), e.what());
+        }
+    }
 
     std::string cmd = argv[argi++];
     try {
