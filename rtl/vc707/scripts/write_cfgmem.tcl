@@ -24,4 +24,4 @@ if {![file exists $bitfile]} {
 write_cfgmem -format mcs -interface bpix16 -size 128 \
              -loadbit "up 0x0 $bitfile" -file $mcsfile -force
 
-puts "[write_cfgmem] wrote $mcsfile from $bitfile"
+puts "write_cfgmem: wrote $mcsfile from $bitfile"
