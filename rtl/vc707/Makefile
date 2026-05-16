@@ -233,6 +233,9 @@ program:
 
 flash: $(mcs)
 	$(VIVADO) $(VIVADOFLAGS) -source scripts/flash.tcl
+	@# Same reap as `program:` — Vivado's cs_server/hw_server idle-poll
+	@# at high CPU after JTAG flash if not killed.
+	@pkill -f 'cs_server|hw_server' 2>/dev/null || true
 
 clean:
 	rm -rf *.log *.jou *.str *.mif $(work-dir) microgpt_eth.cache microgpt_eth.hw \

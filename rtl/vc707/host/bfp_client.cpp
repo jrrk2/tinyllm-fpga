@@ -82,10 +82,8 @@ constexpr uint16_t REG_RESULT        = 0x1D0;
 constexpr uint16_t REG_DONE          = 0x1F0;   // {30'd0, lay_done_latched, lay_done}
 constexpr uint16_t REG_RESTART       = 0x1F1;   // bit 0: write 1 to pulse restart
 
-constexpr int N_PROMPT       = 4;
-constexpr int N_GEN          = 15;
-constexpr int N_STEPS        = N_PROMPT + N_GEN;       // 19
-constexpr int RESULT_NWORDS  = (N_STEPS * 16 + 31) / 32;  // 10
+constexpr int N_STEPS_DEFAULT = 19;   // matches LBFP_FULL_NPROMPT+NGEN baked
+constexpr int N_STEPS_MAX     = 64;   // regmap 0x1D0..0x1EF = 32 words = 64 × 16-bit
 
 constexpr int      CHUNK            = 64;            // bytes per FT_DDR_WRITE
 constexpr int      DEFAULT_INFLIGHT = 32;
@@ -661,22 +659,22 @@ std::string decode_tokens(const Vocab& v, const std::vector<uint16_t>& tokens) {
 // ---------------------------------------------------------------------
 // Subcommand: tokens
 // ---------------------------------------------------------------------
-std::vector<uint16_t> fetch_tokens(Udp& u) {
-    auto words = reg_read(u, REG_RESULT, RESULT_NWORDS, 50);
-    if ((int)words.size() != RESULT_NWORDS) {
-        throw std::runtime_error("expected " + std::to_string(RESULT_NWORDS)
+std::vector<uint16_t> fetch_tokens(Udp& u, int n_steps) {
+    int nwords = (n_steps * 16 + 31) / 32;
+    auto words = reg_read(u, REG_RESULT, static_cast<uint8_t>(nwords), 50);
+    if ((int)words.size() != nwords) {
+        throw std::runtime_error("expected " + std::to_string(nwords)
                                  + " result words, got "
                                  + std::to_string(words.size()));
     }
-    // Repack 10×32-bit → 19×16-bit (LE).
     std::vector<uint16_t> tokens;
-    tokens.reserve(N_STEPS);
+    tokens.reserve(n_steps);
     uint64_t accum = 0;
     int      bits  = 0;
     for (auto w : words) {
         accum |= (uint64_t)w << bits;
         bits += 32;
-        while (bits >= 16 && (int)tokens.size() < N_STEPS) {
+        while (bits >= 16 && (int)tokens.size() < n_steps) {
             tokens.push_back(static_cast<uint16_t>(accum & 0xffff));
             accum >>= 16;
             bits  -= 16;
@@ -685,8 +683,8 @@ std::vector<uint16_t> fetch_tokens(Udp& u) {
     return tokens;
 }
 
-void print_tokens(Udp& u, const Vocab* vocab) {
-    auto tokens = fetch_tokens(u);
+void print_tokens(Udp& u, const Vocab* vocab, int n_steps) {
+    auto tokens = fetch_tokens(u, n_steps);
     std::printf("RTL_TOKENS:");
     for (auto t : tokens) std::printf(" %u", t);
     std::printf("\n");
@@ -706,6 +704,7 @@ void usage() {
         "  -P  ms between done_count polls                       (default 20)\n"
         "      (default ceiling ≈ 3.3 MB/s — verified byte-perfect; higher rates\n"
         "       have produced silent DDR3 corruption on this bitstream)\n"
+        "  -n  total tokens to fetch = NPROMPT+NGEN (default 19, max 64)\n"
         "  discover           look up the FPGA's IP from its MAC (default %s)\n"
         "                     in /proc/net/arp; seed the cache by pinging the\n"
         "                     /24 around -p's IP (default %s) if not found\n"
@@ -728,6 +727,7 @@ int main(int argc, char** argv) {
     std::string fpga_mac   = FPGA_MAC;
     int         lead_limit = 1024;   // safe ceiling ≈ 3.3 MB/s
     int         poll_ms    = 20;
+    int         n_steps    = N_STEPS_DEFAULT;
 
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-') {
@@ -747,6 +747,12 @@ int main(int argc, char** argv) {
             lead_limit = std::atoi(argv[++argi]);
         } else if (a == "-P" && argi + 1 < argc) {
             poll_ms = std::atoi(argv[++argi]);
+        } else if (a == "-n" && argi + 1 < argc) {
+            n_steps = std::atoi(argv[++argi]);
+            if (n_steps < 1 || n_steps > N_STEPS_MAX) {
+                std::fprintf(stderr, "n_steps must be 1..%d\n", N_STEPS_MAX);
+                return 2;
+            }
         } else if (a == "-h" || a == "--help") {
             usage(); return 0;
         } else {
@@ -820,7 +826,7 @@ int main(int argc, char** argv) {
             return ok ? 0 : 1;
         }
         if (cmd == "tokens") {
-            print_tokens(u, vocab.get());
+            print_tokens(u, vocab.get(), n_steps);
             return 0;
         }
         if (cmd == "all") {
@@ -838,7 +844,7 @@ int main(int argc, char** argv) {
                 std::printf("[all] restart-wait timed out\n");
                 return 1;
             }
-            print_tokens(u, vocab.get());
+            print_tokens(u, vocab.get(), n_steps);
             return 0;
         }
 

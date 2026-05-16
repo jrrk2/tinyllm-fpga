@@ -35,3 +35,8 @@ create_hw_bitstream -hw_device [current_hw_device] [get_property PROGRAM.HW_CFGM
 program_hw_devices [current_hw_device]
 refresh_hw_device [current_hw_device]
 program_hw_cfgmem -hw_cfgmem $cfgmem
+
+# Clean teardown so cs_server/hw_server don't linger as CPU hogs.
+close_hw_target
+disconnect_hw_server
+close_hw_manager
