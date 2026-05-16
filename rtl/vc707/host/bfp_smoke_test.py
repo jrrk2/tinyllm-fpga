@@ -97,7 +97,10 @@ def main():
           file=sys.stderr)
     time.sleep(0.05)
 
-    # 4. Poll done bit
+    # 4. Poll done bit.  REG_DONE = {30'd0, lay_done_latched, lay_done}.
+    # `lay_done` is a 1-cycle pulse the host can easily miss between
+    # 200 ms polls; `lay_done_latched` is the sticky version we actually
+    # rely on.  Either bit set means the autoregress finished a run.
     deadline = time.time() + args.timeout
     last_v = None
     while time.time() < deadline:
@@ -105,9 +108,10 @@ def main():
         if v != last_v:
             print(f"  REG_DONE = 0x{v:08x}", file=sys.stderr)
             last_v = v
-        if v & 1:
+        if v & 0x3:
             elapsed = args.timeout - (deadline - time.time())
-            print(f"[smoke] done @ t≈{elapsed:.2f}s", file=sys.stderr)
+            print(f"[smoke] done @ t≈{elapsed:.2f}s "
+                  f"(latched={(v>>1)&1}, live={v&1})", file=sys.stderr)
             break
         time.sleep(0.2)
     else:
