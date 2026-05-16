@@ -44,6 +44,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -81,6 +82,8 @@ constexpr uint16_t REG_DDR_WR_ACK    = 0x01B;   // MIG ack toggles seen
 constexpr uint16_t REG_DDR_WR_TX     = 0x01C;   // FT_ACK frames dispatched back
 constexpr uint16_t REG_HAS_RUN       = 0x049;   // bit 0: single-shot run complete
 constexpr uint16_t REG_RDATA_CRC     = 0x04A;   // CRC32 over BFP master's R beats
+constexpr uint16_t REG_BRAM_TARGET   = 0x060;   // write: {inc[31], 8'd0, kind[22:18], addr[17:0]}
+constexpr uint16_t REG_BRAM_DATA     = 0x061;   // write: {16'd0, data[15:0]} — pulses BRAM write
 constexpr uint16_t REG_BUILD_VERSION = 0x10F;
 constexpr uint16_t REG_RESULT        = 0x1D0;
 constexpr uint16_t REG_DONE          = 0x1F0;   // {30'd0, lay_done_latched, lay_done}
@@ -855,6 +858,143 @@ int verify_sampled(Udp& u, const std::string& path, int n_samples) {
 }
 
 // ---------------------------------------------------------------------
+// Subcommand: load-roms
+// ---------------------------------------------------------------------
+// Streams per-model BRAM init data from a model directory into the
+// FPGA's on-chip ROMs.  Phase 1 BRAMs:
+//   kind 0  rom_G1_m   (NL × D 16-b mantissas)         G1_m.hex
+//   kind 1  rom_G1_e   (NL × NT_D 8-b exponents)       G1_e.hex
+//   kind 2  rom_G2_m                                   G2_m.hex
+//   kind 3  rom_G2_e                                   G2_e.hex
+//   kind 4  rom_NW_m   (D 16-b mantissas, decode head) NORM_W_m.hex
+//   kind 5  rom_NW_e   (NT_D 8-b exponents)            NORM_W_e.hex
+//   kind 6  prompt_rom (N_PROMPT 16-b tokens)          PROMPT.hex
+//
+// .hex files are HuggingFace-bake outputs in $readmemh format —
+// whitespace/comment-tolerant lines of hex words, one entry per line.
+//
+// Wire protocol:
+//   1. write 0x060 = (inc=1<<31) | (kind<<18) | base_addr   to set target
+//   2. for each entry value: write 0x061 = value            (addr auto-increments)
+// Packed into FT_REG_WRITE frames with up to 16 writes per UDP packet
+// to keep upload time bounded — full SmolLM2-135M Phase 1 set is
+// ~37000 entries = ~2300 packets ≈ 1 s.
+
+static std::vector<uint16_t> parse_hex_file(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("cannot open " + path);
+    std::vector<uint16_t> out;
+    std::string line;
+    while (std::getline(f, line)) {
+        // strip // comments
+        auto cslash = line.find("//");
+        if (cslash != std::string::npos) line.resize(cslash);
+        auto chash  = line.find('#');
+        if (chash  != std::string::npos) line.resize(chash);
+        std::istringstream is(line);
+        std::string tok;
+        while (is >> tok) {
+            try {
+                unsigned long v = std::stoul(tok, nullptr, 16);
+                out.push_back(static_cast<uint16_t>(v & 0xFFFF));
+            } catch (...) { /* skip garbage tokens */ }
+        }
+    }
+    return out;
+}
+
+// Pack a batch of writes (up to 16, FT_REG_WRITE max) into one frame.
+// Each entry is {addr_LE_u16, data_LE_u32, pad_LE_u16}, 8 bytes per entry,
+// after an 8-byte header — matches eth_ctrl's parser.
+struct RegW { uint16_t addr; uint32_t data; };
+
+static void send_reg_write_batch(Udp& u, uint8_t seq,
+                                 const std::vector<RegW>& batch) {
+    if (batch.empty()) return;
+    if (batch.size() > 16) throw std::runtime_error("batch too big");
+    uint8_t tx[8 + 16 * 8];
+    tx[0] = FT_REG_WRITE;
+    tx[1] = seq;
+    tx[2] = static_cast<uint8_t>(batch.size());
+    for (int i = 3; i < 8; ++i) tx[i] = 0;
+    for (size_t i = 0; i < batch.size(); ++i) {
+        uint8_t* p = tx + 8 + i * 8;
+        p[0] = static_cast<uint8_t>(batch[i].addr & 0xff);
+        p[1] = static_cast<uint8_t>((batch[i].addr >> 8) & 0xff);
+        p[2] = static_cast<uint8_t>(batch[i].data        & 0xff);
+        p[3] = static_cast<uint8_t>((batch[i].data >>  8) & 0xff);
+        p[4] = static_cast<uint8_t>((batch[i].data >> 16) & 0xff);
+        p[5] = static_cast<uint8_t>((batch[i].data >> 24) & 0xff);
+        p[6] = 0;
+        p[7] = 0;
+    }
+    u.send(tx, 8 + batch.size() * 8);
+}
+
+static void load_rom(Udp& u, int kind, const std::vector<uint16_t>& entries,
+                     uint8_t& seq) {
+    std::printf("[load-roms] kind=%d entries=%zu\n", kind, entries.size());
+    if (entries.empty()) return;
+    // 1. Set target: inc=1, kind, base=0
+    uint32_t target = (1u << 31)
+                    | (static_cast<uint32_t>(kind & 0x1f) << 18)
+                    | 0u /* base_addr=0 */;
+    std::vector<RegW> first = {{REG_BRAM_TARGET, target}};
+    send_reg_write_batch(u, seq++, first);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    // 2. Stream data writes in batches of 16.
+    for (size_t i = 0; i < entries.size(); i += 16) {
+        std::vector<RegW> batch;
+        size_t end = std::min(entries.size(), i + 16);
+        for (size_t j = i; j < end; ++j)
+            batch.push_back({REG_BRAM_DATA, static_cast<uint32_t>(entries[j])});
+        send_reg_write_batch(u, seq++, batch);
+        // small breather every ~100 packets so we don't outrun eth_ctrl
+        if (((i / 16) % 64) == 63)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+int load_roms(Udp& u, const std::string& dir) {
+    struct Entry { int kind; const char* name; bool optional; };
+    const Entry roms[] = {
+        {0, "G1_m.hex",     false},
+        {1, "G1_e.hex",     false},
+        {2, "G2_m.hex",     false},
+        {3, "G2_e.hex",     false},
+        {4, "NORM_W_m.hex", false},
+        {5, "NORM_W_e.hex", false},
+        {6, "PROMPT.hex",   false},
+    };
+    uint8_t seq = 200;
+    auto t0 = std::chrono::steady_clock::now();
+    for (const auto& r : roms) {
+        // Try the model-dir-prefixed name first (eg lbfp_full_G1_m.hex),
+        // then the bare name.
+        std::string p1 = dir + "/lbfp_full_" + r.name;
+        std::string p2 = dir + "/" + r.name;
+        std::ifstream probe1(p1);
+        std::string path = probe1 ? p1 : p2;
+        try {
+            auto entries = parse_hex_file(path);
+            load_rom(u, r.kind, entries, seq);
+        } catch (const std::exception& e) {
+            if (r.optional) {
+                std::fprintf(stderr, "[load-roms] skip %s: %s\n", r.name, e.what());
+            } else {
+                std::fprintf(stderr, "[load-roms] %s: %s\n", r.name, e.what());
+                return 1;
+            }
+        }
+    }
+    auto secs = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::printf("[load-roms] done in %.2f s\n", secs);
+    return 0;
+}
+
+// ---------------------------------------------------------------------
 // Subcommand: read-crc
 // ---------------------------------------------------------------------
 // Reads the FPGA's rolling XOR-with-rotate hash over every 512-bit
@@ -944,10 +1084,16 @@ void usage() {
         "                     each to <bin>.  Note: bursts cause AR/R desync\n"
         "                     mismatches; measure noise floor first.\n"
         "  restart            pulse restart, poll until done (or 60 s)\n"
-        "  tokens             read 10 result words from 0x1D0\n"
-        "                     (with -v: also print decoded text)\n"
-        "  read-crc           read FPGA CRC32 of every AXI rdata beat the\n"
-        "                     BFP master has seen since last restart\n"
+        "  tokens             pulse restart, wait for autoregress done,\n"
+        "                     read 10 result words from 0x1D0, decode\n"
+        "                     through vocab (auto-found), print hash\n"
+        "  peek-tokens        read current result_tokens without restart\n"
+        "  read-crc           read FPGA rolling hash of weight-bus reads\n"
+        "                     since last restart (matches across runs of\n"
+        "                     the same DDR3 contents)\n"
+        "  load-roms <dir>    stream per-model BRAM init (G1/G2 gammas,\n"
+        "                     final NORM_W, prompt tokens) from .hex files\n"
+        "                     in <dir> via the host-write protocol\n"
         "  all     <bin>      upload → verify → restart → tokens\n",
         FPGA_MAC, DEFAULT_PEER_IP);
 }
@@ -1099,12 +1245,33 @@ int main(int argc, char** argv) {
             return ok ? 0 : 1;
         }
         if (cmd == "tokens") {
+            // Single-shot autoregress means result_tokens latches at the
+            // last run's output and stays until next restart.  So
+            // `tokens` always pulses restart and waits for the new run
+            // to finish — otherwise running `tokens` twice gives identical
+            // (stale) output, which is a confusing default.  Use
+            // `peek-tokens` for the read-only "show me what's already
+            // there" case.
+            if (!restart_and_wait_done(u)) {
+                std::printf("[tokens] restart-wait timed out\n");
+                return 1;
+            }
             print_tokens(u, vocab.get(), n_steps);
+            print_crc(u);
+            return 0;
+        }
+        if (cmd == "peek-tokens") {
+            print_tokens(u, vocab.get(), n_steps);
+            print_crc(u);
             return 0;
         }
         if (cmd == "read-crc") {
             print_crc(u);
             return 0;
+        }
+        if (cmd == "load-roms") {
+            if (argi >= argc) { usage(); return 2; }
+            return load_roms(u, argv[argi]);
         }
         if (cmd == "all") {
             if (argi >= argc) { usage(); return 2; }

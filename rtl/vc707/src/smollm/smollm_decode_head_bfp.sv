@@ -52,7 +52,13 @@ module smollm_decode_head_bfp #(
   input  wire [AXI_ID_WIDTH-1:0]                    m_axi_rid,
   input  wire [511:0]                               m_axi_rdata,
   input  wire [1:0]                                 m_axi_rresp,
-  input  wire                                       m_axi_rlast
+  input  wire                                       m_axi_rlast,
+  // Host write port for rom_NW_m (kind=4) and rom_NW_e (kind=5).
+  // Plumbed in from vc707_microgpt_eth via the autoregress top.
+  input  wire [4:0]                                 wr_kind,
+  input  wire [17:0]                                wr_addr,
+  input  wire [15:0]                                wr_data,
+  input  wire                                       wr_en
 );
 
   localparam int NT_D          = D / BFP_TILE;
@@ -65,18 +71,18 @@ module smollm_decode_head_bfp #(
   (* ram_style = "block" *) logic signed [BFP_MANT_W-1:0] rom_NW_m [0:D-1];
   (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] rom_NW_e [0:NT_D-1];
 
-  // norm_w always BRAM-loaded (tiny: 576 × 2 B + 36 B).
-`ifdef MICROGPT_WEIGHT_DIR
-  initial begin
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "NORM_W_m.hex"}, rom_NW_m);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "NORM_W_e.hex"}, rom_NW_e);
+  // norm_w is host-loaded at boot via the wr_* port (kind=4 for NW_m,
+  // kind=5 for NW_e).  Power-on contents are all-zero; host must call
+  // bfp_client load-roms before inference is meaningful.
+  always_ff @(posedge clk) begin
+    if (wr_en) begin
+      case (wr_kind)
+        5'd4: rom_NW_m[wr_addr[$clog2(D)-1:0]]    <= $signed(wr_data);
+        5'd5: rom_NW_e[wr_addr[$clog2(NT_D)-1:0]] <= $signed(wr_data[BFP_EXP_W-1:0]);
+        default: ;
+      endcase
+    end
   end
-`else
-  initial begin
-    $readmemh({PREFIX, "NORM_W_m.hex"}, rom_NW_m);
-    $readmemh({PREFIX, "NORM_W_e.hex"}, rom_NW_e);
-  end
-`endif
 
   // ---------------------------------------------------------------------------
   // Latched hidden_in (BRAM-style)

@@ -38,6 +38,12 @@ module smollm_multilayer_tm_bfp #(
   output logic signed [(D/BFP_TILE)*BFP_EXP_W-1:0]  hidden_out_e,
   output logic                                      done,
   output wire  [31:0]                               weight_hash,
+  // Pass-through host BRAM write port (kinds 0..3 land in this layer's
+  // gammas; other kinds pass through harmlessly).
+  input  wire [4:0]                                 wr_kind,
+  input  wire [17:0]                                wr_addr,
+  input  wire [15:0]                                wr_data,
+  input  wire                                       wr_en,
   // DDR3 streamer ports.  Layer-0 base addresses for each weight
   // matrix — this module derives per-layer bases as `base + lay_idx
   // × W?_*_PL` internally.
@@ -149,7 +155,7 @@ module smollm_multilayer_tm_bfp #(
     .hidden_in_m(h_state_m), .hidden_in_e(h_state_e),
     .hidden_out_m(lay_hidden_out_m), .hidden_out_e(lay_hidden_out_e),
     .done(lay_done),
-    .wr_kind(5'd0), .wr_addr(18'd0), .wr_data(16'd0), .wr_en(1'b0),
+    .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(wr_data), .wr_en(wr_en),
     .ws_base_WQ_m(lay_base_WQ_m),   .ws_base_WQ_e(lay_base_WQ_e),
     .ws_base_WK_m(lay_base_WK_m),   .ws_base_WK_e(lay_base_WK_e),
     .ws_base_WV_m(lay_base_WV_m),   .ws_base_WV_e(lay_base_WV_e),

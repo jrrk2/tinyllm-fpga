@@ -721,6 +721,43 @@ module vc707_microgpt_eth (
     lay_rst_sync_core <= {lay_rst_sync_core[1:0], lay_rst_tog_eth};
   wire lay_restart_core = lay_rst_sync_core[2] ^ lay_rst_sync_core[1];
 
+  // -------------------------------------------------------------------
+  // Host BRAM write protocol (Phase 1: per-model gammas + norm_w +
+  // prompt).  Two regmap entries on the host side:
+  //   0x060 (write): {bram_inc[31], 8'd0, bram_kind[22:18], bram_addr[17:0]}
+  //                  — set target.  bram_inc=1 enables auto-increment
+  //                  of bram_addr after each 0x061 write.
+  //   0x061 (write): bram_data[15:0]  — pulse a write into the targeted
+  //                  BRAM at current bram_addr.
+  // Eth-clock-domain state is latched on regmap writes; a toggle-CDC
+  // pulse into core_clk drives the actual BRAM write.  bram_kind /
+  // bram_addr / bram_data are quasi-static during the CDC (changed
+  // synchronously with the toggle); 2-FF sync is safe.
+  // -------------------------------------------------------------------
+  reg [4:0]  bram_kind_eth   = 5'd0;
+  reg [17:0] bram_addr_eth   = 18'd0;
+  reg [15:0] bram_data_eth   = 16'd0;
+  reg        bram_inc_eth    = 1'b0;
+  reg        bram_wr_tog_eth = 1'b0;
+
+  (* ASYNC_REG = "TRUE" *) reg [4:0]  bram_kind_sync1_core, bram_kind_sync2_core;
+  (* ASYNC_REG = "TRUE" *) reg [17:0] bram_addr_sync1_core, bram_addr_sync2_core;
+  (* ASYNC_REG = "TRUE" *) reg [15:0] bram_data_sync1_core, bram_data_sync2_core;
+  (* ASYNC_REG = "TRUE" *) reg [2:0]  bram_tog_sync_core   = 3'd0;
+  always_ff @(posedge core_clk) begin
+    bram_kind_sync1_core <= bram_kind_eth;
+    bram_kind_sync2_core <= bram_kind_sync1_core;
+    bram_addr_sync1_core <= bram_addr_eth;
+    bram_addr_sync2_core <= bram_addr_sync1_core;
+    bram_data_sync1_core <= bram_data_eth;
+    bram_data_sync2_core <= bram_data_sync1_core;
+    bram_tog_sync_core   <= {bram_tog_sync_core[1:0], bram_wr_tog_eth};
+  end
+  wire [4:0]  bram_wr_kind_core = bram_kind_sync2_core;
+  wire [17:0] bram_wr_addr_core = bram_addr_sync2_core;
+  wire [15:0] bram_wr_data_core = bram_data_sync2_core;
+  wire        bram_wr_en_core   = bram_tog_sync_core[2] ^ bram_tog_sync_core[1];
+
   // Diagnostic snapshot signals — read by host via 0x012..0x044.
   wire [29:0]  dbg_first_araddr;
   wire [511:0] dbg_first_rdata;
@@ -1096,7 +1133,11 @@ module vc707_microgpt_eth (
     .m_axi_rid    ( m_axi_rid         ),
     .m_axi_rdata  ( m_axi_rdata       ),
     .m_axi_rresp  ( m_axi_rresp       ),
-    .m_axi_rlast  ( m_axi_rlast       )
+    .m_axi_rlast  ( m_axi_rlast       ),
+    .wr_kind      ( bram_wr_kind_core ),
+    .wr_addr      ( bram_wr_addr_core ),
+    .wr_data      ( bram_wr_data_core ),
+    .wr_en        ( bram_wr_en_core   )
   );
   assign lay_result = {{(9216 - LBFP_NSTEPS*16){1'b0}}, bfp_result_tokens};
 
@@ -1306,6 +1347,24 @@ module vc707_microgpt_eth (
         10'h191: if (jtag_master_writedata[0]) sg_rst_tog_eth   <= ~sg_rst_tog_eth;
         10'h1C1: if (jtag_master_writedata[0]) sm_rst_tog_eth   <= ~sm_rst_tog_eth;
         10'h1F1: if (jtag_master_writedata[0]) lay_rst_tog_eth  <= ~lay_rst_tog_eth;
+        // 0x060 — set BRAM target.  Format:
+        //   [31]    auto-increment enable
+        //   [22:18] bram_kind  (0..6 in Phase 1, 7..31 reserved)
+        //   [17:0]  base address inside the destination BRAM
+        10'h060: begin
+          bram_inc_eth  <= jtag_master_writedata[31];
+          bram_kind_eth <= jtag_master_writedata[22:18];
+          bram_addr_eth <= jtag_master_writedata[17:0];
+        end
+        // 0x061 — one BRAM write.  bram_data = writedata[15:0]; pulse the
+        // toggle so the core_clk-side decoder fires a wr_en.  If
+        // bram_inc_eth is set, increment bram_addr_eth after the pulse
+        // so a stream of writes to 0x061 fills the BRAM linearly.
+        10'h061: begin
+          bram_data_eth   <= jtag_master_writedata[15:0];
+          bram_wr_tog_eth <= ~bram_wr_tog_eth;
+          if (bram_inc_eth) bram_addr_eth <= bram_addr_eth + 18'd1;
+        end
         default: ;
       endcase
       // Runtime SwiGLU/Attn factor overrides — eth-clk shadow + toggle CDC.

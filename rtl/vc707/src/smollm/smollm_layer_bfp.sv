@@ -323,39 +323,29 @@ module smollm_layer_bfp #(
   // Weights come from DDR3 via the streamer below; gammas continue to
   // load from hex.  KV caches are zero-initialised by Vivado's bitstream
   // (no $readmemh) — autoregress writes each kv_pos before reading it.
-`ifdef MICROGPT_WEIGHT_DIR
-  initial begin
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "G1_m.hex"},  rom_G1_m);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "G2_m.hex"},  rom_G2_m);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "G1_e.hex"},  rom_G1_e);
-    $readmemh({`MICROGPT_WEIGHT_DIR, "/", PREFIX, "G2_e.hex"},  rom_G2_e);
-  end
-`else
-  initial begin
-    $readmemh({PREFIX, "G1_m.hex"},  rom_G1_m);
-    $readmemh({PREFIX, "G2_m.hex"},  rom_G2_m);
-    $readmemh({PREFIX, "G1_e.hex"},  rom_G1_e);
-    $readmemh({PREFIX, "G2_e.hex"},  rom_G2_e);
-  end
-`endif
+  // Per-model gamma BRAMs (G1_m, G2_m, G1_e, G2_e) are host-loaded at
+  // boot via the wr_* port below — no $readmemh.  Power-on state is
+  // all zeros; host must call bfp_client load-roms before inference.
 
   // ---------------------------------------------------------------------------
-  // Host write port (wr_kind / wr_addr / wr_data / wr_en): currently NOT
-  // wired internally.  The wide-packed ROM layout that Vivado needs for
-  // BRAM inference (256-bit-wide mantissa entries cascaded across multiple
-  // RAMB36 primitives) is incompatible with a single-mantissa byte-write
-  // port.  To restore writability the host would have to use a 2-cycle
-  // read-modify-write helper FSM, or the build flow would emit per-lane
-  // BRAM wrappers (cf. gen_brom_sv.py for the int8 path).
-  //
-  // For now hex files are the source of truth: regenerate via
-  //   make USE_BFP=1 bfp-sim     # rebake lbfp_*.hex
-  // and resynthesize.  The wr_* wrapper port is retained for ABI compat
-  // with the int8 scale-write regmap path, but writes are dropped here.
+  // Host write port for the gamma BRAMs.
+  //   wr_kind: 0=G1_m  1=G1_e  2=G2_m  3=G2_e   (kinds 4..6 belong to the
+  //            decode head and autoregress top; this module ignores them.)
+  //   wr_addr: linear entry index in the destination BRAM
+  //   wr_data: 16-bit mantissa or low-8-bit exponent
+  //   wr_en  : 1-cycle pulse from the top regmap CDC
   // ---------------------------------------------------------------------------
-  /* verilator lint_off UNUSEDSIGNAL */
-  wire _unused_wr = &{1'b0, wr_kind, wr_addr, wr_data, wr_en, 1'b0};
-  /* verilator lint_on UNUSEDSIGNAL */
+  always_ff @(posedge clk) begin
+    if (wr_en) begin
+      case (wr_kind)
+        5'd0: rom_G1_m[wr_addr[$clog2(NL*D)-1:0]]      <= $signed(wr_data);
+        5'd1: rom_G1_e[wr_addr[$clog2(NL*NT_D)-1:0]]   <= $signed(wr_data[BFP_EXP_W-1:0]);
+        5'd2: rom_G2_m[wr_addr[$clog2(NL*D)-1:0]]      <= $signed(wr_data);
+        5'd3: rom_G2_e[wr_addr[$clog2(NL*NT_D)-1:0]]   <= $signed(wr_data[BFP_EXP_W-1:0]);
+        default: ;  // other kinds handled elsewhere in the hierarchy
+      endcase
+    end
+  end
 
   // ---------------------------------------------------------------------------
   // Working buffers
