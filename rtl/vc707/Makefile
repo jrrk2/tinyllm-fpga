@@ -237,9 +237,93 @@ flash: $(mcs)
 	@# at high CPU after JTAG flash if not killed.
 	@pkill -f 'cs_server|hw_server' 2>/dev/null || true
 
+# ----------------------------------------------------------------------
+# Release: capture the current build into release/ so it survives
+# `make clean` and can be re-programmed / flashed / demo'd later
+# without rebuilding.  Stores the bitstream, the .mcs (BPI image),
+# the DDR3 weight image, the baked vocab, the Vivado reports, and a
+# small build_info.txt with build_version + git hash + dims.
+#
+# Targets:
+#   make release         capture the current build into release/
+#   make program-release JTAG-program release/*.bit  (DDR3 contents lost)
+#   make flash-release   write release/*.mcs to BPI flash (persists)
+#   make demo            build + run bfp_client against release/ artifacts
+# ----------------------------------------------------------------------
+release-dir := release
+release-bit := $(release-dir)/vc707_microgpt_eth.bit
+release-mcs := $(release-dir)/vc707_microgpt_eth.mcs
+release-ddr := $(release-dir)/lbfp_full_DDR3.bin
+release-voc := $(release-dir)/bfp_vocab.bin
+
+# Build a release snapshot from whatever is currently in work/, the
+# generated/ tree, and the Vivado reports.  Requires `make` to have
+# completed first (we don't trigger a fresh synth from here — that's
+# what `make` itself is for).
+release: $(bit) $(mcs) $(GENERATED_DIR)/lbfp_full_DDR3.bin host/bfp_vocab.bin
+	@mkdir -p $(release-dir)/reports
+	@cp $(bit)                              $(release-bit)
+	@cp $(mcs)                              $(release-mcs)
+	@cp $(GENERATED_DIR)/lbfp_full_DDR3.bin $(release-ddr)
+	@cp host/bfp_vocab.bin                  $(release-voc)
+	@cp $(GENERATED_DIR)/lbfp_full_cfg.svh             $(release-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/lbfp_full_PROMPT_TOKENS.txt   $(release-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/lbfp_full_GOLDEN_TOKENS.txt   $(release-dir)/ 2>/dev/null || true
+	@# Vivado reports — pull from both reports/ (run.tcl-emitted) and
+	@# microgpt_eth.runs/impl_1 (per-step reports).  Missing files are OK.
+	@cp -r reports/.                                          $(release-dir)/reports/ 2>/dev/null || true
+	@cp microgpt_eth.runs/impl_1/*timing_summary_routed.rpt   $(release-dir)/reports/ 2>/dev/null || true
+	@cp microgpt_eth.runs/impl_1/*utilization*.rpt            $(release-dir)/reports/ 2>/dev/null || true
+	@cp microgpt_eth.runs/impl_1/*drc_routed.rpt              $(release-dir)/reports/ 2>/dev/null || true
+	@cp microgpt_eth.runs/impl_1/*methodology_drc_routed.rpt  $(release-dir)/reports/ 2>/dev/null || true
+	@cp microgpt_eth.runs/synth_1/*utilization_synth.rpt      $(release-dir)/reports/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/build_version.svh                    $(release-dir)/ 2>/dev/null || true
+	@{ \
+	    echo "build_date: $$(date -u --iso-8601=seconds)"; \
+	    echo "git_hash:   $$(git rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	    echo "git_status: $$(git diff --shortstat HEAD 2>/dev/null || echo unknown)"; \
+	    echo "host:       $$(hostname)"; \
+	    grep -h '^`define LBFP_FULL_' $(GENERATED_DIR)/lbfp_full_cfg.svh 2>/dev/null; \
+	    grep -h 'BUILD_VERSION' $(GENERATED_DIR)/build_version.svh 2>/dev/null; \
+	    echo "bitstream:  $$(du -h $(release-bit) | cut -f1)"; \
+	    echo "mcs:        $$(du -h $(release-mcs) | cut -f1)"; \
+	    echo "ddr3 image: $$(du -h $(release-ddr) | cut -f1)"; \
+	} > $(release-dir)/build_info.txt
+	@echo "=== release captured into $(release-dir)/ ==="
+	@cat $(release-dir)/build_info.txt
+
+program-release: $(release-bit)
+	BITFILE=$(release-bit) $(VIVADO) $(VIVADOFLAGS) -source scripts/program.tcl
+	@pkill -f 'cs_server|hw_server' 2>/dev/null || true
+
+flash-release: $(release-mcs)
+	MCSFILE=$(release-mcs) $(VIVADO) $(VIVADOFLAGS) -source scripts/flash.tcl
+	@pkill -f 'cs_server|hw_server' 2>/dev/null || true
+
+# Single demo target: builds host/bfp_client (no-torch C++ client),
+# then runs the full upload → restart → tokens → vocab-decode pipeline
+# against the release-area artifacts.  Defaults are conservative
+# (-L 1024 -P 20 = ~3.3 MB/s, verified byte-perfect).  Assumes the
+# bitstream is already on the FPGA (via program-release / flash-release
+# + power-cycle).  DDR3 contents are lost on any JTAG reprogram, so the
+# demo always re-uploads the weight image.
+host/bfp_client: host/bfp_client.cpp
+	g++ -std=c++17 -O2 -Wall -Wextra -pthread -o $@ $<
+
+demo: host/bfp_client $(release-ddr) $(release-voc)
+	./host/bfp_client -v $(release-voc) all $(release-ddr)
+
+# ----------------------------------------------------------------------
+# `make clean` deliberately preserves release/ — the whole point is that
+# a captured release survives a fresh build.  Use `make distclean` to
+# blow it away.
+# ----------------------------------------------------------------------
 clean:
 	rm -rf *.log *.jou *.str *.mif $(work-dir) microgpt_eth.cache microgpt_eth.hw \
 	       microgpt_eth.ip_user_files microgpt_eth.runs microgpt_eth.srcs \
 	       microgpt_eth.sim scripts/vivado*
 
-.PHONY: all mcs program flash clean
+distclean: clean
+	rm -rf $(release-dir) host/bfp_client
+
+.PHONY: all mcs program flash release program-release flash-release demo clean distclean

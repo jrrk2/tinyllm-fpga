@@ -17,7 +17,10 @@ foreach target [get_hw_targets] {
 current_hw_device [get_hw_devices $device_name]
 refresh_hw_device -update_hw_probes false [current_hw_device]
 
-set mcsfile work/vc707_microgpt_eth.mcs
+# Override via env MCSFILE=<path> (used by `make flash-release`).
+set mcsfile [expr {[info exists ::env(MCSFILE)] ? $::env(MCSFILE)
+                                                : "work/vc707_microgpt_eth.mcs"}]
+puts "flash.tcl: mcsfile = $mcsfile"
 create_hw_cfgmem -hw_device [current_hw_device] [lindex [get_cfgmem_parts $flash_type] 0]
 set cfgmem [get_property PROGRAM.HW_CFGMEM [current_hw_device]]
 set_property PROGRAM.FILES [list $mcsfile] $cfgmem

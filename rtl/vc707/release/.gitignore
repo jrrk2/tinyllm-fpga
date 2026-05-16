@@ -1,0 +1,11 @@
+# Track the structure + README, ignore the heavy build artifacts.
+# Run `make release` from rtl/vc707/ to (re)populate this directory.
+*.bit
+*.mcs
+*.bin
+*.svh
+*.txt
+build_info.txt
+reports/
+!README.md
+!.gitignore

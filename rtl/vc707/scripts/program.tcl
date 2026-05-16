@@ -12,7 +12,11 @@ foreach target [get_hw_targets] {
 }
 
 current_hw_device [get_hw_devices $device_name]
-set_property PROGRAM.FILE {work/vc707_microgpt_eth.bit} [current_hw_device]
+# Override via env BITFILE=<path> (used by `make program-release`).
+set bitfile [expr {[info exists ::env(BITFILE)] ? $::env(BITFILE)
+                                                : "work/vc707_microgpt_eth.bit"}]
+puts "program.tcl: bitfile = $bitfile"
+set_property PROGRAM.FILE $bitfile [current_hw_device]
 program_hw_devices [current_hw_device]
 refresh_hw_device [current_hw_device]
 
