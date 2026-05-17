@@ -239,20 +239,67 @@ $(ips): %.xci :
 	@cd $(ip-dir)/$(basename $(@F)) && make clean && make
 	@cp $(ip-dir)/$(basename $(@F))/$(basename $(@F)).srcs/sources_1/ip/$(basename $(@F))/$(@F) $@
 
-$(mcs): $(bit)
-	$(VIVADO) $(VIVADOFLAGS) -source scripts/write_cfgmem.tcl -tclargs $@ $^
+# ----------------------------------------------------------------------
+# program / flash / mcs — capture-style.  Never re-trigger a full Vivado
+# synth: if a bitstream exists anywhere reasonable, use it directly.
+# The previous `flash: $(mcs)` chain walked the synthesis dep graph all
+# the way back, so a stale work/ dir or a touched .hex dep would launch
+# a 25-min rebuild on what should be a 2-min flash.
+# ----------------------------------------------------------------------
+# Resolved at make-parse time — the freshest existing bit/mcs, if any.
+EXISTING_BIT := $(firstword $(wildcard \
+    microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit \
+    $(work-dir)/vc707_microgpt_eth.bit))
+EXISTING_MCS := $(firstword $(wildcard \
+    microgpt_eth.runs/impl_1/vc707_microgpt_eth.mcs \
+    $(work-dir)/vc707_microgpt_eth.mcs))
 
-mcs: $(mcs)
+# Re-bake the BPI image from the current bit.  Falls back to a full
+# Vivado synth only if no bitstream exists anywhere.
+mcs:
+	@if [ -n "$(EXISTING_BIT)" ]; then \
+	    echo "[mcs] from $(EXISTING_BIT)"; \
+	    $(VIVADO) $(VIVADOFLAGS) -source scripts/write_cfgmem.tcl \
+	        -tclargs $(EXISTING_BIT:.bit=.mcs) $(EXISTING_BIT); \
+	else \
+	    echo "[mcs] no bitstream found — running full build"; \
+	    $(MAKE) $(bit); \
+	    $(VIVADO) $(VIVADOFLAGS) -source scripts/write_cfgmem.tcl \
+	        -tclargs $(mcs) $(bit); \
+	fi
 
+# JTAG-load from the freshest bit.  Aborts (not rebuilds) if absent.
 program:
-	$(VIVADO) $(VIVADOFLAGS) -source scripts/program.tcl
+	@if [ -z "$(EXISTING_BIT)" ]; then \
+	    echo "ERROR: no bitstream found in microgpt_eth.runs/ or $(work-dir)/"; \
+	    echo "       Run 'make all' first, or 'make program-release' for release/."; \
+	    exit 1; \
+	fi
+	@echo "[program] from $(EXISTING_BIT)"
+	BITFILE=$(EXISTING_BIT) $(VIVADO) $(VIVADOFLAGS) -source scripts/program.tcl
 	@# program.tcl cleanly closes the hw_manager, but Vivado's
 	@# cs_server (ChipScope) and hw_server (JTAG) sometimes survive
 	@# as background processes and idle-poll at high CPU.  Reap them.
 	@pkill -f 'cs_server|hw_server' 2>/dev/null || true
 
-flash: $(mcs)
-	$(VIVADO) $(VIVADOFLAGS) -source scripts/flash.tcl
+# Write BPI flash from the freshest mcs.  Bakes mcs on the fly from
+# an existing bit if needed; never re-runs Vivado synth.
+flash:
+	@set -e; \
+	if [ -n "$(EXISTING_MCS)" ]; then \
+	    mcs_path="$(EXISTING_MCS)"; \
+	elif [ -n "$(EXISTING_BIT)" ]; then \
+	    mcs_path="$(EXISTING_BIT:.bit=.mcs)"; \
+	    echo "[flash] generating $$mcs_path from $(EXISTING_BIT)"; \
+	    $(VIVADO) $(VIVADOFLAGS) -source scripts/write_cfgmem.tcl \
+	        -tclargs $$mcs_path $(EXISTING_BIT); \
+	else \
+	    echo "ERROR: no bitstream found in microgpt_eth.runs/ or $(work-dir)/"; \
+	    echo "       Run 'make all' first, or 'make flash-release' for release/."; \
+	    exit 1; \
+	fi; \
+	echo "[flash] writing $$mcs_path to BPI flash"; \
+	MCSFILE=$$mcs_path $(VIVADO) $(VIVADOFLAGS) -source scripts/flash.tcl
 	@# Same reap as `program:` — Vivado's cs_server/hw_server idle-poll
 	@# at high CPU after JTAG flash if not killed.
 	@pkill -f 'cs_server|hw_server' 2>/dev/null || true
