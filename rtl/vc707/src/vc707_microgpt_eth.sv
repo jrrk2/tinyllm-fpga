@@ -1025,8 +1025,26 @@ module vc707_microgpt_eth (
   // of lay_result (9216-bit legacy bus); host reads via the existing
   // 0x1D0 regmap window (32 32-bit words, 19 tokens occupy the first ~10).
   // ----------------------------------------------------------------------
-  localparam int LBFP_NSTEPS = `LBFP_FULL_NPROMPT + `LBFP_FULL_NGEN;   // 19
+  // Result-token buffer sized for the maximum prompt the bitstream
+  // supports (NPROMPT_MAX) + the fixed N_GEN.  The active prompt
+  // length is host-settable at runtime via regmap 0x063, so the
+  // first `n_prompt_active` slots hold the prompt tokens and the
+  // next N_GEN slots hold the generated tokens.
+  localparam int LBFP_NSTEPS = `LBFP_FULL_NPROMPT_MAX + `LBFP_FULL_NGEN;
   wire [LBFP_NSTEPS*16-1:0] bfp_result_tokens;
+
+  // Active prompt length register.  Eth_clk side latched on regmap
+  // write to 0x063; 2-FF synced into core_clk for the autoregress
+  // FSM.  Boot default = LBFP_FULL_NPROMPT (the value that came out
+  // of the packer for the prompt baked into the .hex set).
+  localparam int NPA_W = $clog2(`LBFP_FULL_NPROMPT_MAX + 1);
+  reg [NPA_W-1:0] n_prompt_active_eth;
+  (* ASYNC_REG = "TRUE" *) reg [NPA_W-1:0] npa_sync1_core, npa_sync2_core;
+  always_ff @(posedge core_clk) begin
+    npa_sync1_core <= n_prompt_active_eth;
+    npa_sync2_core <= npa_sync1_core;
+  end
+  wire [NPA_W-1:0] n_prompt_active_core = npa_sync2_core;
 
   // Single-shot start: exactly one autoregress run per (reset OR restart
   // pulse).  Earlier perpetual auto-restart hammered MIG with reads
@@ -1071,6 +1089,7 @@ module vc707_microgpt_eth (
     .NL      (`LBFP_FULL_NL),
     .MAX_CTX (`LBFP_FULL_MAX_CTX),
     .VOCAB   (`LBFP_FULL_VOCAB),
+    .NPROMPT_MAX(`LBFP_FULL_NPROMPT_MAX),
     .N_PROMPT(`LBFP_FULL_NPROMPT),
     .N_GEN   (`LBFP_FULL_NGEN),
     .PREFIX  ("lbfp_full_"),
@@ -1081,6 +1100,7 @@ module vc707_microgpt_eth (
     .clk          ( core_clk          ),
     .rst          ( ~core_resetn | lay_restart_core ),
     .start        ( bfp_start_r       ),
+    .n_prompt_active( n_prompt_active_core ),
     .done         ( lay_done_core     ),
     .result_tokens( bfp_result_tokens ),
     .weight_hash  ( bfp_weight_hash_core ),
@@ -1285,6 +1305,7 @@ module vc707_microgpt_eth (
       scale_wr_addr_eth    <= '0;
       scale_wr_data_eth    <= '0;
       scale_wr_toggle_eth  <= 1'b0;
+      n_prompt_active_eth  <= NPA_W'(`LBFP_FULL_NPROMPT);
     end
 
     if (read_pending_reg) begin
@@ -1362,6 +1383,13 @@ module vc707_microgpt_eth (
           bram_wr_en_eth   <= 1'b1;
           if (bram_inc_eth) bram_addr_eth <= bram_addr_eth + 18'd1;
         end
+        // 0x063 — set the active prompt length (number of prompt_rom
+        // entries the autoregress FSM consumes before switching to
+        // generation).  Must be in [1, LBFP_FULL_NPROMPT_MAX].  Boot
+        // default is `LBFP_FULL_NPROMPT (the value baked into the
+        // .hex prompt file at packer-time).  Host writes this once
+        // per fine-tune after load-roms.
+        10'h063: n_prompt_active_eth <= jtag_master_writedata[NPA_W-1:0];
         default: ;
       endcase
       // Runtime SwiGLU/Attn factor overrides — eth-clk shadow + toggle CDC.
@@ -1717,6 +1745,7 @@ module vc707_microgpt_eth (
       //        the regmap's own read_pending_reg cycle plus the BRAM
       //        port-A output register that ran 1 eth_clk after 0x060.
       10'h062: read_data_comb = {16'd0, bram_rdata_eth};
+      10'h063: read_data_comb = {{(32-NPA_W){1'b0}}, n_prompt_active_eth};
       // 0x019..0x01C: DDR3 write-path stage counters (eth_clk domain).
       //   0x019 ddr_wr_rx_count   = FT_DDR_WRITE frames accepted by parser
       //   0x01A ddr_wr_done_count = ddr_wr_req toggles (write dispatched)

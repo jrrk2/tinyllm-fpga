@@ -25,9 +25,16 @@ module autoregress_bfp_top #(
   parameter int NL       = 30,
   parameter int MAX_CTX  = 64,
   parameter int VOCAB    = 49152,
-  parameter int N_PROMPT = 4,
-  parameter int N_GEN    = 15,
-  parameter int N_STEPS  = N_PROMPT + N_GEN,
+  // NPROMPT_MAX sizes the host-writable prompt_rom and the result_tokens
+  // output buffer at synthesis time.  N_PROMPT is the boot-time default
+  // active prompt length (the value the host can override at runtime
+  // via n_prompt_active).  Any prompt of length 1..NPROMPT_MAX can run
+  // on the same bitstream — no Vivado rebuild needed when changing the
+  // prompt length.
+  parameter int NPROMPT_MAX = 64,
+  parameter int N_PROMPT    = 4,
+  parameter int N_GEN       = 15,
+  parameter int N_STEPS     = NPROMPT_MAX + N_GEN,
   parameter     PREFIX   = "lbfp_full_",
   parameter bit STREAM_LOOKUP  = 1'b0,
   parameter int AXI_ADDR_WIDTH = 30,
@@ -36,6 +43,11 @@ module autoregress_bfp_top #(
   input  wire                          clk,
   input  wire                          rst,
   input  wire                          start,
+  // Active prompt length — number of prompt_rom entries the FSM
+  // consumes before switching to autoregressive generation.  Must be
+  // in [1, NPROMPT_MAX].  Already 2-FF synced into the core_clk
+  // domain by the caller; stable for the duration of a run.
+  input  wire [$clog2(NPROMPT_MAX+1)-1:0] n_prompt_active,
   output logic                         done,
   output logic [N_STEPS*16-1:0]        result_tokens,
   output wire  [31:0]                  weight_hash,
@@ -98,13 +110,13 @@ module autoregress_bfp_top #(
   // prompt_rom is host-loaded at boot via wr_* (kind=6, addr=0..N_PROMPT-1).
   // Power-on contents are all-zero — autoregress would treat that as
   // <|endoftext|> tokens until host calls bfp_client load-roms.
-  (* ram_style = "block" *) logic [15:0] prompt_rom [0:N_PROMPT-1];
+  (* ram_style = "block" *) logic [15:0] prompt_rom [0:NPROMPT_MAX-1];
   logic [15:0] rd_prompt;
   logic [4:0]  wr_kind_q;
   always_ff @(posedge clk_wr) begin
     if (wr_en && wr_kind == 5'd6)
-      prompt_rom[wr_addr[$clog2(N_PROMPT)-1:0]] <= wr_data;
-    rd_prompt <= prompt_rom[wr_addr[$clog2(N_PROMPT)-1:0]];
+      prompt_rom[wr_addr[$clog2(NPROMPT_MAX)-1:0]] <= wr_data;
+    rd_prompt <= prompt_rom[wr_addr[$clog2(NPROMPT_MAX)-1:0]];
     wr_kind_q <= wr_kind;
   end
 
@@ -344,7 +356,8 @@ module autoregress_bfp_top #(
           state      <= S_DRIVE;
         end
         S_DRIVE: begin
-          if (step < N_PROMPT) mdl_token_in <= prompt_rom[step[$clog2(N_PROMPT+1)-1:0]];
+          if (step < n_prompt_active)
+                               mdl_token_in <= prompt_rom[step[$clog2(NPROMPT_MAX)-1:0]];
           else                 mdl_token_in <= last_token;
           mdl_pos    <= 11'(step);
           mdl_kv_pos <= 7'(step);

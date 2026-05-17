@@ -460,8 +460,15 @@ def main():
         f.write(f"`define LBFP_FULL_NL      {NL}\n")
         f.write(f"`define LBFP_FULL_MAX_CTX {MAX_CTX}\n")
         f.write(f"`define LBFP_FULL_VOCAB   {VOCAB + pad}\n")
-        f.write(f"`define LBFP_FULL_NPROMPT {len(ids)}\n")
-        f.write(f"`define LBFP_FULL_NGEN    {N_GEN}\n")
+        f.write(f"`define LBFP_FULL_NPROMPT     {len(ids)}\n")
+        # NPROMPT_MAX sizes the on-chip prompt_rom and result_tokens
+        # buffer at synthesis time.  The host may write a different
+        # active length at runtime (regmap 0x063) so any prompt up to
+        # NPROMPT_MAX tokens can run on the same bitstream without a
+        # Vivado rebuild.  Capped at 48 so NPROMPT_MAX + NGEN (=63)
+        # fits the 32-word legacy result-token regmap window at 0x1D0.
+        f.write(f"`define LBFP_FULL_NPROMPT_MAX 48\n")
+        f.write(f"`define LBFP_FULL_NGEN        {N_GEN}\n")
 
     print(f"[bake] done. files in {OUT}/{PREFIX}*", file=sys.stderr)
 

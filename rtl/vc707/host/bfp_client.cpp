@@ -85,12 +85,18 @@ constexpr uint16_t REG_RDATA_CRC     = 0x04A;   // CRC32 over BFP master's R bea
 constexpr uint16_t REG_BRAM_TARGET   = 0x060;   // write: {inc[31], 8'd0, kind[22:18], addr[17:0]}
 constexpr uint16_t REG_BRAM_DATA     = 0x061;   // write: {16'd0, data[15:0]} — pulses BRAM write
 constexpr uint16_t REG_BRAM_READ     = 0x062;   // read: {16'd0, BRAM[kind, addr]} — port-A readback
+constexpr uint16_t REG_N_PROMPT      = 0x063;   // r/w: active prompt length (1..NPROMPT_MAX)
 constexpr uint16_t REG_BUILD_VERSION = 0x10F;
 constexpr uint16_t REG_RESULT        = 0x1D0;
 constexpr uint16_t REG_DONE          = 0x1F0;   // {30'd0, lay_done_latched, lay_done}
 constexpr uint16_t REG_RESTART       = 0x1F1;   // bit 0: write 1 to pulse restart
 
-constexpr int N_STEPS_DEFAULT = 19;   // matches LBFP_FULL_NPROMPT+NGEN baked
+// With NPROMPT_MAX=48 + NGEN=15 the result-tokens buffer is 63 slots.
+// The host reads all of them and trims based on the active prompt
+// length reported by the FPGA at 0x063.  Earlier bitstreams used
+// NPROMPT=4 / NGEN=15 = 19 slots; the new default reads more but
+// short bitstreams just have zero-padded tail words.
+constexpr int N_STEPS_DEFAULT = 63;
 constexpr int N_STEPS_MAX     = 64;   // regmap 0x1D0..0x1EF = 32 words = 64 × 16-bit
 
 constexpr int      CHUNK            = 64;            // bytes per FT_DDR_WRITE
@@ -1221,6 +1227,7 @@ int load_roms(Udp& u, const std::string& dir) {
     auto t0 = std::chrono::steady_clock::now();
     const char* env_prefix = std::getenv("MGRT_PREFIX");
     std::string prefix = env_prefix ? env_prefix : "lbfp_full_";
+    size_t prompt_len = 0;   // captured from kind=6's .hex file; written to 0x063 at end
     for (const auto& r : roms) {
         // Try the model-dir-prefixed name first (eg lbfp_full_G1_m.hex,
         // or whatever MGRT_PREFIX overrides to), then the bare name.
@@ -1230,6 +1237,7 @@ int load_roms(Udp& u, const std::string& dir) {
         std::string path = probe1 ? p1 : p2;
         try {
             auto entries = parse_hex_file(path);
+            if (r.kind == 6) prompt_len = entries.size();
             load_rom(u, r.kind, entries, seq);
         } catch (const std::exception& e) {
             if (r.optional) {
@@ -1238,6 +1246,21 @@ int load_roms(Udp& u, const std::string& dir) {
                 std::fprintf(stderr, "[load-roms] %s: %s\n", r.name, e.what());
                 return 1;
             }
+        }
+    }
+    // Tell the FPGA how many of the prompt_rom entries to actually
+    // consume — defaults to the value baked at synth time, but any
+    // length up to NPROMPT_MAX (64) works on the same bitstream.
+    if (prompt_len > 0) {
+        std::vector<RegW> set = {{REG_N_PROMPT, static_cast<uint32_t>(prompt_len)}};
+        send_reg_write_batch(u, seq++, set);
+        auto got = reg_read(u, REG_N_PROMPT, 1, seq++)[0];
+        if (got != prompt_len) {
+            std::fprintf(stderr,
+                "[load-roms] WARN: n_prompt_active set to %zu but readback %u\n",
+                prompt_len, got);
+        } else {
+            std::printf("[load-roms] n_prompt_active = %zu\n", prompt_len);
         }
     }
     auto secs = std::chrono::duration<double>(
@@ -1300,6 +1323,17 @@ std::vector<uint16_t> fetch_tokens(Udp& u, int n_steps) {
 
 void print_tokens(Udp& u, const Vocab* vocab, int n_steps) {
     auto tokens = fetch_tokens(u, n_steps);
+    // Trim to active_prompt + N_GEN (= 15) — the buffer is sized for
+    // NPROMPT_MAX prompts, but a short prompt leaves trailing zero
+    // slots that aren't meaningful output.  Older bitstreams that
+    // don't expose 0x063 just return 0; treat that as "no trim".
+    try {
+        uint32_t active = reg_read(u, REG_N_PROMPT, 1, 60)[0];
+        if (active > 0 && active < tokens.size()) {
+            size_t keep = std::min<size_t>(active + 15, tokens.size());
+            tokens.resize(keep);
+        }
+    } catch (...) { /* old bitstream — leave tokens untrimmed */ }
     std::printf("RTL_TOKENS:");
     for (auto t : tokens) std::printf(" %u", t);
     std::printf("\n");

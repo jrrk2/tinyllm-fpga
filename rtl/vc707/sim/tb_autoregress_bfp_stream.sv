@@ -15,7 +15,7 @@ module tb_autoregress_bfp_stream (
   input  wire                                                 rst,
   input  wire                                                 go,
   output wire                                                 done,
-  output wire [(`LBFP_FULL_NPROMPT + `LBFP_FULL_NGEN)*16-1:0] result_tokens
+  output wire [(`LBFP_FULL_NPROMPT_MAX + `LBFP_FULL_NGEN)*16-1:0] result_tokens
 );
 
   // AXI fabric between DUT master and mock slave.
@@ -38,6 +38,7 @@ module tb_autoregress_bfp_stream (
     .NL      (`LBFP_FULL_NL),
     .MAX_CTX (`LBFP_FULL_MAX_CTX),
     .VOCAB   (`LBFP_FULL_VOCAB),
+    .NPROMPT_MAX(`LBFP_FULL_NPROMPT_MAX),
     .N_PROMPT(`LBFP_FULL_NPROMPT),
     .N_GEN   (`LBFP_FULL_NGEN),
     .PREFIX  ("../generated/lbfp_full_"),
@@ -45,6 +46,7 @@ module tb_autoregress_bfp_stream (
     .AXI_ADDR_WIDTH(30),   .AXI_ID_WIDTH(5)
   ) dut (
     .clk(clk), .rst(rst), .start(go),
+    .n_prompt_active(($clog2(`LBFP_FULL_NPROMPT_MAX+1))'(`LBFP_FULL_NPROMPT)),
     .done(done), .result_tokens(result_tokens),
     .weight_hash(/* unused in sim */),
     .wr_kind(5'd0), .wr_addr(18'd0), .wr_data(16'd0), .wr_en(1'b0), .clk_wr(clk), .wr_rdata(/* unused */),
