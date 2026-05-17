@@ -45,6 +45,7 @@ module smollm_multilayer_tm_bfp #(
   input  wire [15:0]                                wr_data,
   input  wire                                       wr_en,
   input  wire                                       clk_wr,
+  output wire [15:0]                                wr_rdata,
   // DDR3 streamer ports.  Layer-0 base addresses for each weight
   // matrix — this module derives per-layer bases as `base + lay_idx
   // × W?_*_PL` internally.
@@ -157,7 +158,7 @@ module smollm_multilayer_tm_bfp #(
     .hidden_out_m(lay_hidden_out_m), .hidden_out_e(lay_hidden_out_e),
     .done(lay_done),
     .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(wr_data), .wr_en(wr_en),
-    .clk_wr(clk_wr),
+    .clk_wr(clk_wr), .wr_rdata(wr_rdata),
     .ws_base_WQ_m(lay_base_WQ_m),   .ws_base_WQ_e(lay_base_WQ_e),
     .ws_base_WK_m(lay_base_WK_m),   .ws_base_WK_e(lay_base_WK_e),
     .ws_base_WV_m(lay_base_WV_m),   .ws_base_WV_e(lay_base_WV_e),

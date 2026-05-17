@@ -46,6 +46,10 @@ module autoregress_bfp_top #(
   input  wire [15:0]                   wr_data,
   input  wire                          wr_en,
   input  wire                          clk_wr,   // BRAM write clock (eth_clk at top)
+  // Read-back of the BRAM at wr_addr — muxed across all sub-modules by
+  // wr_kind (registered, 1-cycle latency in clk_wr).  Returns zero for
+  // unmapped kinds.
+  output logic [15:0]                  wr_rdata,
   // Layer-0 / region base offsets — caller patches in lbfp_ddr3.svh
   // constants.  Ignored when neither stream is enabled.
   input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WQ_m,
@@ -95,9 +99,26 @@ module autoregress_bfp_top #(
   // Power-on contents are all-zero — autoregress would treat that as
   // <|endoftext|> tokens until host calls bfp_client load-roms.
   (* ram_style = "block" *) logic [15:0] prompt_rom [0:N_PROMPT-1];
+  logic [15:0] rd_prompt;
+  logic [4:0]  wr_kind_q;
   always_ff @(posedge clk_wr) begin
     if (wr_en && wr_kind == 5'd6)
       prompt_rom[wr_addr[$clog2(N_PROMPT)-1:0]] <= wr_data;
+    rd_prompt <= prompt_rom[wr_addr[$clog2(N_PROMPT)-1:0]];
+    wr_kind_q <= wr_kind;
+  end
+
+  // Read-back MUX.  Layer / decode-head MUXes (kinds 0..3 / 4..5)
+  // arrive on lay_wr_rdata / dec_wr_rdata (their own wr_kind_q select).
+  wire [15:0] lay_wr_rdata;
+  wire [15:0] dec_wr_rdata;
+  always_comb begin
+    case (wr_kind_q)
+      5'd0, 5'd1, 5'd2, 5'd3: wr_rdata = lay_wr_rdata;
+      5'd4, 5'd5:             wr_rdata = dec_wr_rdata;
+      5'd6:                   wr_rdata = rd_prompt;
+      default:                wr_rdata = 16'h0000;
+    endcase
   end
 
   localparam int NT_D = D / BFP_TILE;
@@ -235,7 +256,7 @@ module autoregress_bfp_top #(
     .m_axi_rresp  (m_axi_rresp),
     .m_axi_rlast  (m_axi_rlast),
     .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(wr_data), .wr_en(wr_en),
-    .clk_wr(clk_wr)
+    .clk_wr(clk_wr), .wr_rdata(lay_wr_rdata)
   );
 
   // ---------------------------------------------------------------------------
@@ -276,7 +297,7 @@ module autoregress_bfp_top #(
     .m_axi_rresp  (m_axi_rresp),
     .m_axi_rlast  (m_axi_rlast),
     .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(wr_data), .wr_en(wr_en),
-    .clk_wr(clk_wr)
+    .clk_wr(clk_wr), .wr_rdata(dec_wr_rdata)
   );
 
   // ---------------------------------------------------------------------------

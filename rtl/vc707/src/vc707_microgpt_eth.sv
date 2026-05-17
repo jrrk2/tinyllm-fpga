@@ -735,11 +735,17 @@ module vc707_microgpt_eth (
   // RAMB36E1 with asymmetric clocks — no CDC, no risk of dropped pulses.
   // -------------------------------------------------------------------
   reg [4:0]  bram_kind_eth    = 5'd0;
-  reg [17:0] bram_addr_eth    = 18'd0;   // next-write pointer
+  reg [17:0] bram_addr_eth    = 18'd0;   // next-write pointer (also read addr)
   reg [17:0] bram_wr_addr_eth = 18'd0;   // address used by the current pulse
   reg [15:0] bram_data_eth    = 16'd0;
   reg        bram_inc_eth     = 1'b0;
   reg        bram_wr_en_eth   = 1'b0;
+  // For writes, drive bram_wr_addr_eth (pre-increment snapshot so the
+  // BRAM writes the address the host actually targeted).  For reads
+  // (wr_en=0), drive the live bram_addr_eth so the read returns the
+  // contents at the host-selected address.
+  wire [17:0] bram_port_addr_eth = bram_wr_en_eth ? bram_wr_addr_eth : bram_addr_eth;
+  wire [15:0] bram_rdata_eth;
 
   // Diagnostic snapshot signals — read by host via 0x012..0x044.
   wire [29:0]  dbg_first_araddr;
@@ -1117,11 +1123,12 @@ module vc707_microgpt_eth (
     .m_axi_rdata  ( m_axi_rdata       ),
     .m_axi_rresp  ( m_axi_rresp       ),
     .m_axi_rlast  ( m_axi_rlast       ),
-    .wr_kind      ( bram_kind_eth    ),
-    .wr_addr      ( bram_wr_addr_eth ),
-    .wr_data      ( bram_data_eth    ),
-    .wr_en        ( bram_wr_en_eth   ),
-    .clk_wr       ( eth_clk          )
+    .wr_kind      ( bram_kind_eth      ),
+    .wr_addr      ( bram_port_addr_eth ),
+    .wr_data      ( bram_data_eth      ),
+    .wr_en        ( bram_wr_en_eth     ),
+    .clk_wr       ( eth_clk            ),
+    .wr_rdata     ( bram_rdata_eth     )
   );
   assign lay_result = {{(9216 - LBFP_NSTEPS*16){1'b0}}, bfp_result_tokens};
 
@@ -1704,6 +1711,12 @@ module vc707_microgpt_eth (
       //              hash(Python upload) vs hash(C++ upload).
       10'h049: read_data_comb = {31'd0, has_run_eth};
       10'h04A: read_data_comb = bfp_rdata_crc_eth;
+      // 0x062: BRAM read-back at the address last set via 0x060.  Returns
+      //        the 16-bit contents (zero-extended exponents) of the BRAM
+      //        selected by bram_kind_eth.  Read latency is satisfied by
+      //        the regmap's own read_pending_reg cycle plus the BRAM
+      //        port-A output register that ran 1 eth_clk after 0x060.
+      10'h062: read_data_comb = {16'd0, bram_rdata_eth};
       // 0x019..0x01C: DDR3 write-path stage counters (eth_clk domain).
       //   0x019 ddr_wr_rx_count   = FT_DDR_WRITE frames accepted by parser
       //   0x01A ddr_wr_done_count = ddr_wr_req toggles (write dispatched)

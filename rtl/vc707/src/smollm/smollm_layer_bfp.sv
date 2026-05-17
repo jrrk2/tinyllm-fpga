@@ -107,6 +107,12 @@ module smollm_layer_bfp #(
   input  wire [15:0]                         wr_data,
   input  wire                                wr_en,
   input  wire                                clk_wr,    // BRAM write clock (eth_clk at top)
+  // Read-back of the BRAM at wr_addr — uses port A (clk_wr) of the same
+  // TDP BRAM, registered output (1-cycle latency).  Muxed by wr_kind so
+  // the caller can verify what was loaded.  Exponents are zero-extended
+  // to 16 b.  Kinds outside this module's range return 0; the upstream
+  // mux selects between this output and the decode-head/prompt outputs.
+  output logic [15:0]                        wr_rdata,
   // Debug taps (synthesis-friendly — only used by sim testbench)
   output logic [6:0]                         dbg_state,
   output logic [11:0]                        dbg_cnt,
@@ -336,6 +342,10 @@ module smollm_layer_bfp #(
   //   wr_kind: 0=G1_m  1=G1_e  2=G2_m  3=G2_e   (kinds 4..6 belong to the
   //            decode head and autoregress top; this module ignores them.)
   // ---------------------------------------------------------------------------
+  logic [BFP_MANT_W-1:0] rd_G1_m, rd_G2_m;
+  logic [BFP_EXP_W -1:0] rd_G1_e, rd_G2_e;
+  logic [4:0]            wr_kind_q;
+
   always_ff @(posedge clk_wr) begin
     if (wr_en) begin
       case (wr_kind)
@@ -346,6 +356,22 @@ module smollm_layer_bfp #(
         default: ;  // other kinds handled elsewhere in the hierarchy
       endcase
     end
+    // Read-back path — registered out of each BRAM (port-A read).
+    rd_G1_m   <= rom_G1_m[wr_addr[$clog2(NL*D)-1:0]];
+    rd_G1_e   <= rom_G1_e[wr_addr[$clog2(NL*NT_D)-1:0]];
+    rd_G2_m   <= rom_G2_m[wr_addr[$clog2(NL*D)-1:0]];
+    rd_G2_e   <= rom_G2_e[wr_addr[$clog2(NL*NT_D)-1:0]];
+    wr_kind_q <= wr_kind;
+  end
+
+  always_comb begin
+    case (wr_kind_q)
+      5'd0: wr_rdata = {{(16-BFP_MANT_W){rd_G1_m[BFP_MANT_W-1]}}, rd_G1_m};
+      5'd1: wr_rdata = {{(16-BFP_EXP_W ){rd_G1_e[BFP_EXP_W -1]}}, rd_G1_e};
+      5'd2: wr_rdata = {{(16-BFP_MANT_W){rd_G2_m[BFP_MANT_W-1]}}, rd_G2_m};
+      5'd3: wr_rdata = {{(16-BFP_EXP_W ){rd_G2_e[BFP_EXP_W -1]}}, rd_G2_e};
+      default: wr_rdata = 16'h0000;
+    endcase
   end
 
   // ---------------------------------------------------------------------------

@@ -47,7 +47,7 @@ module tb_autoregress_bfp_stream (
     .clk(clk), .rst(rst), .start(go),
     .done(done), .result_tokens(result_tokens),
     .weight_hash(/* unused in sim */),
-    .wr_kind(5'd0), .wr_addr(18'd0), .wr_data(16'd0), .wr_en(1'b0), .clk_wr(clk),
+    .wr_kind(5'd0), .wr_addr(18'd0), .wr_data(16'd0), .wr_en(1'b0), .clk_wr(clk), .wr_rdata(/* unused */),
     .ws_base_WQ_m       (`LBFP_BASE_WQ_M),
     .ws_base_WQ_e       (`LBFP_BASE_WQ_E),
     .ws_base_WK_m       (`LBFP_BASE_WK_M),

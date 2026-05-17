@@ -84,6 +84,7 @@ constexpr uint16_t REG_HAS_RUN       = 0x049;   // bit 0: single-shot run comple
 constexpr uint16_t REG_RDATA_CRC     = 0x04A;   // CRC32 over BFP master's R beats
 constexpr uint16_t REG_BRAM_TARGET   = 0x060;   // write: {inc[31], 8'd0, kind[22:18], addr[17:0]}
 constexpr uint16_t REG_BRAM_DATA     = 0x061;   // write: {16'd0, data[15:0]} — pulses BRAM write
+constexpr uint16_t REG_BRAM_READ     = 0x062;   // read: {16'd0, BRAM[kind, addr]} — port-A readback
 constexpr uint16_t REG_BUILD_VERSION = 0x10F;
 constexpr uint16_t REG_RESULT        = 0x1D0;
 constexpr uint16_t REG_DONE          = 0x1F0;   // {30'd0, lay_done_latched, lay_done}
@@ -960,6 +961,84 @@ static void load_rom(Udp& u, int kind, const std::vector<uint16_t>& entries,
     }
 }
 
+// ---------------------------------------------------------------------
+// Subcommand: verify-roms
+// ---------------------------------------------------------------------
+// Reads back every BRAM entry through 0x062 and compares to the .hex
+// file.  For each entry: set 0x060 to (kind<<18|addr) with inc=0, then
+// FT_REG_READ 0x062.  Two RTTs per entry — ~7 s for the full Phase-1
+// set, but unambiguous: any mismatch means the BRAM contents don't
+// match what was uploaded.
+static int verify_rom(Udp& u, int kind, const std::vector<uint16_t>& entries,
+                      uint8_t& seq, const char* name) {
+    if (entries.empty()) return 0;
+    std::printf("[verify-roms] kind=%d (%s) entries=%zu ... ", kind, name, entries.size());
+    std::fflush(stdout);
+    size_t mismatches = 0;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        // 1. Set the read address (no auto-increment).
+        uint32_t target = (0u << 31)
+                        | (static_cast<uint32_t>(kind & 0x1f) << 18)
+                        | (static_cast<uint32_t>(i) & 0x3ffff);
+        std::vector<RegW> one = {{REG_BRAM_TARGET, target}};
+        send_reg_write_batch(u, seq++, one);
+        // 2. Read 0x062.
+        auto got = reg_read(u, REG_BRAM_READ, 1, seq++)[0] & 0xffff;
+        uint16_t want = entries[i];
+        // For exponent kinds the wr_rdata path zero/sign-extends to 16 b;
+        // .hex files store the raw 8-bit value in the low byte, so mask.
+        bool is_exp = (kind == 1 || kind == 3 || kind == 5);
+        if (is_exp) { got &= 0xff; want &= 0xff; }
+        if (got != static_cast<uint32_t>(want)) {
+            if (mismatches < 8) {
+                std::printf("\n  [%zu] want=0x%04x got=0x%04x", i, want, got);
+            }
+            ++mismatches;
+        }
+    }
+    std::printf("\n  %s: %zu/%zu mismatches\n",
+                mismatches == 0 ? "OK" : "FAIL", mismatches, entries.size());
+    return mismatches == 0 ? 0 : 1;
+}
+
+int verify_roms(Udp& u, const std::string& dir) {
+    struct Entry { int kind; const char* name; bool optional; };
+    const Entry roms[] = {
+        {0, "G1_m.hex",     false},
+        {1, "G1_e.hex",     false},
+        {2, "G2_m.hex",     false},
+        {3, "G2_e.hex",     false},
+        {4, "NORM_W_m.hex", false},
+        {5, "NORM_W_e.hex", false},
+        {6, "PROMPT.hex",   false},
+    };
+    uint8_t seq = 150;
+    auto t0 = std::chrono::steady_clock::now();
+    int total_fail = 0;
+    for (const auto& r : roms) {
+        std::string p1 = dir + "/lbfp_full_" + r.name;
+        std::string p2 = dir + "/" + r.name;
+        std::ifstream probe1(p1);
+        std::string path = probe1 ? p1 : p2;
+        try {
+            auto entries = parse_hex_file(path);
+            total_fail += verify_rom(u, r.kind, entries, seq, r.name);
+        } catch (const std::exception& e) {
+            if (r.optional) {
+                std::fprintf(stderr, "[verify-roms] skip %s: %s\n", r.name, e.what());
+            } else {
+                std::fprintf(stderr, "[verify-roms] %s: %s\n", r.name, e.what());
+                return 1;
+            }
+        }
+    }
+    auto secs = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::printf("[verify-roms] %s in %.2f s\n",
+                total_fail == 0 ? "ALL OK" : "FAILED", secs);
+    return total_fail;
+}
+
 int load_roms(Udp& u, const std::string& dir) {
     struct Entry { int kind; const char* name; bool optional; };
     const Entry roms[] = {
@@ -1098,6 +1177,8 @@ void usage() {
         "  load-roms <dir>    stream per-model BRAM init (G1/G2 gammas,\n"
         "                     final NORM_W, prompt tokens) from .hex files\n"
         "                     in <dir> via the host-write protocol\n"
+        "  verify-roms <dir>  read every BRAM entry back and compare to\n"
+        "                     the .hex files (~7 s; per-entry round-trip)\n"
         "  all     <bin>      upload → verify → restart → tokens\n",
         FPGA_MAC, DEFAULT_PEER_IP);
 }
@@ -1276,6 +1357,10 @@ int main(int argc, char** argv) {
         if (cmd == "load-roms") {
             if (argi >= argc) { usage(); return 2; }
             return load_roms(u, argv[argi]);
+        }
+        if (cmd == "verify-roms") {
+            if (argi >= argc) { usage(); return 2; }
+            return verify_roms(u, argv[argi]);
         }
         if (cmd == "all") {
             if (argi >= argc) { usage(); return 2; }
