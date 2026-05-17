@@ -385,12 +385,12 @@ def main():
     write_lines(os.path.join(OUT, f"{PREFIX}EMBED_LOOKUP_e.hex"), emb_e_lines)
     print(f"  emit EMBED_LOOKUP_{{m,e}}.hex (narrow per-element, for RTL)", file=sys.stderr)
 
-    # Prompt token ids — one per line — used by tb_full_bfp.cpp.
-    with open(os.path.join(OUT, f"{PREFIX}PROMPT_TOKENS.txt"), 'w') as f:
-        for tid in tok(PROMPT, return_tensors='pt').input_ids[0].tolist():
-            f.write(f"{tid}\n")
-    # Same prompt token ids as 16-bit hex (4 hex chars per line) — used by
-    # autoregress_bfp_top.sv's $readmemh into prompt_rom.
+    # Prompt token ids as 16-bit hex (4 chars per line) — host loads
+    # these into prompt_rom via the 0x060/0x061 BRAM-write path.  The
+    # one-token-id-per-line PROMPT_TOKENS.txt and the matching cfg.svh
+    # are now emitted by gen_smollm_blockfp_cfg.py (which doesn't need
+    # to load model weights — faster, and lets the Vivado build skip
+    # the heavy hex bake entirely).
     with open(os.path.join(OUT, f"{PREFIX}PROMPT.hex"), 'w') as f:
         for tid in tok(PROMPT, return_tensors='pt').input_ids[0].tolist():
             f.write(f"{int(tid) & 0xFFFF:04x}\n")
@@ -450,25 +450,17 @@ def main():
     print(f"[bake] wrote {len(generated)} golden tokens to {PREFIX}GOLDEN_TOKENS.txt",
           file=sys.stderr)
 
-    # cfg.svh
-    with open(os.path.join(OUT, f"{PREFIX}cfg.svh"), 'w') as f:
-        f.write(f"`define LBFP_FULL_D       {D}\n")
-        f.write(f"`define LBFP_FULL_HQ      {H_Q}\n")
-        f.write(f"`define LBFP_FULL_HKV     {H_KV}\n")
-        f.write(f"`define LBFP_FULL_HD      {HD}\n")
-        f.write(f"`define LBFP_FULL_FFN     {FFN}\n")
-        f.write(f"`define LBFP_FULL_NL      {NL}\n")
-        f.write(f"`define LBFP_FULL_MAX_CTX {MAX_CTX}\n")
-        f.write(f"`define LBFP_FULL_VOCAB   {VOCAB + pad}\n")
-        f.write(f"`define LBFP_FULL_NPROMPT     {len(ids)}\n")
-        # NPROMPT_MAX sizes the on-chip prompt_rom and result_tokens
-        # buffer at synthesis time.  The host may write a different
-        # active length at runtime (regmap 0x063) so any prompt up to
-        # NPROMPT_MAX tokens can run on the same bitstream without a
-        # Vivado rebuild.  Capped at 48 so NPROMPT_MAX + NGEN (=63)
-        # fits the 32-word legacy result-token regmap window at 0x1D0.
-        f.write(f"`define LBFP_FULL_NPROMPT_MAX 48\n")
-        f.write(f"`define LBFP_FULL_NGEN        {N_GEN}\n")
+    # cfg.svh + PROMPT_TOKENS.txt are now produced by
+    # gen_smollm_blockfp_cfg.py (which can run without loading any
+    # model weights).  Delegate so a one-shot `python
+    # gen_smollm_blockfp_full.py` still emits the full release set.
+    print(f"[bake] delegating cfg.svh + PROMPT_TOKENS.txt to gen_smollm_blockfp_cfg.py",
+          file=sys.stderr)
+    import subprocess
+    subprocess.run([sys.executable,
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'gen_smollm_blockfp_cfg.py')],
+                   check=True, env=os.environ)
 
     print(f"[bake] done. files in {OUT}/{PREFIX}*", file=sys.stderr)
 

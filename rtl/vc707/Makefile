@@ -81,6 +81,13 @@ $(tm_stamp): $(TM_HEX_GEN) host/gen_layer_ddr3.py
 $(GENERATED_DIR)/silu_lut.hex: sim/gen_swiglu_lut.py
 	python3 sim/gen_swiglu_lut.py
 
+# Exp LUT for softmax_bfp.sv / softmax_q15.sv.  Architecture LUT,
+# model-independent.  Was previously assumed-present (only the sim
+# Makefile had a rule); now it's an explicit synth-time dep so a clean
+# checkout builds without surprises.
+$(GENERATED_DIR)/exp_lut.hex: sim/gen_exp_lut.py
+	python3 sim/gen_exp_lut.py
+
 # ----------------------------------------------------------------------
 # Block-FP weight bake for smollm_layer_bfp (small-dim selftest config).
 # Emits all weight / gamma / KV-init mantissa+exponent hex files plus a
@@ -143,28 +150,41 @@ ifneq ($(strip $(VIVADO_DEFINES)),)
   export VIVADO_DEFINES
 endif
 
-# Synthesis-time hex deps for the BFP path:
-#   - lbfp_full_stamp  (gen_smollm_blockfp_full.py): bakes the per-matrix
-#       lbfp_full_*.hex files that smollm_layer_bfp / decode_head /
-#       embed_lookup $readmemh-load at elaboration.  Even in streaming
-#       mode the gamma + KV-init + norm_w hex files are still BRAM-loaded
-#       (the streamer only replaces the large W?_* + EMBED matrices).
-#   - lbfp_full_DDR3_stamp  (gen_smollm_blockfp_ddr.py): bakes the .bin
-#       DDR3 image.  Only the .bin is needed for synth (the layout svh
-#       references baked-in offsets); the matching .hex is generated
-#       on-demand for the Verilator streaming testbench (LBFP_EMIT_HEX=1).
+# Synthesis-time hex deps for the BFP path.
+#
+# After the dual-port BRAM rework (gammas / norm_w / prompt now host-
+# loaded via 0x060/0x061) and STREAM_LOOKUP=1 (embed table streamed
+# from DDR3), the active BFP+STREAM path no longer `$readmemh`s any
+# per-model data.  Only the cfg.svh defines (D, NL, FFN, VOCAB,
+# NPROMPT_MAX, ...) and the architecture LUTs (silu_lut, exp_lut) are
+# needed at synth.  The heavy hex bake (lbfp_full_stamp) is now a
+# runtime artifact, captured by `make release-model`.
+#
+#   - lbfp_full_cfg_stamp  (gen_smollm_blockfp_cfg.py): emits
+#       lbfp_full_cfg.svh + PROMPT_TOKENS.txt.  Loads tokenizer+config
+#       only, ~2 s.
+#   - lbfp_full_stamp  (gen_smollm_blockfp_full.py): full per-matrix
+#       hex bake — needed by `release-model` and by the Verilator
+#       autoregress regression, NOT by Vivado synth in the BFP+STREAM
+#       path.
+#   - lbfp_full_DDR3_stamp  (gen_smollm_blockfp_ddr.py): .bin DDR3
+#       image.  Pure runtime artifact (uploaded by host) — not a synth
+#       dep.  Listed under release-model.
+lbfp_full_cfg_stamp  := $(GENERATED_DIR)/.lbfp_full_cfg.stamp
 lbfp_full_stamp      := $(GENERATED_DIR)/.lbfp_full.stamp
 lbfp_full_DDR3_stamp := $(GENERATED_DIR)/.lbfp_full_DDR3.stamp
 
+$(lbfp_full_cfg_stamp): host/gen_smollm_blockfp_cfg.py
+	@echo "=== generating lbfp_full_cfg.svh + PROMPT_TOKENS.txt ==="
+	python3 host/gen_smollm_blockfp_cfg.py
+	@touch $@
+
 BFP_BUILD_DEPS :=
 ifeq ($(USE_BFP),1)
-  BFP_BUILD_DEPS += $(lbfp_full_stamp)
-  ifeq ($(BFP_STREAM),1)
-    BFP_BUILD_DEPS += $(lbfp_full_DDR3_stamp)
-  endif
+  BFP_BUILD_DEPS += $(lbfp_full_cfg_stamp)
 endif
 
-$(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(lbfp_stamp) $(BFP_BUILD_DEPS)
+$(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(GENERATED_DIR)/exp_lut.hex $(lbfp_stamp) $(BFP_BUILD_DEPS)
 	mkdir -p $(work-dir)
 	$(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
 	cp microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit ./$(work-dir)/ 2>/dev/null || \
@@ -372,9 +392,15 @@ release-model-dir := release/models/$(PREFIX)
 release-model-ddr := $(release-model-dir)/$(PREFIX)DDR3.bin
 
 release-model:
-	@if [ ! -f "$(GENERATED_DIR)/$(PREFIX)DDR3.bin" ]; then \
-	    echo "ERROR: $(GENERATED_DIR)/$(PREFIX)DDR3.bin missing — capture-only target."; \
-	    echo "       Run 'PREFIX=$(PREFIX) python host/gen_smollm_blockfp_ddr.py' first."; \
+	@if [ ! -f "$(GENERATED_DIR)/$(PREFIX)DDR3.bin" ] || [ ! -f "$(GENERATED_DIR)/$(PREFIX)G1_m.hex" ]; then \
+	    echo "ERROR: $(GENERATED_DIR)/$(PREFIX)DDR3.bin or .hex set missing"; \
+	    echo "       — capture-only target.  Bake first with:"; \
+	    echo "         PREFIX=$(PREFIX) python host/gen_smollm_blockfp_full.py"; \
+	    echo "         PREFIX=$(PREFIX) python host/gen_smollm_blockfp_ddr.py"; \
+	    echo "       (the .hex files were previously baked as a Vivado synth"; \
+	    echo "       side-effect; after the dual-port BRAM rework they're"; \
+	    echo "       runtime-only artifacts, so make release-model is the"; \
+	    echo "       trigger to bake them now.)"; \
 	    exit 1; \
 	fi
 	@mkdir -p $(release-model-dir)

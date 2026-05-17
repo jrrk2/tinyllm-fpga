@@ -227,9 +227,15 @@ export XILINX_PART=xc7vx485tffg1761-2
 export XILINX_BOARD=xilinx.com:vc707:part0:1.4
 export BOARD=vc707
 
-# Generate the BFP weight artifacts (Python; ~3 min).
+# Generate the cfg the Vivado build needs (~2 s; tokenizer + config only).
+python host/gen_smollm_blockfp_cfg.py  # cfg.svh + PROMPT_TOKENS.txt
+
+# Generate the BFP weight artifacts (Python; ~3 min).  These are NOT
+# Vivado build deps any more — gammas/norm_w/prompt are host-loaded
+# at runtime via 0x060/0x061, weights stream from DDR3.  Run these
+# when you want to capture a release-model.
 python host/calibrate_smollm.py        # one-time; produces calibration scales
-python host/gen_smollm_blockfp_full.py # .hex files for BRAMs + cfg.svh
+python host/gen_smollm_blockfp_full.py # .hex files for BRAMs (host-loaded)
 python host/gen_smollm_blockfp_ddr.py  # 337 MB DDR3 .bin image
 
 # Build the bitstream (Vivado; ~25 min on a modern desktop).
