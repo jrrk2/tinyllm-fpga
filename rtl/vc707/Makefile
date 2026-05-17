@@ -300,6 +300,115 @@ flash-release: $(release-mcs)
 	MCSFILE=$(release-mcs) $(VIVADO) $(VIVADOFLAGS) -source scripts/flash.tcl
 	@pkill -f 'cs_server|hw_server' 2>/dev/null || true
 
+# ----------------------------------------------------------------------
+# release-bitstream + release-model — split the legacy `make release`
+# into the two artifact lifecycles it conflates:
+#
+#   release/bitstream/             one per Vivado build (model-indep.)
+#     .bit, .mcs, bfp_vocab.bin, reports/, build_info.txt
+#
+#   release/models/<PREFIX>/       one per fine-tune (bitstream-indep.)
+#     <PREFIX>DDR3.bin, <PREFIX>cfg.svh, <PREFIX>{G1,G2,NORM_W}_*.hex,
+#     <PREFIX>PROMPT.hex, <PREFIX>{PROMPT,GOLDEN}_TOKENS.txt,
+#     model_info.txt
+#
+# Why split: a single bitstream serves many fine-tuned models (the
+# per-model BRAMs are host-loaded at runtime), and a single fine-tune
+# can target many bitstream revisions.  The legacy `make release`
+# target still works (writes flat into release/) but is layered on
+# top of these for backward compatibility.
+#
+# Default PREFIX is lbfp_full_ (matches the rest of the build).  For a
+# Shakespeare or other fine-tune variant:
+#   make release-model PREFIX=shake_
+# ----------------------------------------------------------------------
+PREFIX ?= lbfp_full_
+
+release-bs-dir := release/bitstream
+release-bs-bit := $(release-bs-dir)/vc707_microgpt_eth.bit
+release-bs-mcs := $(release-bs-dir)/vc707_microgpt_eth.mcs
+release-bs-voc := $(release-bs-dir)/bfp_vocab.bin
+
+release-bitstream: host/bfp_vocab.bin
+	@if [ ! -f "$(bit)" ] || [ ! -f "$(mcs)" ]; then \
+	    echo "ERROR: $(bit) or $(mcs) missing — release-bitstream is a"; \
+	    echo "       capture-only target.  Run 'make' / 'make mcs' first,"; \
+	    echo "       or use 'make release' (legacy) for build-and-capture."; \
+	    exit 1; \
+	fi
+	@mkdir -p $(release-bs-dir)/reports
+	@cp $(bit)             $(release-bs-bit)
+	@cp $(mcs)             $(release-bs-mcs)
+	@cp host/bfp_vocab.bin $(release-bs-voc)
+	@cp -r reports/.                                          $(release-bs-dir)/reports/ 2>/dev/null || true
+	@cp microgpt_eth.runs/impl_1/*timing_summary_routed.rpt   $(release-bs-dir)/reports/ 2>/dev/null || true
+	@cp microgpt_eth.runs/impl_1/*utilization*.rpt            $(release-bs-dir)/reports/ 2>/dev/null || true
+	@cp microgpt_eth.runs/impl_1/*drc_routed.rpt              $(release-bs-dir)/reports/ 2>/dev/null || true
+	@cp microgpt_eth.runs/impl_1/*methodology_drc_routed.rpt  $(release-bs-dir)/reports/ 2>/dev/null || true
+	@cp microgpt_eth.runs/synth_1/*utilization_synth.rpt      $(release-bs-dir)/reports/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/build_version.svh                    $(release-bs-dir)/ 2>/dev/null || true
+	@{ \
+	    echo "build_date: $$(date -u --iso-8601=seconds)"; \
+	    echo "git_hash:   $$(git rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	    echo "git_status: $$(git diff --shortstat HEAD 2>/dev/null || echo unknown)"; \
+	    echo "host:       $$(hostname)"; \
+	    grep -h 'BUILD_VERSION' $(GENERATED_DIR)/build_version.svh 2>/dev/null; \
+	    echo "bitstream:  $$(du -h $(release-bs-bit) | cut -f1)"; \
+	    echo "mcs:        $$(du -h $(release-bs-mcs) | cut -f1)"; \
+	} > $(release-bs-dir)/build_info.txt
+	@echo "=== bitstream release captured into $(release-bs-dir)/ ==="
+	@cat $(release-bs-dir)/build_info.txt
+
+release-model-dir := release/models/$(PREFIX)
+release-model-ddr := $(release-model-dir)/$(PREFIX)DDR3.bin
+
+release-model:
+	@if [ ! -f "$(GENERATED_DIR)/$(PREFIX)DDR3.bin" ]; then \
+	    echo "ERROR: $(GENERATED_DIR)/$(PREFIX)DDR3.bin missing — capture-only target."; \
+	    echo "       Run 'PREFIX=$(PREFIX) python host/gen_smollm_blockfp_ddr.py' first."; \
+	    exit 1; \
+	fi
+	@mkdir -p $(release-model-dir)
+	@cp $(GENERATED_DIR)/$(PREFIX)DDR3.bin              $(release-model-ddr)
+	@cp $(GENERATED_DIR)/$(PREFIX)cfg.svh               $(release-model-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/$(PREFIX)PROMPT_TOKENS.txt     $(release-model-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/$(PREFIX)GOLDEN_TOKENS.txt     $(release-model-dir)/ 2>/dev/null || true
+	@# Per-model BRAM .hex files (gammas, final norm, prompt) — host
+	@# loads these into BRAMs at runtime via load-roms.
+	@cp $(GENERATED_DIR)/$(PREFIX)G1_m.hex     $(release-model-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/$(PREFIX)G1_e.hex     $(release-model-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/$(PREFIX)G2_m.hex     $(release-model-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/$(PREFIX)G2_e.hex     $(release-model-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/$(PREFIX)NORM_W_m.hex $(release-model-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/$(PREFIX)NORM_W_e.hex $(release-model-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/$(PREFIX)PROMPT.hex   $(release-model-dir)/ 2>/dev/null || true
+	@{ \
+	    echo "build_date: $$(date -u --iso-8601=seconds)"; \
+	    echo "prefix:     $(PREFIX)"; \
+	    echo "git_hash:   $$(git rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	    grep -h '^`define LBFP_FULL_' $(GENERATED_DIR)/$(PREFIX)cfg.svh 2>/dev/null; \
+	    echo "ddr3 image: $$(du -h $(release-model-ddr) | cut -f1)"; \
+	} > $(release-model-dir)/model_info.txt
+	@echo "=== model release ($(PREFIX)) captured into $(release-model-dir)/ ==="
+	@cat $(release-model-dir)/model_info.txt
+
+# Convenience: program/flash from the split bitstream dir.
+program-release-bitstream: $(release-bs-bit)
+	BITFILE=$(release-bs-bit) $(VIVADO) $(VIVADOFLAGS) -source scripts/program.tcl
+	@pkill -f 'cs_server|hw_server' 2>/dev/null || true
+
+flash-release-bitstream: $(release-bs-mcs)
+	MCSFILE=$(release-bs-mcs) $(VIVADO) $(VIVADOFLAGS) -source scripts/flash.tcl
+	@pkill -f 'cs_server|hw_server' 2>/dev/null || true
+
+# Full demo against the split layout — uploads the model's DDR3 image,
+# loads its BRAMs through the host-write path, then runs inference.
+# Use PREFIX= to pick the model; bitstream comes from release/bitstream/.
+demo-model: host/bfp_client
+	MGRT_PREFIX=$(PREFIX) ./host/bfp_client load-roms release/models/$(PREFIX)
+	MGRT_PREFIX=$(PREFIX) ./host/bfp_client -v $(release-bs-voc) \
+	    all release/models/$(PREFIX)/$(PREFIX)DDR3.bin
+
 # Single demo target: builds host/bfp_client (no-torch C++ client),
 # then runs the full upload → restart → tokens → vocab-decode pipeline
 # against the release-area artifacts.  Defaults are conservative
@@ -326,4 +435,5 @@ clean:
 distclean: clean
 	rm -rf $(release-dir) host/bfp_client
 
-.PHONY: all mcs program flash release program-release flash-release demo clean distclean
+.PHONY: all mcs program flash release program-release flash-release demo clean distclean \
+        release-bitstream release-model program-release-bitstream flash-release-bitstream demo-model

@@ -145,6 +145,51 @@ make program-release       # JTAG (volatile — DDR3 contents lost; re-run make 
 make flash-release         # BPI x16 flash (persists across power cycles)
 ```
 
+## Release layout: bitstream-release vs model-release
+
+A bitstream and a model have independent lifecycles — one bitstream
+serves many fine-tuned models (host-loadable BRAMs), and one fine-tune
+targets many bitstream revisions.  `make release-bitstream` and
+`make release-model` separate the two:
+
+```
+release/bitstream/             one per Vivado build
+    vc707_microgpt_eth.bit
+    vc707_microgpt_eth.mcs
+    bfp_vocab.bin
+    build_info.txt
+    reports/
+
+release/models/lbfp_full_/     one per fine-tune (default: SmolLM2 baseline)
+release/models/shake_/         one per fine-tune (Shakespeare variant)
+    <PREFIX>DDR3.bin
+    <PREFIX>cfg.svh
+    <PREFIX>{G1,G2,NORM_W}_{m,e}.hex
+    <PREFIX>PROMPT.hex
+    <PREFIX>{PROMPT,GOLDEN}_TOKENS.txt
+    model_info.txt
+```
+
+Capture commands:
+
+```sh
+make release-bitstream                   # after a successful Vivado build
+make release-model                       # default PREFIX=lbfp_full_
+make release-model PREFIX=shake_         # Shakespeare variant
+```
+
+Demo using the split layout:
+
+```sh
+make program-release-bitstream           # one-time JTAG load (or use flash variant)
+make demo-model                          # default model (lbfp_full_)
+make demo-model PREFIX=shake_            # Shakespeare model on the same bitstream
+```
+
+The legacy flat `make release` / `make demo` still work for backward
+compatibility (writes into `release/` root rather than the split
+subdirs), but new releases should use the split form.
+
 After any JTAG reprogram, the MIG refresh controller resets and DDR3
 contents are lost within 64 ms (the refresh is soft fabric on Virtex-7,
 not hard MIG silicon).  `make demo` always re-uploads, so this is
