@@ -56,11 +56,19 @@ Ethernet link LED is on.
 ### 3. Run the canonical demo
 
 ```sh
-make demo
+make run                    # default model (lbfp_full_)
+make run PREFIX=shake_      # any captured fine-tune
 ```
 
-Wraps the three steps below into one invocation.  Expect ~3 minutes
-total (most of it the rate-limited DDR3 upload at ~2 MB/s).
+Single command, existing release → decoded text.  Auto-detects layout
+(split release/bitstream + release/models/<PREFIX>/, or legacy flat
+release/), conditionally loads per-model BRAMs (only if .hex files
+are present — older $readmemh bitstreams skip this step), uploads
+DDR3, restarts inference, reads tokens, decodes through the baked
+vocab.  Expect ~3 minutes total (rate-limited DDR3 upload at ~2 MB/s).
+
+The legacy `make demo` is still available for direct backward compat
+(no auto-detect, only the flat layout, only the lbfp_full_ default).
 
 Output ends with the golden token sequence:
 

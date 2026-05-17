@@ -269,6 +269,15 @@ release: $(bit) $(mcs) $(GENERATED_DIR)/lbfp_full_DDR3.bin host/bfp_vocab.bin
 	@cp $(GENERATED_DIR)/lbfp_full_cfg.svh             $(release-dir)/ 2>/dev/null || true
 	@cp $(GENERATED_DIR)/lbfp_full_PROMPT_TOKENS.txt   $(release-dir)/ 2>/dev/null || true
 	@cp $(GENERATED_DIR)/lbfp_full_GOLDEN_TOKENS.txt   $(release-dir)/ 2>/dev/null || true
+	@# Per-model BRAM .hex files for the host-loaded dual-port BRAMs
+	@# (gammas, final norm, prompt) — `make run` loads these via 0x060/0x061.
+	@cp $(GENERATED_DIR)/lbfp_full_G1_m.hex     $(release-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/lbfp_full_G1_e.hex     $(release-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/lbfp_full_G2_m.hex     $(release-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/lbfp_full_G2_e.hex     $(release-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/lbfp_full_NORM_W_m.hex $(release-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/lbfp_full_NORM_W_e.hex $(release-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/lbfp_full_PROMPT.hex   $(release-dir)/ 2>/dev/null || true
 	@# Vivado reports — pull from both reports/ (run.tcl-emitted) and
 	@# microgpt_eth.runs/impl_1 (per-step reports).  Missing files are OK.
 	@cp -r reports/.                                          $(release-dir)/reports/ 2>/dev/null || true
@@ -409,6 +418,47 @@ demo-model: host/bfp_client
 	MGRT_PREFIX=$(PREFIX) ./host/bfp_client -v $(release-bs-voc) \
 	    all release/models/$(PREFIX)/$(PREFIX)DDR3.bin
 
+# ----------------------------------------------------------------------
+# make run — single command: existing release → decoded text.
+#
+# Auto-detects layout (prefers split release/bitstream + release/models/
+# over legacy flat release/), conditionally loads BRAMs (only if .hex
+# files are present in the layout — older bitstreams use $readmemh and
+# need no load), then uploads DDR3 + restarts + reads + decodes.
+#
+#   make run                    # default model (lbfp_full_)
+#   make run PREFIX=shake_      # any captured fine-tune
+#
+# Assumes the FPGA already has the matching bitstream loaded.  For a
+# freshly power-cycled board:
+#   make program-release-bitstream   # split layout, or
+#   make program-release             # legacy flat
+# then `make run`.
+# ----------------------------------------------------------------------
+run: host/bfp_client
+	@set -e; \
+	if [ -d release/bitstream ] && [ -d release/models/$(PREFIX) ]; then \
+	    echo "[run] split layout — release/bitstream + release/models/$(PREFIX)/"; \
+	    if ls release/models/$(PREFIX)/$(PREFIX)G1_m.hex >/dev/null 2>&1; then \
+	        MGRT_PREFIX=$(PREFIX) ./host/bfp_client load-roms release/models/$(PREFIX); \
+	    fi; \
+	    ./host/bfp_client -v release/bitstream/bfp_vocab.bin \
+	        all release/models/$(PREFIX)/$(PREFIX)DDR3.bin; \
+	elif [ -f release/$(PREFIX)DDR3.bin ] && [ -f release/bfp_vocab.bin ]; then \
+	    echo "[run] legacy flat layout — release/"; \
+	    if ls release/$(PREFIX)G1_m.hex >/dev/null 2>&1; then \
+	        MGRT_PREFIX=$(PREFIX) ./host/bfp_client load-roms release; \
+	    fi; \
+	    ./host/bfp_client -v release/bfp_vocab.bin all release/$(PREFIX)DDR3.bin; \
+	else \
+	    echo "ERROR: no release artifacts found for PREFIX=$(PREFIX)."; \
+	    echo "       Expected one of:"; \
+	    echo "         release/bitstream/bfp_vocab.bin + release/models/$(PREFIX)/$(PREFIX)DDR3.bin (split)"; \
+	    echo "         release/bfp_vocab.bin + release/$(PREFIX)DDR3.bin (legacy)"; \
+	    echo "       Capture a release first (see 'release-bitstream' / 'release-model' / legacy 'release')."; \
+	    exit 1; \
+	fi
+
 # Single demo target: builds host/bfp_client (no-torch C++ client),
 # then runs the full upload → restart → tokens → vocab-decode pipeline
 # against the release-area artifacts.  Defaults are conservative
@@ -436,4 +486,4 @@ distclean: clean
 	rm -rf $(release-dir) host/bfp_client
 
 .PHONY: all mcs program flash release program-release flash-release demo clean distclean \
-        release-bitstream release-model program-release-bitstream flash-release-bitstream demo-model
+        release-bitstream release-model program-release-bitstream flash-release-bitstream demo-model run
