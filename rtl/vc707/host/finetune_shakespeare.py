@@ -51,7 +51,17 @@ class TextBlocks(Dataset):
     """Tokenise once, slice into fixed-length blocks for causal-LM training."""
 
     def __init__(self, text: str, tokenizer, block_size: int):
-        ids = tokenizer(text, return_tensors="pt").input_ids[0]
+        # Bypass the tokenizer's model_max_length warning — we tokenise the
+        # whole corpus in one shot and slice into blocks ourselves; the
+        # 8192-token model limit only applies to what we feed at training
+        # time (one `block_size` slice per example), not to the tokenise
+        # call itself.
+        saved_max = tokenizer.model_max_length
+        tokenizer.model_max_length = 10**12
+        try:
+            ids = tokenizer(text, return_tensors="pt").input_ids[0]
+        finally:
+            tokenizer.model_max_length = saved_max
         n_blocks = len(ids) // block_size
         if n_blocks == 0:
             raise ValueError(
