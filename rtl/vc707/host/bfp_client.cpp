@@ -932,10 +932,56 @@ static void send_reg_write_batch(Udp& u, uint8_t seq,
     u.send(tx, 8 + batch.size() * 8);
 }
 
+// One mismatched BRAM entry: address, what the file says it should be,
+// and what readback actually returned.
+struct Mismatch { size_t addr; uint16_t want; uint16_t got; };
+
+// Iterate every entry in `entries`, drive 0x060 with that address, read
+// 0x062, and return the list of addresses that don't match.  Two
+// round-trips per entry, ~7 s for the full Phase-1 set.
+static std::vector<Mismatch> find_mismatches(
+    Udp& u, int kind, const std::vector<uint16_t>& entries, uint8_t& seq) {
+    std::vector<Mismatch> bad;
+    bool is_exp = (kind == 1 || kind == 3 || kind == 5);
+    for (size_t i = 0; i < entries.size(); ++i) {
+        uint32_t target = (0u << 31)
+                        | (static_cast<uint32_t>(kind & 0x1f) << 18)
+                        | (static_cast<uint32_t>(i) & 0x3ffff);
+        std::vector<RegW> one = {{REG_BRAM_TARGET, target}};
+        send_reg_write_batch(u, seq++, one);
+        uint16_t got  = reg_read(u, REG_BRAM_READ, 1, seq++)[0] & 0xffff;
+        uint16_t want = entries[i];
+        uint16_t got_cmp  = is_exp ? (got  & 0xff) : got;
+        uint16_t want_cmp = is_exp ? (want & 0xff) : want;
+        if (got_cmp != want_cmp) {
+            bad.push_back({i, want, got});
+        }
+    }
+    return bad;
+}
+
+// Patch a list of mismatched entries by writing each one individually
+// in a 2-entry FT_REG_WRITE (0x060 target + 0x061 data) so the eth_ctrl
+// dispatcher emits them back-to-back without re-ordering risk.
+static void patch_rom(Udp& u, int kind,
+                      const std::vector<Mismatch>& bad, uint8_t& seq) {
+    for (const auto& m : bad) {
+        uint32_t target = (0u << 31)
+                        | (static_cast<uint32_t>(kind & 0x1f) << 18)
+                        | (static_cast<uint32_t>(m.addr) & 0x3ffff);
+        std::vector<RegW> two = {
+            {REG_BRAM_TARGET, target},
+            {REG_BRAM_DATA,   static_cast<uint32_t>(m.want)},
+        };
+        send_reg_write_batch(u, seq++, two);
+    }
+}
+
 static void load_rom(Udp& u, int kind, const std::vector<uint16_t>& entries,
                      uint8_t& seq) {
-    std::printf("[load-roms] kind=%d entries=%zu\n", kind, entries.size());
-    if (entries.empty()) return;
+    std::printf("[load-roms] kind=%d entries=%zu", kind, entries.size());
+    std::fflush(stdout);
+    if (entries.empty()) { std::printf("\n"); return; }
     // 1. Set target: inc=1, kind, base=0
     uint32_t target = (1u << 31)
                     | (static_cast<uint32_t>(kind & 0x1f) << 18)
@@ -959,46 +1005,59 @@ static void load_rom(Udp& u, int kind, const std::vector<uint16_t>& entries,
         }
         send_reg_write_batch(u, seq++, batch);
     }
+
+    // 3. Self-heal: verify-then-patch up to 3 rounds.  UDP frames can
+    // drop in transit (no retransmit in the streaming write loop), so
+    // a single dropped frame leaves up to 16 entries stale.  Reading
+    // back through 0x062 and rewriting just the bad ones recovers
+    // without re-streaming the whole rom.  ~10 s amortised verify time
+    // per kind on the happy path; near-zero patch traffic when clean.
+    constexpr int MAX_HEAL_ROUNDS = 3;
+    for (int round = 0; round < MAX_HEAL_ROUNDS; ++round) {
+        auto bad = find_mismatches(u, kind, entries, seq);
+        if (bad.empty()) {
+            std::printf("  OK%s\n",
+                        round > 0 ? (" (healed in " + std::to_string(round) + " round(s))").c_str() : "");
+            return;
+        }
+        std::printf("\n  round %d: patching %zu/%zu", round + 1, bad.size(), entries.size());
+        std::fflush(stdout);
+        patch_rom(u, kind, bad, seq);
+    }
+    // Final check — if still bad, complain loudly with the first 8 bad addrs.
+    auto bad = find_mismatches(u, kind, entries, seq);
+    if (bad.empty()) {
+        std::printf("  OK (healed in %d round(s))\n", MAX_HEAL_ROUNDS);
+    } else {
+        std::printf("\n  FAIL: %zu entries still mismatched after %d patch rounds:\n",
+                    bad.size(), MAX_HEAL_ROUNDS);
+        for (size_t k = 0; k < bad.size() && k < 8; ++k) {
+            std::printf("    [%zu] want=0x%04x got=0x%04x\n",
+                        bad[k].addr, bad[k].want, bad[k].got);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
 // Subcommand: verify-roms
 // ---------------------------------------------------------------------
-// Reads back every BRAM entry through 0x062 and compares to the .hex
-// file.  For each entry: set 0x060 to (kind<<18|addr) with inc=0, then
-// FT_REG_READ 0x062.  Two RTTs per entry — ~7 s for the full Phase-1
-// set, but unambiguous: any mismatch means the BRAM contents don't
-// match what was uploaded.
+// Stand-alone diagnostic.  load-roms already self-heals via the same
+// readback path, so verify-roms is mainly useful for post-inference
+// checks ("did the BRAMs survive a run?") and for cases where the user
+// wants to confirm contents without a re-load.
 static int verify_rom(Udp& u, int kind, const std::vector<uint16_t>& entries,
                       uint8_t& seq, const char* name) {
     if (entries.empty()) return 0;
     std::printf("[verify-roms] kind=%d (%s) entries=%zu ... ", kind, name, entries.size());
     std::fflush(stdout);
-    size_t mismatches = 0;
-    for (size_t i = 0; i < entries.size(); ++i) {
-        // 1. Set the read address (no auto-increment).
-        uint32_t target = (0u << 31)
-                        | (static_cast<uint32_t>(kind & 0x1f) << 18)
-                        | (static_cast<uint32_t>(i) & 0x3ffff);
-        std::vector<RegW> one = {{REG_BRAM_TARGET, target}};
-        send_reg_write_batch(u, seq++, one);
-        // 2. Read 0x062.
-        auto got = reg_read(u, REG_BRAM_READ, 1, seq++)[0] & 0xffff;
-        uint16_t want = entries[i];
-        // For exponent kinds the wr_rdata path zero/sign-extends to 16 b;
-        // .hex files store the raw 8-bit value in the low byte, so mask.
-        bool is_exp = (kind == 1 || kind == 3 || kind == 5);
-        if (is_exp) { got &= 0xff; want &= 0xff; }
-        if (got != static_cast<uint32_t>(want)) {
-            if (mismatches < 8) {
-                std::printf("\n  [%zu] want=0x%04x got=0x%04x", i, want, got);
-            }
-            ++mismatches;
-        }
+    auto bad = find_mismatches(u, kind, entries, seq);
+    for (size_t k = 0; k < bad.size() && k < 8; ++k) {
+        std::printf("\n  [%zu] want=0x%04x got=0x%04x",
+                    bad[k].addr, bad[k].want, bad[k].got);
     }
     std::printf("\n  %s: %zu/%zu mismatches\n",
-                mismatches == 0 ? "OK" : "FAIL", mismatches, entries.size());
-    return mismatches == 0 ? 0 : 1;
+                bad.empty() ? "OK" : "FAIL", bad.size(), entries.size());
+    return bad.empty() ? 0 : 1;
 }
 
 int verify_roms(Udp& u, const std::string& dir) {
