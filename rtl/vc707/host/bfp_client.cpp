@@ -1015,8 +1015,10 @@ int verify_roms(Udp& u, const std::string& dir) {
     uint8_t seq = 150;
     auto t0 = std::chrono::steady_clock::now();
     int total_fail = 0;
+    const char* env_prefix = std::getenv("MGRT_PREFIX");
+    std::string prefix = env_prefix ? env_prefix : "lbfp_full_";
     for (const auto& r : roms) {
-        std::string p1 = dir + "/lbfp_full_" + r.name;
+        std::string p1 = dir + "/" + prefix + r.name;
         std::string p2 = dir + "/" + r.name;
         std::ifstream probe1(p1);
         std::string path = probe1 ? p1 : p2;
@@ -1052,10 +1054,12 @@ int load_roms(Udp& u, const std::string& dir) {
     };
     uint8_t seq = 200;
     auto t0 = std::chrono::steady_clock::now();
+    const char* env_prefix = std::getenv("MGRT_PREFIX");
+    std::string prefix = env_prefix ? env_prefix : "lbfp_full_";
     for (const auto& r : roms) {
-        // Try the model-dir-prefixed name first (eg lbfp_full_G1_m.hex),
-        // then the bare name.
-        std::string p1 = dir + "/lbfp_full_" + r.name;
+        // Try the model-dir-prefixed name first (eg lbfp_full_G1_m.hex,
+        // or whatever MGRT_PREFIX overrides to), then the bare name.
+        std::string p1 = dir + "/" + prefix + r.name;
         std::string p2 = dir + "/" + r.name;
         std::ifstream probe1(p1);
         std::string path = probe1 ? p1 : p2;
