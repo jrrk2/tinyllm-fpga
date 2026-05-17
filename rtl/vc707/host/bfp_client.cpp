@@ -739,13 +739,119 @@ struct Vocab {
     }
 };
 
-std::string decode_tokens(const Vocab& v, const std::vector<uint16_t>& tokens) {
+// Decode one UTF-8 codepoint starting at s[i]; advance i.  On invalid
+// input, returns the raw byte as codepoint and advances by 1.
+static uint32_t utf8_next_cp(const std::string& s, size_t& i) {
+    unsigned char b = static_cast<unsigned char>(s[i]);
+    if (b < 0x80) { ++i; return b; }
+    int n; uint32_t cp;
+    if      ((b & 0xe0) == 0xc0) { n = 2; cp = b & 0x1f; }
+    else if ((b & 0xf0) == 0xe0) { n = 3; cp = b & 0x0f; }
+    else if ((b & 0xf8) == 0xf0) { n = 4; cp = b & 0x07; }
+    else                         { ++i; return b; }
+    if (i + n > s.size())        { ++i; return b; }
+    for (int k = 1; k < n; ++k) {
+        unsigned char c = static_cast<unsigned char>(s[i + k]);
+        if ((c & 0xc0) != 0x80)  { ++i; return b; }
+        cp = (cp << 6) | (c & 0x3f);
+    }
+    i += n;
+    return cp;
+}
+
+static void cp_to_utf8(uint32_t cp, std::string& out) {
+    if      (cp < 0x80)    { out.push_back(static_cast<char>(cp)); }
+    else if (cp < 0x800)   { out.push_back(0xc0 | (cp >> 6));
+                             out.push_back(0x80 | (cp & 0x3f)); }
+    else if (cp < 0x10000) { out.push_back(0xe0 | (cp >> 12));
+                             out.push_back(0x80 | ((cp >> 6) & 0x3f));
+                             out.push_back(0x80 | (cp & 0x3f)); }
+    else                   { out.push_back(0xf0 | (cp >> 18));
+                             out.push_back(0x80 | ((cp >> 12) & 0x3f));
+                             out.push_back(0x80 | ((cp >> 6) & 0x3f));
+                             out.push_back(0x80 | (cp & 0x3f)); }
+}
+
+// If `cp` is a codepoint reachable in Windows-1252 single-byte encoding,
+// return the byte (0x00-0xFF).  Else -1.  ASCII passes through; latin-1
+// supplement passes through; the 27 Win1252 specials in 0x80-0x9F (€, …,
+// smart-quotes, em-dash, etc.) get mapped back to their single byte.
+static int cp_to_win1252_byte(uint32_t cp) {
+    if (cp < 0x80 || (cp >= 0xA0 && cp <= 0xFF)) return static_cast<int>(cp);
+    switch (cp) {
+        case 0x20AC: return 0x80;  case 0x201A: return 0x82;
+        case 0x0192: return 0x83;  case 0x201E: return 0x84;
+        case 0x2026: return 0x85;  case 0x2020: return 0x86;
+        case 0x2021: return 0x87;  case 0x02C6: return 0x88;
+        case 0x2030: return 0x89;  case 0x0160: return 0x8A;
+        case 0x2039: return 0x8B;  case 0x0152: return 0x8C;
+        case 0x017D: return 0x8E;  case 0x2018: return 0x91;
+        case 0x2019: return 0x92;  case 0x201C: return 0x93;
+        case 0x201D: return 0x94;  case 0x2022: return 0x95;
+        case 0x2013: return 0x96;  case 0x2014: return 0x97;
+        case 0x02DC: return 0x98;  case 0x2122: return 0x99;
+        case 0x0161: return 0x9A;  case 0x203A: return 0x9B;
+        case 0x0153: return 0x9C;  case 0x017E: return 0x9E;
+        case 0x0178: return 0x9F;
+    }
+    return -1;
+}
+
+// Greedy ftfy: scan for runs of codepoints that map back to single
+// Windows-1252 bytes >= 0x80.  Reinterpret as raw bytes and try UTF-8
+// decode.  If the result produces codepoints outside the byte range
+// (i.e., decoded a multi-byte UTF-8 sequence the model emitted as
+// individual byte-level BPE tokens), substitute it.  Recovers em-
+// dashes / smart-quotes / etc. from web-mojibake patterns the base
+// model learned.
+static std::string fix_mojibake(const std::string& s) {
+    std::vector<uint32_t> cps;
+    for (size_t i = 0; i < s.size(); ) cps.push_back(utf8_next_cp(s, i));
     std::string out;
-    for (auto t : tokens) {
-        auto sv = v.bytes_for(t);
-        out.append(sv.data(), sv.size());
+    for (size_t i = 0; i < cps.size(); ) {
+        int b0 = cp_to_win1252_byte(cps[i]);
+        if (b0 < 0x80) {
+            cp_to_utf8(cps[i], out); ++i; continue;
+        }
+        size_t j = i;
+        std::string bytes;
+        while (j < cps.size()) {
+            int b = cp_to_win1252_byte(cps[j]);
+            if (b < 0x80) break;
+            bytes.push_back(static_cast<char>(b));
+            ++j;
+        }
+        // Try UTF-8 decode of the byte run.
+        std::string decoded;
+        size_t bi = 0;
+        bool ok = !bytes.empty();
+        bool gained = false;
+        while (bi < bytes.size()) {
+            size_t prev = bi;
+            uint32_t cp2 = utf8_next_cp(bytes, bi);
+            if (bi == prev + 1 && static_cast<unsigned char>(bytes[prev]) >= 0x80) {
+                ok = false; break;  // lead byte couldn't form a sequence
+            }
+            if (cp2 > 0xFF) gained = true;
+            cp_to_utf8(cp2, decoded);
+        }
+        if (ok && gained) {
+            out += decoded;
+        } else {
+            for (size_t k = i; k < j; ++k) cp_to_utf8(cps[k], out);
+        }
+        i = j;
     }
     return out;
+}
+
+std::string decode_tokens(const Vocab& v, const std::vector<uint16_t>& tokens) {
+    std::string raw;
+    for (auto t : tokens) {
+        auto sv = v.bytes_for(t);
+        raw.append(sv.data(), sv.size());
+    }
+    return fix_mojibake(raw);
 }
 
 // ---------------------------------------------------------------------
