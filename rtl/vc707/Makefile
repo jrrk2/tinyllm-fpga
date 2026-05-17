@@ -323,14 +323,31 @@ release-mcs := $(release-dir)/vc707_microgpt_eth.mcs
 release-ddr := $(release-dir)/lbfp_full_DDR3.bin
 release-voc := $(release-dir)/bfp_vocab.bin
 
-# Build a release snapshot from whatever is currently in work/, the
-# generated/ tree, and the Vivado reports.  Requires `make` to have
-# completed first (we don't trigger a fresh synth from here — that's
-# what `make` itself is for).
-release: $(bit) $(mcs) $(GENERATED_DIR)/lbfp_full_DDR3.bin host/bfp_vocab.bin
+# Capture a release snapshot from whatever is currently built — never
+# triggers a fresh Vivado synth or hex/DDR3 bake.  Resolves the source
+# bitstream from microgpt_eth.runs/ → work/ → release/bitstream/ at
+# parse time (same EXISTING_BIT used by flash/program).  If nothing
+# exists, fails with explicit instructions instead of silently kicking
+# off a 25-min synth (the old behaviour).
+release: host/bfp_vocab.bin
+	@set -e; \
+	if [ -z "$(EXISTING_BIT)" ]; then \
+	    echo "ERROR: no bitstream found.  Run 'make all' first."; exit 1; \
+	fi; \
+	if [ ! -f "$(GENERATED_DIR)/lbfp_full_DDR3.bin" ]; then \
+	    echo "ERROR: $(GENERATED_DIR)/lbfp_full_DDR3.bin missing."; \
+	    echo "       Bake first with: python host/gen_smollm_blockfp_ddr.py"; \
+	    exit 1; \
+	fi
 	@mkdir -p $(release-dir)/reports
-	@cp $(bit)                              $(release-bit)
-	@cp $(mcs)                              $(release-mcs)
+	@cp $(EXISTING_BIT)                     $(release-bit)
+	@if [ -n "$(EXISTING_MCS)" ]; then \
+	    cp $(EXISTING_MCS) $(release-mcs); \
+	else \
+	    echo "[release] generating $(release-mcs) from $(EXISTING_BIT)"; \
+	    $(VIVADO) $(VIVADOFLAGS) -source scripts/write_cfgmem.tcl \
+	        -tclargs $(release-mcs) $(EXISTING_BIT); \
+	fi
 	@cp $(GENERATED_DIR)/lbfp_full_DDR3.bin $(release-ddr)
 	@cp host/bfp_vocab.bin                  $(release-voc)
 	@cp $(GENERATED_DIR)/lbfp_full_cfg.svh             $(release-dir)/ 2>/dev/null || true
