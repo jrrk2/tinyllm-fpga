@@ -385,7 +385,14 @@ module autoregress_bfp_top #(
           state            <= S_NEXT;
         end
         S_NEXT: begin
-          if (step == N_STEPS - 1) state <= S_ALL_DONE;
+          // Terminate after n_prompt_active prompt tokens + N_GEN generated
+          // tokens.  N_STEPS (= NPROMPT_MAX + N_GEN) sizes the buffer at
+          // synth — but if the active prompt is shorter than NPROMPT_MAX
+          // (the common case) the FSM would otherwise iterate over the
+          // empty slack slots, blowing the host poll timeout for no gain.
+          if (step == ({{($bits(step)-$clog2(NPROMPT_MAX+1)){1'b0}},
+                        n_prompt_active} + N_GEN - 1))
+            state <= S_ALL_DONE;
           else begin
             step  <= step + 1'b1;
             state <= S_DRIVE;
