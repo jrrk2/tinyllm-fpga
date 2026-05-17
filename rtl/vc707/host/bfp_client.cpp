@@ -943,16 +943,20 @@ static void load_rom(Udp& u, int kind, const std::vector<uint16_t>& entries,
     send_reg_write_batch(u, seq++, first);
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
-    // 2. Stream data writes in batches of 16.
-    for (size_t i = 0; i < entries.size(); i += 16) {
+    // 2. Stream data writes — pack 16 entries per FT_REG_WRITE packet.
+    // The destination BRAM is true-dual-port with port A clocked by
+    // eth_clk (host side), so every regmap write to 0x061 lands as
+    // a write on the very next eth_clk edge.  No CDC, no risk of
+    // dropped pulses regardless of packet density.
+    constexpr size_t PER_PKT = 16;
+    for (size_t i = 0; i < entries.size(); i += PER_PKT) {
+        size_t n = std::min(PER_PKT, entries.size() - i);
         std::vector<RegW> batch;
-        size_t end = std::min(entries.size(), i + 16);
-        for (size_t j = i; j < end; ++j)
-            batch.push_back({REG_BRAM_DATA, static_cast<uint32_t>(entries[j])});
+        batch.reserve(n);
+        for (size_t j = 0; j < n; ++j) {
+            batch.push_back({REG_BRAM_DATA, static_cast<uint32_t>(entries[i + j])});
+        }
         send_reg_write_batch(u, seq++, batch);
-        // small breather every ~100 packets so we don't outrun eth_ctrl
-        if (((i / 16) % 64) == 63)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 

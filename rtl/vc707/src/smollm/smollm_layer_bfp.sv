@@ -106,6 +106,7 @@ module smollm_layer_bfp #(
   input  wire [17:0]                         wr_addr,
   input  wire [15:0]                         wr_data,
   input  wire                                wr_en,
+  input  wire                                clk_wr,    // BRAM write clock (eth_clk at top)
   // Debug taps (synthesis-friendly — only used by sim testbench)
   output logic [6:0]                         dbg_state,
   output logic [11:0]                        dbg_cnt,
@@ -328,14 +329,14 @@ module smollm_layer_bfp #(
   // all zeros; host must call bfp_client load-roms before inference.
 
   // ---------------------------------------------------------------------------
-  // Host write port for the gamma BRAMs.
+  // Host write port for the gamma BRAMs — clocked by clk_wr (eth_clk
+  // at the top).  Read side stays on `clk` (core_clk).  Vivado infers
+  // each ROM as a true-dual-port BRAM with asymmetric clocks — no CDC
+  // needed for kind/addr/data/en, no risk of pulse loss.
   //   wr_kind: 0=G1_m  1=G1_e  2=G2_m  3=G2_e   (kinds 4..6 belong to the
   //            decode head and autoregress top; this module ignores them.)
-  //   wr_addr: linear entry index in the destination BRAM
-  //   wr_data: 16-bit mantissa or low-8-bit exponent
-  //   wr_en  : 1-cycle pulse from the top regmap CDC
   // ---------------------------------------------------------------------------
-  always_ff @(posedge clk) begin
+  always_ff @(posedge clk_wr) begin
     if (wr_en) begin
       case (wr_kind)
         5'd0: rom_G1_m[wr_addr[$clog2(NL*D)-1:0]]      <= $signed(wr_data);

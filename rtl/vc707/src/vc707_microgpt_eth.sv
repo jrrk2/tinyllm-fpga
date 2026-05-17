@@ -729,34 +729,17 @@ module vc707_microgpt_eth (
   //                  of bram_addr after each 0x061 write.
   //   0x061 (write): bram_data[15:0]  — pulse a write into the targeted
   //                  BRAM at current bram_addr.
-  // Eth-clock-domain state is latched on regmap writes; a toggle-CDC
-  // pulse into core_clk drives the actual BRAM write.  bram_kind /
-  // bram_addr / bram_data are quasi-static during the CDC (changed
-  // synchronously with the toggle); 2-FF sync is safe.
+  // All signals stay in eth_clk: they are wired directly into the
+  // autoregress BRAMs' write port (port A) while the read port (port B)
+  // remains on core_clk.  Vivado infers each BRAM as a true-dual-port
+  // RAMB36E1 with asymmetric clocks — no CDC, no risk of dropped pulses.
   // -------------------------------------------------------------------
-  reg [4:0]  bram_kind_eth   = 5'd0;
-  reg [17:0] bram_addr_eth   = 18'd0;
-  reg [15:0] bram_data_eth   = 16'd0;
-  reg        bram_inc_eth    = 1'b0;
-  reg        bram_wr_tog_eth = 1'b0;
-
-  (* ASYNC_REG = "TRUE" *) reg [4:0]  bram_kind_sync1_core, bram_kind_sync2_core;
-  (* ASYNC_REG = "TRUE" *) reg [17:0] bram_addr_sync1_core, bram_addr_sync2_core;
-  (* ASYNC_REG = "TRUE" *) reg [15:0] bram_data_sync1_core, bram_data_sync2_core;
-  (* ASYNC_REG = "TRUE" *) reg [2:0]  bram_tog_sync_core   = 3'd0;
-  always_ff @(posedge core_clk) begin
-    bram_kind_sync1_core <= bram_kind_eth;
-    bram_kind_sync2_core <= bram_kind_sync1_core;
-    bram_addr_sync1_core <= bram_addr_eth;
-    bram_addr_sync2_core <= bram_addr_sync1_core;
-    bram_data_sync1_core <= bram_data_eth;
-    bram_data_sync2_core <= bram_data_sync1_core;
-    bram_tog_sync_core   <= {bram_tog_sync_core[1:0], bram_wr_tog_eth};
-  end
-  wire [4:0]  bram_wr_kind_core = bram_kind_sync2_core;
-  wire [17:0] bram_wr_addr_core = bram_addr_sync2_core;
-  wire [15:0] bram_wr_data_core = bram_data_sync2_core;
-  wire        bram_wr_en_core   = bram_tog_sync_core[2] ^ bram_tog_sync_core[1];
+  reg [4:0]  bram_kind_eth    = 5'd0;
+  reg [17:0] bram_addr_eth    = 18'd0;   // next-write pointer
+  reg [17:0] bram_wr_addr_eth = 18'd0;   // address used by the current pulse
+  reg [15:0] bram_data_eth    = 16'd0;
+  reg        bram_inc_eth     = 1'b0;
+  reg        bram_wr_en_eth   = 1'b0;
 
   // Diagnostic snapshot signals — read by host via 0x012..0x044.
   wire [29:0]  dbg_first_araddr;
@@ -1134,10 +1117,11 @@ module vc707_microgpt_eth (
     .m_axi_rdata  ( m_axi_rdata       ),
     .m_axi_rresp  ( m_axi_rresp       ),
     .m_axi_rlast  ( m_axi_rlast       ),
-    .wr_kind      ( bram_wr_kind_core ),
-    .wr_addr      ( bram_wr_addr_core ),
-    .wr_data      ( bram_wr_data_core ),
-    .wr_en        ( bram_wr_en_core   )
+    .wr_kind      ( bram_kind_eth    ),
+    .wr_addr      ( bram_wr_addr_eth ),
+    .wr_data      ( bram_data_eth    ),
+    .wr_en        ( bram_wr_en_eth   ),
+    .clk_wr       ( eth_clk          )
   );
   assign lay_result = {{(9216 - LBFP_NSTEPS*16){1'b0}}, bfp_result_tokens};
 
@@ -1278,6 +1262,9 @@ module vc707_microgpt_eth (
   // ================================================================
   always @(posedge eth_clk) begin
     jtag_master_readdatavalid <= 1'b0;
+    // Default-clear the 1-cycle BRAM write pulse; the 0x061 case below
+    // re-asserts it for exactly the cycle the data is latched.
+    bram_wr_en_eth <= 1'b0;
 
     // Reset only the new factor-override shadow regs (others rely on
     // inline init that pre-dates the no-inline-init rule).
@@ -1356,13 +1343,16 @@ module vc707_microgpt_eth (
           bram_kind_eth <= jtag_master_writedata[22:18];
           bram_addr_eth <= jtag_master_writedata[17:0];
         end
-        // 0x061 — one BRAM write.  bram_data = writedata[15:0]; pulse the
-        // toggle so the core_clk-side decoder fires a wr_en.  If
-        // bram_inc_eth is set, increment bram_addr_eth after the pulse
-        // so a stream of writes to 0x061 fills the BRAM linearly.
+        // 0x061 — one BRAM write.  bram_data = writedata[15:0]; pulse
+        // bram_wr_en_eth high for exactly the cycle the data is latched
+        // so the dual-port BRAM (clk_wr = eth_clk) captures it on the
+        // next edge.  If bram_inc_eth is set, increment bram_addr_eth
+        // after the pulse so a stream of writes to 0x061 fills the
+        // BRAM linearly.
         10'h061: begin
-          bram_data_eth   <= jtag_master_writedata[15:0];
-          bram_wr_tog_eth <= ~bram_wr_tog_eth;
+          bram_data_eth    <= jtag_master_writedata[15:0];
+          bram_wr_addr_eth <= bram_addr_eth;       // pre-increment snapshot
+          bram_wr_en_eth   <= 1'b1;
           if (bram_inc_eth) bram_addr_eth <= bram_addr_eth + 18'd1;
         end
         default: ;

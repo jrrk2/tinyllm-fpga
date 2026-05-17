@@ -58,7 +58,8 @@ module smollm_decode_head_bfp #(
   input  wire [4:0]                                 wr_kind,
   input  wire [17:0]                                wr_addr,
   input  wire [15:0]                                wr_data,
-  input  wire                                       wr_en
+  input  wire                                       wr_en,
+  input  wire                                       clk_wr   // BRAM write clock
 );
 
   localparam int NT_D          = D / BFP_TILE;
@@ -72,9 +73,9 @@ module smollm_decode_head_bfp #(
   (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] rom_NW_e [0:NT_D-1];
 
   // norm_w is host-loaded at boot via the wr_* port (kind=4 for NW_m,
-  // kind=5 for NW_e).  Power-on contents are all-zero; host must call
-  // bfp_client load-roms before inference is meaningful.
-  always_ff @(posedge clk) begin
+  // kind=5 for NW_e).  Write port is on clk_wr (eth_clk); read port
+  // stays on clk (core_clk) — true-dual-port BRAM, no CDC.
+  always_ff @(posedge clk_wr) begin
     if (wr_en) begin
       case (wr_kind)
         5'd4: rom_NW_m[wr_addr[$clog2(D)-1:0]]    <= $signed(wr_data);

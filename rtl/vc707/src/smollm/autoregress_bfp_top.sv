@@ -45,6 +45,7 @@ module autoregress_bfp_top #(
   input  wire [17:0]                   wr_addr,
   input  wire [15:0]                   wr_data,
   input  wire                          wr_en,
+  input  wire                          clk_wr,   // BRAM write clock (eth_clk at top)
   // Layer-0 / region base offsets — caller patches in lbfp_ddr3.svh
   // constants.  Ignored when neither stream is enabled.
   input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WQ_m,
@@ -94,7 +95,7 @@ module autoregress_bfp_top #(
   // Power-on contents are all-zero — autoregress would treat that as
   // <|endoftext|> tokens until host calls bfp_client load-roms.
   (* ram_style = "block" *) logic [15:0] prompt_rom [0:N_PROMPT-1];
-  always_ff @(posedge clk) begin
+  always_ff @(posedge clk_wr) begin
     if (wr_en && wr_kind == 5'd6)
       prompt_rom[wr_addr[$clog2(N_PROMPT)-1:0]] <= wr_data;
   end
@@ -233,7 +234,8 @@ module autoregress_bfp_top #(
     .m_axi_rdata  (m_axi_rdata),
     .m_axi_rresp  (m_axi_rresp),
     .m_axi_rlast  (m_axi_rlast),
-    .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(wr_data), .wr_en(wr_en)
+    .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(wr_data), .wr_en(wr_en),
+    .clk_wr(clk_wr)
   );
 
   // ---------------------------------------------------------------------------
@@ -273,7 +275,8 @@ module autoregress_bfp_top #(
     .m_axi_rdata  (m_axi_rdata),
     .m_axi_rresp  (m_axi_rresp),
     .m_axi_rlast  (m_axi_rlast),
-    .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(wr_data), .wr_en(wr_en)
+    .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(wr_data), .wr_en(wr_en),
+    .clk_wr(clk_wr)
   );
 
   // ---------------------------------------------------------------------------
