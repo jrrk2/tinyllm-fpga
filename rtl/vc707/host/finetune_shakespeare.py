@@ -11,17 +11,21 @@ End-to-end flow:
     # 1. Fine-tune (one-time, ~10–30 min on a single GPU).
     python host/finetune_shakespeare.py --out generated/shakespeare-smollm
 
-    # 2. Pack for FPGA — re-uses the existing BFP pipeline with a different
-    #    MODEL path and PREFIX so the artifacts don't collide with the
-    #    SmolLM2-135M baseline.
-    MODEL=generated/shakespeare-smollm PREFIX=shake_ \
-      PROMPT="To be, or not to be" N_GEN=32 \
-      python host/gen_smollm_blockfp_full.py
+    # 2. Pack for FPGA — TWO scripts, both honour MODEL + PREFIX:
+    #       _full.py  emits the host-loaded BRAM .hex files (gammas,
+    #                 norm_w, prompt, embed, KV init).
+    #       _ddr.py   bakes the wide-packed weight matrices into the
+    #                 DDR3 .bin image that the FPGA streams over AXI.
+    export MODEL=generated/shakespeare-smollm
+    export PREFIX=shake_
+    export PROMPT="Hark"        # keep prompt <= 4 tokens until N_PROMPT lifted in bitstream
+    export N_GEN=32
+    python host/gen_smollm_blockfp_full.py
+    python host/gen_smollm_blockfp_ddr.py
 
-    # 3. Upload to FPGA.
+    # 3. Upload to FPGA — no Vivado rebuild needed; same bitstream.
     cd host
-    MGRT_PREFIX=shake_ ./bfp_client load-roms   ../generated
-    MGRT_PREFIX=shake_ ./bfp_client verify-roms ../generated
+    MGRT_PREFIX=shake_ ./bfp_client load-roms ../generated
     ./bfp_client all ../generated/shake_DDR3.bin
 
 The corpus defaults to Karpathy's "tinyshakespeare" (1 MB, downloaded
@@ -160,10 +164,10 @@ def main():
     print(f"\n[finetune] saved {args.out}", file=sys.stderr)
     print("\nNext steps:", file=sys.stderr)
     print(
-        f'  MODEL={args.out} PREFIX=shake_ PROMPT="To be, or not to be" \\\n'
-        f"    N_GEN=32 python host/gen_smollm_blockfp_full.py\n"
-        f"  MGRT_PREFIX=shake_ ./bfp_client load-roms   ../generated\n"
-        f"  MGRT_PREFIX=shake_ ./bfp_client verify-roms ../generated\n"
+        f'  export MODEL={args.out} PREFIX=shake_ PROMPT="Hark" N_GEN=32\n'
+        f"  python host/gen_smollm_blockfp_full.py     # .hex files\n"
+        f"  python host/gen_smollm_blockfp_ddr.py      # DDR3 .bin\n"
+        f"  MGRT_PREFIX=shake_ ./bfp_client load-roms ../generated\n"
         f"  ./bfp_client all ../generated/shake_DDR3.bin",
         file=sys.stderr,
     )

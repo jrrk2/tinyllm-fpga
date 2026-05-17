@@ -4,7 +4,7 @@ image (.bin) that mirrors lbfp_ddr3.svh's byte-offset map.  The image
 is uploaded to DDR3 by the host before pulsing the autoregress start
 bit; weight_streamer_bfp_mt.sv then fetches per-matvec chunks via AXI.
 
-Output: generated/lbfp_full_DDR3.bin  (~286 MB)
+Output: generated/<PREFIX>DDR3.bin  (~286 MB; default PREFIX=lbfp_full_)
 
 Each weight matrix region is wide-packed in BFP:
   mantissas: LANES (=16) × 16 b = 256 b per (chunk, col) entry,
@@ -30,6 +30,9 @@ HD     = int(os.environ.get('HD',     64))
 FFN    = int(os.environ.get('FFN',    1536))
 NL     = int(os.environ.get('NL',     30))
 OUT    = os.environ.get('OUT',    'generated')
+# PREFIX matches gen_smollm_blockfp_full.py so fine-tuned models can
+# emit a parallel set of artifacts (eg PREFIX=shake_ → shake_DDR3.bin).
+PREFIX = os.environ.get('PREFIX', 'lbfp_full_')
 TILE   = 16
 LANES  = 16
 ALIGN  = 4096
@@ -226,23 +229,24 @@ def main():
     for name, data in regions:
         offsets[name] = len(img)
         img.extend(data)
-    out_path = os.path.join(OUT, 'lbfp_full_DDR3.bin')
+    out_path = os.path.join(OUT, f'{PREFIX}DDR3.bin')
     with open(out_path, 'wb') as f:
         f.write(img)
     print(f"\n[ddr] wrote {out_path}  ({len(img):,} B = {len(img)/1024/1024:.1f} MB)",
           file=sys.stderr)
-    with open(os.path.join(OUT, 'lbfp_full_DDR3.offsets.txt'), 'w') as f:
+    offsets_path = os.path.join(OUT, f'{PREFIX}DDR3.offsets.txt')
+    with open(offsets_path, 'w') as f:
         f.write(f"# Region offsets in {out_path}\n")
         for name, off in offsets.items():
             f.write(f"  {name:14s}  0x{off:08X}  ({off:,} B)\n")
-    print(f"[ddr] offsets in lbfp_full_DDR3.offsets.txt", file=sys.stderr)
+    print(f"[ddr] offsets in {offsets_path}", file=sys.stderr)
 
     # Optional: emit a $readmemh-compatible 128-bit-entry hex file for
     # mock_axi_slave loading (Verilator end-to-end streaming test).  The
     # file is roughly 2× the .bin size (33 ASCII chars per 16 raw bytes)
     # so we gate it behind LBFP_EMIT_HEX=1 — by default skipped.
     if os.environ.get('LBFP_EMIT_HEX', '0') == '1':
-        out_hex = os.path.join(OUT, 'lbfp_full_DDR3.hex')
+        out_hex = os.path.join(OUT, f'{PREFIX}DDR3.hex')
         nentries = (len(img) + 15) // 16
         print(f"[ddr] emitting {out_hex}  ({nentries:,} 128-bit entries) ...",
               file=sys.stderr)
