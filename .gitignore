@@ -76,6 +76,12 @@ rtl/vc707/ip/*/*.xci
 rtl/vc707/ip/*/*.xml
 rtl/vc707/ip/*/*.gen/
 rtl/vc707/ip/*/*.runs/
+rtl/vc707/ip/*/*.cache/
+rtl/vc707/ip/*/*.hw/
+rtl/vc707/ip/*/*.srcs/
+rtl/vc707/ip/*/*.sim/
+rtl/vc707/ip/*/*.ip_user_files/
+rtl/vc707/ip/*/*.xpr
 
 # Release area: track small text artifacts (.hex / .svh / .txt / .prm /
 # reports) but never the big binaries — those go to GitHub Releases.
