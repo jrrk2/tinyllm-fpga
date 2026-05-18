@@ -15,9 +15,14 @@ Output: ../generated/silu_lut.hex  (65536 lines of 4 hex digits)
 # and host/gen_smollm_blockfp.py.
 SILU_LUT_SCALE = 32.0
 import numpy as np
-import pathlib, sys
+import os, pathlib, sys
 
-OUT = pathlib.Path(__file__).parent.parent / "generated" / "silu_lut.hex"
+# Default = rtl/generated/, matching gen_smollm_blockfp.py and what
+# Vivado synth's $readmemh sees via MICROGPT_WEIGHT_DIR=[file normalize
+# ../generated].  Override with OUT=... (e.g. sim/Makefile sets
+# OUT=../generated so Verilator from rtl/vc707/sim/ finds it).
+_DEFAULT_OUT = pathlib.Path(__file__).resolve().parent.parent.parent / "generated"
+OUT = pathlib.Path(os.environ.get("OUT", _DEFAULT_OUT)) / "silu_lut.hex"
 
 def main():
     # All 65536 16-bit two's-complement values, in order 0,1,...,32767,-32768,...,-1

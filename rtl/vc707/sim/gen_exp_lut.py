@@ -25,7 +25,11 @@ import os
 N_LUT = 1024
 STEP  = 128.0  # 1/step real per index unit = 1/128
 
-out_dir = os.path.join(os.path.dirname(__file__), '..', 'generated')
+# Default = rtl/generated/ (canonical, matches gen_smollm_blockfp.py and
+# Vivado's MICROGPT_WEIGHT_DIR).  Override with OUT=... e.g. sim/Makefile
+# sets OUT=../generated so Verilator from rtl/vc707/sim/ finds it.
+_default_out = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'generated'))
+out_dir = os.environ.get('OUT', _default_out)
 os.makedirs(out_dir, exist_ok=True)
 out_path = os.path.join(out_dir, 'exp_lut.hex')
 

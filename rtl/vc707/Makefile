@@ -5,12 +5,45 @@
 ##         make flash
 ##         make clean
 ##
-## Required env (mirrors cva6 sourceme.sh):
+## Env (mirrors cva6 sourceme.sh) — defaults supplied below, override on the
+## command line or in the environment if your install differs:
+##   XILINX_VIVADO_VERSION=2020.1
+##   XILINX_VIVADO_ROOT=/opt/Xilinx/Vivado/$(XILINX_VIVADO_VERSION)
 ##   XILINX_PART=xc7vx485tffg1761-2
 ##   XILINX_BOARD=xilinx.com:vc707:part0:1.4
 ##   BOARD=vc707
+##
+## The IPs were generated with Vivado 2020.1 (see ip/*/.../2020.1.1 cache
+## dirs) — newer versions auto-upgrade on first parse but may emit warnings.
 
-VIVADO ?= vivado
+# ----------------------------------------------------------------------
+# Vivado install + version defaults.
+#
+# Picks $(XILINX_VIVADO_ROOT)/bin/vivado when present, otherwise falls
+# back to whatever `vivado` is on PATH (so a `source settings64.sh`
+# workflow still works untouched).  Prepending the bin dir to PATH also
+# lets the per-IP sub-makes (ip/common.mk → bare `vivado`) and any
+# Vivado-launched helpers resolve the same executable.
+# ----------------------------------------------------------------------
+XILINX_VIVADO_VERSION ?= 2020.1
+XILINX_VIVADO_ROOT    ?= /opt/Xilinx/Vivado/$(XILINX_VIVADO_VERSION)
+
+ifneq ($(wildcard $(XILINX_VIVADO_ROOT)/bin/vivado),)
+  VIVADO ?= $(XILINX_VIVADO_ROOT)/bin/vivado
+  export PATH := $(XILINX_VIVADO_ROOT)/bin:$(PATH)
+  export XILINX_VIVADO ?= $(XILINX_VIVADO_ROOT)
+else
+  VIVADO ?= vivado
+endif
+
+# Board/part triple consumed by scripts/prologue.tcl and ip/*/tcl/run.tcl
+# via $::env(...).  Must be exported so the recursive `make` in the IP
+# rule and the Vivado-launched Tcl both see them.
+XILINX_PART  ?= xc7vx485tffg1761-2
+XILINX_BOARD ?= xilinx.com:vc707:part0:1.4
+BOARD        ?= vc707
+export XILINX_PART XILINX_BOARD BOARD
+
 VIVADOFLAGS ?= -nojournal -mode batch -source scripts/prologue.tcl
 
 work-dir := work
@@ -68,11 +101,10 @@ TM_HEX_GEN := host/gen_multilayer_test.py
 TM_HEX_CMD := python3 host/gen_multilayer_test.py --mode tm --nlayers $(NLAYERS) --config $(LAYER_CONFIG)
 endif
 
-$(tm_stamp): $(TM_HEX_GEN) host/gen_layer_ddr3.py
+$(tm_stamp): $(TM_HEX_GEN)
 	@echo "=== regenerating tm_layer_*  (NL=$(NLAYERS) config=$(LAYER_CONFIG)) ==="
 	@rm -f $(GENERATED_DIR)/.tm_layer_*.stamp
 	$(TM_HEX_CMD)
-	python3 host/gen_layer_ddr3.py      --mode tm --nlayers $(NLAYERS)
 	@touch $@
 
 # SiLU LUT for swiglu.sv.  Regen when SILU_LUT_SCALE in gen_swiglu_lut.py
@@ -193,6 +225,12 @@ BUILD_STAMP ?= $(shell date -u +%Y%m%d-%H%M%S)
 
 VARIANT ?= smollm135
 
+## Per-VARIANT defaults.  MAX_CTX/NPROMPT_MAX/N_GEN use `?=` so a command
+## line `make MAX_CTX=64 ...` still wins (command-line vars > makefile
+## assignments, regardless of operator).  The smollm360 defaults are
+## tuned to fit XC7VX485T's 1030 BRAM36 budget: at MAX_CTX=64 the design
+## overflows by ~85 tiles (the KV cache is the dominant scaling consumer
+## and is linear in MAX_CTX); 32 leaves comfortable margin.
 ifeq ($(VARIANT),smollm135)
   SMOLLM_MODEL := HuggingFaceTB/SmolLM2-135M
   SMOLLM_D     := 576
@@ -201,6 +239,9 @@ ifeq ($(VARIANT),smollm135)
   SMOLLM_HD    := 64
   SMOLLM_FFN   := 1536
   SMOLLM_NL    := 30
+  MAX_CTX      ?= 64
+  NPROMPT_MAX  ?= 48
+  N_GEN        ?= 15
 else ifeq ($(VARIANT),smollm360)
   SMOLLM_MODEL := HuggingFaceTB/SmolLM2-360M
   SMOLLM_D     := 960
@@ -209,24 +250,50 @@ else ifeq ($(VARIANT),smollm360)
   SMOLLM_HD    := 64
   SMOLLM_FFN   := 2560
   SMOLLM_NL    := 32
+  MAX_CTX      ?= 32
+  NPROMPT_MAX  ?= 24
+  N_GEN        ?= 8
 else
   $(error VARIANT=$(VARIANT) not recognised — use smollm135 or smollm360)
 endif
 
-# Threaded into every packer invocation so cfg.svh, the .hex set, and
-# the DDR3 image all agree on the variant.
+## OUT pins the packer output dir to $(GENERATED_DIR) (= ../generated, i.e.
+## rtl/generated/).  gen_smollm_blockfp_{cfg,full,ddr}.py default
+## OUT='generated' relative to CWD = rtl/vc707/, which wrongly drops files
+## in rtl/vc707/generated/ where Vivado's include-path can't find them.
+##
+## MAX_CTX / NPROMPT_MAX / N_GEN flow from the per-VARIANT block above.
+## Without forwarding them through SMOLLM_ENV, `make MAX_CTX=32` etc.
+## silently has no effect — make doesn't export command-line variables
+## to recipe subshells by default.
 SMOLLM_ENV := MODEL=$(SMOLLM_MODEL) D=$(SMOLLM_D) H_Q=$(SMOLLM_H_Q) \
               H_KV=$(SMOLLM_H_KV) HD=$(SMOLLM_HD) FFN=$(SMOLLM_FFN) \
-              NL=$(SMOLLM_NL)
+              NL=$(SMOLLM_NL) OUT=$(GENERATED_DIR) \
+              MAX_CTX=$(MAX_CTX) NPROMPT_MAX=$(NPROMPT_MAX) N_GEN=$(N_GEN)
 
-$(lbfp_full_cfg_stamp): host/gen_smollm_blockfp_cfg.py
+## Target the real artifact (lbfp_full_cfg.svh) rather than a side-effect
+## stamp.  A previous stamp-only rule could pass make's up-to-date check
+## even when the .svh was deleted or never written, leaving Vivado to
+## fail with "cannot open include file lbfp_full_cfg.svh".  Variant-marker
+## ensures `make VARIANT=smollm360` after a smollm135 build regenerates.
+lbfp_full_cfg_svh    := $(GENERATED_DIR)/lbfp_full_cfg.svh
+## Marker name encodes every knob that changes cfg.svh — VARIANT plus
+## MAX_CTX/NPROMPT_MAX/N_GEN — so changing any of them forces a regen.
+## (Otherwise `make VARIANT=smollm360 MAX_CTX=32` after a prior smollm360
+##  build would skip cfg regen and synth the wrong-sized KV cache.)
+lbfp_full_cfg_marker := $(GENERATED_DIR)/.lbfp_full_cfg_$(VARIANT)_C$(MAX_CTX)_P$(NPROMPT_MAX)_G$(N_GEN).marker
+
+$(lbfp_full_cfg_marker):
+	@rm -f $(GENERATED_DIR)/.lbfp_full_cfg_*.marker
+	@touch $@
+
+$(lbfp_full_cfg_svh): host/gen_smollm_blockfp_cfg.py $(lbfp_full_cfg_marker)
 	@echo "=== generating lbfp_full_cfg.svh + PROMPT_TOKENS.txt (VARIANT=$(VARIANT)) ==="
 	$(SMOLLM_ENV) python3 host/gen_smollm_blockfp_cfg.py
-	@touch $@
 
 BFP_BUILD_DEPS :=
 ifeq ($(USE_BFP),1)
-  BFP_BUILD_DEPS += $(lbfp_full_cfg_stamp)
+  BFP_BUILD_DEPS += $(lbfp_full_cfg_svh)
 endif
 
 # Date-stamped archive — each successful synth gets snapshotted into
@@ -237,6 +304,16 @@ endif
 archive-dir := archive/$(VARIANT)-$(BUILD_STAMP)
 
 $(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(GENERATED_DIR)/exp_lut.hex $(lbfp_stamp) $(BFP_BUILD_DEPS)
+	@# Wipe stale Vivado project state so prologue.tcl creates a fresh
+	@# project — keeping a stale .xpr + new .runs (or vice versa) has bitten
+	@# us with inconsistent synth results.  Only fires for the bitstream
+	@# build target; `make program`/`flash`/`mcs` still re-open the existing
+	@# project via prologue.tcl.  .runs/.srcs/.sim are bundled in because
+	@# they're part of the same project's metadata — removing .xpr alone
+	@# leaves orphan run dirs that confuse create_project.
+	rm -rf microgpt_eth.xpr microgpt_eth.cache microgpt_eth.hw \
+	       microgpt_eth.ip_user_files microgpt_eth.hbs \
+	       microgpt_eth.runs microgpt_eth.srcs microgpt_eth.sim
 	mkdir -p $(work-dir)
 	$(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
 	cp microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit ./$(work-dir)/ 2>/dev/null || \
@@ -298,7 +375,7 @@ $(lbfp_full_DDR3_stamp): host/gen_smollm_blockfp_ddr.py $(lbfp_full_stamp)
 # AXI fetch + streamer pipeline against the BRAM-mode golden tokens.
 # Requires the (~670 MB) hex image — generated with LBFP_EMIT_HEX=1.
 bfp-autoregress-stream: $(lbfp_full_stamp)
-	LBFP_EMIT_HEX=1 python3 host/gen_smollm_blockfp_ddr.py
+	OUT=$(GENERATED_DIR) LBFP_EMIT_HEX=1 python3 host/gen_smollm_blockfp_ddr.py
 	$(MAKE) -C sim bfp-autoregress-stream
 
 .PHONY: bfp-sim bfp-full bfp-autoregress bfp-autoregress-stream
@@ -608,13 +685,13 @@ shakespeare-pack:
 	    exit 1; \
 	fi
 	@echo "=== packing shake_ artifacts from $(SHAKES_MODEL) (PROMPT=$(SHAKES_PROMPT)) ==="
-	MODEL=$(SHAKES_MODEL) PREFIX=$(SHAKES_PREFIX) \
+	MODEL=$(SHAKES_MODEL) PREFIX=$(SHAKES_PREFIX) OUT=$(GENERATED_DIR) \
 	  PROMPT="$(SHAKES_PROMPT)" N_GEN=$(SHAKES_NGEN) \
 	  python3 host/gen_smollm_blockfp_cfg.py
-	MODEL=$(SHAKES_MODEL) PREFIX=$(SHAKES_PREFIX) \
+	MODEL=$(SHAKES_MODEL) PREFIX=$(SHAKES_PREFIX) OUT=$(GENERATED_DIR) \
 	  PROMPT="$(SHAKES_PROMPT)" N_GEN=$(SHAKES_NGEN) \
 	  python3 host/gen_smollm_blockfp_full.py
-	MODEL=$(SHAKES_MODEL) PREFIX=$(SHAKES_PREFIX) \
+	MODEL=$(SHAKES_MODEL) PREFIX=$(SHAKES_PREFIX) OUT=$(GENERATED_DIR) \
 	  PROMPT="$(SHAKES_PROMPT)" N_GEN=$(SHAKES_NGEN) \
 	  python3 host/gen_smollm_blockfp_ddr.py
 	@echo "=== shake_ artifacts in $(GENERATED_DIR)/$(SHAKES_PREFIX)* ==="
@@ -690,6 +767,216 @@ demo: host/bfp_client $(release-ddr) $(release-voc)
 	./host/bfp_client -v $(release-voc) all $(release-ddr)
 
 # ----------------------------------------------------------------------
+# make smoke-test — end-to-end baseline verification against a published
+# GitHub release.  Pulls the 4 large binary artifacts (bit/mcs/DDR3/vocab)
+# from the tagged release into release/ (only if absent — rm to force
+# re-fetch), JTAG-programs the FPGA, runs inference, and diffs the
+# RTL_TOKENS line against a known-good golden baked into this Makefile.
+# Exits non-zero on mismatch.
+#
+# Per-model BRAM .hex files (G1, G2, NORM_W, PROMPT) are NOT in the
+# GitHub release — they're tracked in-repo under release/ and must
+# match the release tag.  If smoke-test fails on a non-tag commit,
+# `git checkout $(SMOKE_RELEASE_TAG) -- release/*.hex` may be needed.
+#
+# Default tag: v0.2.0 (the canonical SmolLM2-135M baseline whose RTL
+# token output is published in the top-level README).  Override with
+# SMOKE_RELEASE_TAG=... AND a matching SMOKE_EXPECTED_TOKENS_<tag>
+# entry (or pass SMOKE_EXPECTED_TOKENS=... explicitly).
+# ----------------------------------------------------------------------
+SMOKE_RELEASE_TAG ?= v0.2.0
+SMOKE_BASE_URL    := https://github.com/jrrk2/tinyllm-fpga/releases/download/$(SMOKE_RELEASE_TAG)
+SMOKE_ARTIFACTS   := vc707_microgpt_eth.bit vc707_microgpt_eth.mcs \
+                     lbfp_full_DDR3.bin bfp_vocab.bin
+
+# Per-model BRAM .hex files that load-roms uploads at runtime.  These
+# are tracked in git (not in the GitHub-release tarball), so the smoke
+# test pulls them from the tag's tree via `git show` into a dedicated
+# per-tag dir.  This makes the test deterministic regardless of any
+# local edits to release/*.hex (e.g. a modified PROMPT.hex for testing
+# a different prompt would otherwise silently corrupt the baseline run).
+SMOKE_HEX_FILES   := lbfp_full_G1_m.hex     lbfp_full_G1_e.hex \
+                     lbfp_full_G2_m.hex     lbfp_full_G2_e.hex \
+                     lbfp_full_NORM_W_m.hex lbfp_full_NORM_W_e.hex \
+                     lbfp_full_PROMPT.hex
+SMOKE_DIR         := release-smoke/$(SMOKE_RELEASE_TAG)
+
+# Known-good 19-token output for the v0.2.0 baseline (SmolLM2-135M
+# canonical, default prompt baked into release/lbfp_full_PROMPT.hex).
+# Source: top-level README.md Quick start section.
+SMOKE_EXPECTED_TOKENS_v0.2.0 := 712 9612 3102 645 260 905 436 441 2408 281 624 198 198 18 504 905 436 441 805
+SMOKE_EXPECTED_TOKENS        ?= $(SMOKE_EXPECTED_TOKENS_$(SMOKE_RELEASE_TAG))
+
+smoke-test: host/bfp_client
+	@if [ -z "$(strip $(SMOKE_EXPECTED_TOKENS))" ]; then \
+	    echo "ERROR: no golden tokens recorded for SMOKE_RELEASE_TAG=$(SMOKE_RELEASE_TAG)."; \
+	    echo "       Add SMOKE_EXPECTED_TOKENS_$(SMOKE_RELEASE_TAG) := ... to Makefile,"; \
+	    echo "       or pass SMOKE_EXPECTED_TOKENS=\"<tokens>\" on the command line."; \
+	    exit 1; \
+	fi
+	@echo "=== smoke-test against GitHub release $(SMOKE_RELEASE_TAG) ==="
+	@mkdir -p release $(SMOKE_DIR)
+	@# Step 1: download the 4 large binaries into release/ (cached across
+	@# runs).  Symlink them into the per-tag dir so bfp_client reads
+	@# everything from one place.
+	@for f in $(SMOKE_ARTIFACTS); do \
+	    if [ ! -s release/$$f ]; then \
+	        echo "[fetch] release/$$f"; \
+	        curl -fsSL -o release/$$f $(SMOKE_BASE_URL)/$$f || \
+	            { echo "ERROR: failed to fetch $$f from $(SMOKE_BASE_URL)"; exit 1; }; \
+	    else \
+	        echo "[skip]  release/$$f already present"; \
+	    fi; \
+	    ln -sf ../../release/$$f $(SMOKE_DIR)/$$f; \
+	done
+	@# Step 2: materialize the .hex set from the tagged revision (not the
+	@# working tree) into the per-tag dir.  Works even if the working
+	@# tree's release/*.hex are dirty or absent.
+	@echo "[git ] materializing $(SMOKE_RELEASE_TAG) .hex files into $(SMOKE_DIR)/"
+	@for f in $(SMOKE_HEX_FILES); do \
+	    git show $(SMOKE_RELEASE_TAG):rtl/vc707/release/$$f > $(SMOKE_DIR)/$$f 2>/dev/null || \
+	        { echo "ERROR: $$f not present at tag $(SMOKE_RELEASE_TAG)"; exit 1; }; \
+	done
+	@echo "=== programming FPGA from $(SMOKE_DIR)/vc707_microgpt_eth.bit ==="
+	@# `-` prefix: ignore exit code.  scripts/program.tcl reliably loads
+	@# the bitstream but Vivado often returns non-zero on cs_server /
+	@# hw_server teardown even after a successful JTAG program; without
+	@# this prefix smoke-test would FAIL on every run despite a good load.
+	-BITFILE=$(SMOKE_DIR)/vc707_microgpt_eth.bit $(VIVADO) $(VIVADOFLAGS) -source scripts/program.tcl
+	@# Bracketed first char dodges pkill's self-match: regex still resolves
+	@# to cs_server/hw_server against real proc cmdlines, but the LITERAL
+	@# pattern in pkill's own /proc/PID/cmdline is "[c]s_server|[h]w_server"
+	@# which doesn't contain the substring "cs_server" (the '[' breaks it).
+	@# Without this trick pkill would SIGTERM its own shell, killing the
+	@# recipe even before `|| true` can swallow the failure.
+	@pkill -f '[c]s_server|[h]w_server' 2>/dev/null || true
+	@# After JTAG-load, the FPGA's SGMII PHY takes several seconds to
+	@# come up and re-negotiate, during which any stale /proc/net/arp
+	@# entry is meaningless — checking the ARP table will report the
+	@# FPGA "up" while it's actually still negotiating, and the very
+	@# first FT_REG_WRITE in load-roms then times out (REG_RSP timeout
+	@# for addr 0x98).  Probe with a real FastTrans round-trip
+	@# (peek-tokens — tiny FT_REG_READ) wrapped in `timeout` so a
+	@# hung attempt during PHY bring-up doesn't eat the whole budget.
+	@echo "=== waiting for FPGA on Ethernet (FastTrans probe loop) ==="
+	@deadline=$$(( $$(date +%s) + 60 )); \
+	attempt=0; \
+	while :; do \
+	    attempt=$$((attempt+1)); \
+	    if timeout 3 ./host/bfp_client peek-tokens >/dev/null 2>&1; then \
+	        echo "[probe] FPGA responsive after $$attempt attempt(s)"; \
+	        break; \
+	    fi; \
+	    if [ $$(date +%s) -ge $$deadline ]; then \
+	        echo "ERROR: FPGA did not respond to FastTrans probe within 60s"; \
+	        echo "       bitstream loaded but no SGMII link?  Check:"; \
+	        echo "       - host is on 192.168.1.x/24 (FPGA MAC 02:00:00:4d:47:31)"; \
+	        echo "       - SFP cable seated"; \
+	        echo "       - 'ip link' shows your NIC UP"; \
+	        exit 1; \
+	    fi; \
+	    sleep 2; \
+	done
+	@echo "=== running inference (inputs from $(SMOKE_DIR)/) ==="
+	@MGRT_PREFIX=lbfp_full_ ./host/bfp_client load-roms $(SMOKE_DIR)
+	@# -r 0 = auto-probe: ramp 2/4/6/8/10 MB/s, pick min projected total.
+	@./host/bfp_client -r 0 -v $(SMOKE_DIR)/bfp_vocab.bin all $(SMOKE_DIR)/lbfp_full_DDR3.bin \
+	    | tee $(SMOKE_DIR)/smoke-test.out
+	@echo "=== comparing RTL_TOKENS to $(SMOKE_RELEASE_TAG) baseline ==="
+	@actual=$$(grep '^RTL_TOKENS:' $(SMOKE_DIR)/smoke-test.out | sed 's/^RTL_TOKENS: *//'); \
+	expected="$(SMOKE_EXPECTED_TOKENS)"; \
+	if [ "$$actual" = "$$expected" ]; then \
+	    echo "PASS — tokens match $(SMOKE_RELEASE_TAG) baseline"; \
+	else \
+	    echo "FAIL — tokens diverged from $(SMOKE_RELEASE_TAG) baseline"; \
+	    echo "  expected: $$expected"; \
+	    echo "  actual:   $$actual"; \
+	    exit 1; \
+	fi
+
+# ----------------------------------------------------------------------
+# make smoke-test-shakespeare — same end-to-end harness as smoke-test
+# but drives the Shakespeare fine-tune.  Bitstream + vocab still come
+# from the $(SMOKE_RELEASE_TAG) GitHub release (the fine-tune is
+# model-only — same RTL/dims as canonical SmolLM2-135M).  The
+# Shakespeare BRAMs + DDR3 image are sourced from a local pack at
+# $(SMOKE_SHAKES_DIR) (default release/models/shake_/), produced by
+# `make shakespeare-pack && make shakespeare-release`.
+#
+# First run: leave SHAKES_EXPECTED_TOKENS empty — the target prints the
+# actual tokens and exits 0 ("capture mode").  Paste those tokens into
+# SHAKES_EXPECTED_TOKENS := ... (or commit a Makefile fragment) and
+# subsequent runs become a real PASS/FAIL diff.  Token output depends on
+# the fine-tune checkpoint *and* the prompt baked into shake_PROMPT.hex,
+# so a re-train or prompt change requires a fresh capture.
+# ----------------------------------------------------------------------
+SMOKE_SHAKES_DIR        ?= release/models/shake_
+## Captured from the v0.2.0 bitstream + the Shakespeare fine-tune as
+## packed at SHAKES_PROMPT="To be, or not to be," / N_GEN=32 / git
+## 6aa7a8d.  Re-train or change the prompt → recapture by running with
+## SHAKES_EXPECTED_TOKENS= (empty) and pasting the printed list back here.
+SHAKES_EXPECTED_TOKENS  ?= 15681 253 407 441 47 325 253 314 441 253 2138 198 1710 15511 42 198 198 86 42433 94 355 441 285
+
+## Depend on shakespeare-release so artifacts in $(GENERATED_DIR)/shake_*
+## (left there by `make shakespeare-pack`) are auto-copied into
+## $(SMOKE_SHAKES_DIR)/.  shakespeare-release itself errors with a clear
+## message if pack hasn't been run.  Idempotent — re-copies harmlessly
+## if the release dir is already populated.
+smoke-test-shakespeare: host/bfp_client shakespeare-release
+	@echo "=== smoke-test-shakespeare: bitstream from $(SMOKE_RELEASE_TAG), model from $(SMOKE_SHAKES_DIR)/ ==="
+	@mkdir -p release $(SMOKE_DIR)
+	@# Step 1: fetch the model-independent bitstream + vocab (same as
+	@# smoke-test); .mcs and lbfp_full_DDR3.bin are not needed here.
+	@for f in vc707_microgpt_eth.bit bfp_vocab.bin; do \
+	    if [ ! -s release/$$f ]; then \
+	        echo "[fetch] release/$$f"; \
+	        curl -fsSL -o release/$$f $(SMOKE_BASE_URL)/$$f || \
+	            { echo "ERROR: failed to fetch $$f from $(SMOKE_BASE_URL)"; exit 1; }; \
+	    else \
+	        echo "[skip]  release/$$f already present"; \
+	    fi; \
+	    ln -sf ../../release/$$f $(SMOKE_DIR)/$$f; \
+	done
+	@echo "=== programming FPGA from $(SMOKE_DIR)/vc707_microgpt_eth.bit ==="
+	-BITFILE=$(SMOKE_DIR)/vc707_microgpt_eth.bit $(VIVADO) $(VIVADOFLAGS) -source scripts/program.tcl
+	@pkill -f '[c]s_server|[h]w_server' 2>/dev/null || true
+	@echo "=== waiting for FPGA on Ethernet (FastTrans probe loop) ==="
+	@deadline=$$(( $$(date +%s) + 60 )); \
+	attempt=0; \
+	while :; do \
+	    attempt=$$((attempt+1)); \
+	    if timeout 3 ./host/bfp_client peek-tokens >/dev/null 2>&1; then \
+	        echo "[probe] FPGA responsive after $$attempt attempt(s)"; \
+	        break; \
+	    fi; \
+	    if [ $$(date +%s) -ge $$deadline ]; then \
+	        echo "ERROR: FPGA did not respond to FastTrans probe within 60s"; exit 1; \
+	    fi; \
+	    sleep 2; \
+	done
+	@echo "=== running inference (shake_ from $(SMOKE_SHAKES_DIR)/) ==="
+	@MGRT_PREFIX=shake_ ./host/bfp_client load-roms $(SMOKE_SHAKES_DIR)
+	@# -r 0 = auto-probe: ramp 2/4/6/8/10 MB/s, pick min projected total.
+	@./host/bfp_client -r 0 -v $(SMOKE_DIR)/bfp_vocab.bin all $(SMOKE_SHAKES_DIR)/shake_DDR3.bin \
+	    | tee $(SMOKE_SHAKES_DIR)/smoke-test.out
+	@echo "=== comparing RTL_TOKENS to Shakespeare baseline ==="
+	@actual=$$(grep '^RTL_TOKENS:' $(SMOKE_SHAKES_DIR)/smoke-test.out | sed 's/^RTL_TOKENS: *//'); \
+	expected="$(SHAKES_EXPECTED_TOKENS)"; \
+	if [ -z "$$expected" ]; then \
+	    echo "INFO: SHAKES_EXPECTED_TOKENS not set — capture mode."; \
+	    echo "      Pin the current output by adding to Makefile:"; \
+	    echo "        SHAKES_EXPECTED_TOKENS := $$actual"; \
+	    echo "      (or pass it on the command line for one-off runs.)"; \
+	elif [ "$$actual" = "$$expected" ]; then \
+	    echo "PASS — tokens match Shakespeare baseline"; \
+	else \
+	    echo "FAIL — tokens diverged from Shakespeare baseline"; \
+	    echo "  expected: $$expected"; \
+	    echo "  actual:   $$actual"; \
+	    exit 1; \
+	fi
+
+# ----------------------------------------------------------------------
 # `make clean` deliberately preserves release/ — the whole point is that
 # a captured release survives a fresh build.  Use `make distclean` to
 # blow it away.
@@ -707,4 +994,5 @@ distclean: clean
 
 .PHONY: all mcs program flash release program-release flash-release demo clean distclean \
         release-bitstream release-model program-release-bitstream flash-release-bitstream demo-model run \
-        shakespeare shakespeare-train shakespeare-pack shakespeare-release shakespeare-run
+        shakespeare shakespeare-train shakespeare-pack shakespeare-release shakespeare-run \
+        smoke-test smoke-test-shakespeare

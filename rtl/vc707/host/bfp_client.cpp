@@ -377,13 +377,11 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
     // tick, ruining the cadence).  Mirrors Python's structurally-slow
     // one-chunk-at-a-time loop — bursts seemed to be what was tripping
     // the eth_ctrl parser→MIG handshake even at safe average rates.
-    auto chunk_period = std::chrono::nanoseconds(
-        static_cast<long long>(1e9 * CHUNK / (target_mbps * 1e6)));
-    std::printf("[upload] steady pace: target %.2f MB/s "
-                "(%.1f µs/chunk).  Burst-safety net: -L %d -P %d.\n",
-                target_mbps,
-                std::chrono::duration<double, std::micro>(chunk_period).count(),
-                lead_limit, poll_ms);
+    //
+    // target_mbps==0 selects probe-then-commit: a calibration ramp
+    // before the bulk upload picks the rate that minimises projected
+    // total time = pass1_time(r) * (1 + 2*loss_rate(r)) + retry_pass_overhead.
+    // Final chunk_period is set after the probe.
     Udp u_poll(peer_ip, peer_port);
     std::atomic<uint32_t> fpga_done_delta{0};
     std::atomic<int>      fpga_backlog{0};        // rx_count - done_count (parser→MIG)
@@ -421,16 +419,184 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
         }
     });
 
+    uint32_t global_sent = 0;  // total chunks sent across all passes (incl. probe)
+
+    // -----------------------------------------------------------------
+    // Probe-then-commit (target_mbps==0).
+    //
+    // Sends short bursts of PROBE_CHUNKS at each candidate rate over
+    // a disjoint segment of the file, measures ACK-loss, and picks the
+    // rate that minimises projected wall-clock for the bulk upload:
+    //
+    //   total(r) ≈ file_chunks * CHUNK / (r * 1e6) * (1 + 2*loss(r))
+    //            + RETRY_PASS_OVERHEAD * (loss(r) > 0.01 ? 2 : 1)
+    //
+    // Probe-acked chunks count toward chunk_acked[] so pass 1 doesn't
+    // resend them — the probe doubles as real work.  If a rate's loss
+    // exceeds HARD_LOSS_CAP we stop ramping (higher rates almost
+    // certainly fare worse on the same link).
+    // -----------------------------------------------------------------
+    if (target_mbps <= 0.0) {
+        const std::vector<double> CANDIDATES   = {2.0, 4.0, 6.0, 8.0, 10.0};
+        constexpr int             PROBE_CHUNKS = 32768;   // 2 MB per burst
+        constexpr double          HARD_LOSS_CAP = 0.10;   // stop ramping above this
+        constexpr double          RETRY_PASS_OVERHEAD_S = 3.0;
+
+        std::printf("[probe] auto-rate probe: candidates");
+        for (auto r : CANDIDATES) std::printf(" %.0f", r);
+        std::printf(" MB/s × %d chunks (%.2f MB each)\n",
+                    PROBE_CHUNKS, PROBE_CHUNKS * (double)CHUNK / 1e6);
+        std::fflush(stdout);
+
+        double best_rate = CANDIDATES.front();
+        double best_cost = 1e30;
+        int    probe_base = 0;   // chunk-index cursor for disjoint probe regions
+
+        // One shared drainer covers all probe iterations.
+        std::deque<int>   probe_seq_q[256];
+        std::mutex        probe_seq_mu;
+        std::atomic<bool> probe_drain_stop{false};
+        std::thread probe_drainer([&]() {
+            u.set_recv_timeout(20);
+            uint8_t rx[2048]; size_t n = 0;
+            while (!probe_drain_stop.load(std::memory_order_relaxed)) {
+                if (!u.recv(rx, sizeof(rx), &n)) continue;
+                if (n < 1 || rx[0] != FT_ACK) continue;
+                uint8_t s = (n >= 2) ? rx[1] : 0xff;
+                if (s == 0xff) continue;
+                std::lock_guard<std::mutex> g(probe_seq_mu);
+                if (probe_seq_q[s].empty()) continue;
+                int chunk_idx = probe_seq_q[s].front();
+                probe_seq_q[s].pop_front();
+                if (!chunk_acked[chunk_idx]) {
+                    chunk_acked[chunk_idx] = 1;
+                    acked_total.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+
+        for (size_t ci = 0; ci < CANDIDATES.size(); ++ci) {
+            double r = CANDIDATES[ci];
+            int  burst_chunks = std::min(PROBE_CHUNKS, n_real - probe_base);
+            if (burst_chunks <= 0) break;   // file too small for further probes
+
+            auto probe_period = std::chrono::nanoseconds(
+                static_cast<long long>(1e9 * CHUNK / (r * 1e6)));
+
+            int acked_before = acked_total.load(std::memory_order_relaxed);
+            auto burst_t0 = std::chrono::steady_clock::now();
+            auto next_send_at = burst_t0;
+            uint8_t seq = 0;
+            for (int i = 0; i < burst_chunks; ++i) {
+                while (std::chrono::steady_clock::now() < next_send_at)
+                    std::this_thread::yield();
+                next_send_at += probe_period;
+                // Same backstops as main pass.  These will stretch
+                // send_secs above the nominal r when the wire / MIG
+                // path can't keep up — and that stretch is exactly
+                // what the cost model needs to see.
+                while (true) {
+                    uint32_t fdone   = fpga_done_delta.load(std::memory_order_relaxed);
+                    int      backlog = fpga_backlog.load(std::memory_order_relaxed);
+                    bool ahead   = (global_sent > fdone + (uint32_t)lead_limit);
+                    bool stuffed = (backlog > backlog_limit);
+                    if (!ahead && !stuffed) break;
+                    std::this_thread::yield();
+                }
+                int chunk_idx = probe_base + i;
+                uint32_t addr = base + static_cast<uint32_t>(chunk_idx) * CHUNK;
+                uint8_t tx[6 + CHUNK];
+                encode_ddr_write(tx, seq, addr, blob.data() + (size_t)chunk_idx * CHUNK);
+                u.send(tx, sizeof(tx));
+                {
+                    std::lock_guard<std::mutex> g(probe_seq_mu);
+                    probe_seq_q[seq].push_back(chunk_idx);
+                }
+                ++seq;
+                ++global_sent;
+            }
+            // Capture send-only wall-clock BEFORE the drain — this is
+            // the actual achievable throughput at target r (backstops
+            // included).  Earlier versions divided by send+drain time,
+            // which made all measurements look identical because the
+            // 500ms drain dominated the short burst.
+            auto burst_send_end = std::chrono::steady_clock::now();
+            double send_secs = std::chrono::duration<double>(
+                burst_send_end - burst_t0).count();
+
+            // Adaptive drain: keep watching acked_total until it stops
+            // growing (200ms quiet window) so loss reflects real drops
+            // rather than slow-arriving ACKs we cut off too early.
+            int last_acked = acked_total.load(std::memory_order_relaxed);
+            int stable_iters = 0;
+            while (stable_iters < 4) {     // 4 × 50ms = 200ms quiet
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                int now = acked_total.load(std::memory_order_relaxed);
+                if (now == last_acked) ++stable_iters;
+                else { stable_iters = 0; last_acked = now; }
+            }
+
+            int    acked_now    = acked_total.load(std::memory_order_relaxed);
+            int    acked_burst  = acked_now - acked_before;
+            double loss_rate    = 1.0 - (double)acked_burst / (double)burst_chunks;
+            if (loss_rate < 0) loss_rate = 0;   // clip rounding
+            double send_mbps = burst_chunks * (double)CHUNK / 1e6 / send_secs;
+
+            // Project total wall-clock using the ACTUAL achievable send
+            // rate (send_mbps), not the nominal target r — they diverge
+            // once the wire saturates.
+            double bulk_secs    = (double)n_real * CHUNK / 1e6 / send_mbps;
+            double retry_factor = 1.0 + 2.0 * loss_rate;
+            double overhead_s   = (loss_rate > 0.01) ? 2*RETRY_PASS_OVERHEAD_S
+                                                    : RETRY_PASS_OVERHEAD_S;
+            double cost = bulk_secs * retry_factor + overhead_s;
+
+            std::printf("[probe] r=%4.1f MB/s  sent=%d  acked=%d  loss=%.3f%%  "
+                        "send=%.2f MB/s  cost=%.1fs\n",
+                        r, burst_chunks, acked_burst, loss_rate * 100.0,
+                        send_mbps, cost);
+            std::fflush(stdout);
+
+            if (cost < best_cost) {
+                best_cost = cost;
+                best_rate = r;
+            }
+            probe_base += burst_chunks;
+            if (loss_rate > HARD_LOSS_CAP) {
+                std::printf("[probe] loss exceeds %.0f%% — stopping ramp\n",
+                            HARD_LOSS_CAP * 100.0);
+                break;
+            }
+        }
+
+        probe_drain_stop.store(true, std::memory_order_relaxed);
+        probe_drainer.join();
+        target_mbps = best_rate;
+        std::printf("[probe] committed target_mbps = %.1f "
+                    "(projected upload cost %.1f s)\n",
+                    target_mbps, best_cost);
+        std::fflush(stdout);
+    }
+
+    auto chunk_period = std::chrono::nanoseconds(
+        static_cast<long long>(1e9 * CHUNK / (target_mbps * 1e6)));
+    std::printf("[upload] steady pace: target %.2f MB/s "
+                "(%.1f µs/chunk).  Burst-safety net: -L %d -P %d.\n",
+                target_mbps,
+                std::chrono::duration<double, std::micro>(chunk_period).count(),
+                lead_limit, poll_ms);
+
     auto t0 = std::chrono::steady_clock::now();
     int retries_total = 0;
-    uint32_t global_sent = 0;  // total chunks sent across all passes
 
     for (int pass = 1; pass <= max_passes; ++pass) {
         // Build the list of chunks still needing a send for this pass.
+        // Pass 1 skips chunks that the probe already got ACKed — probe
+        // doubles as real work, no need to resend.
         std::vector<int> work;
         if (pass == 1) {
-            work.resize(n_real);
-            for (int i = 0; i < n_real; ++i) work[i] = i;
+            for (int i = 0; i < n_real; ++i)
+                if (!chunk_acked[i]) work.push_back(i);
         } else {
             for (int i = 0; i < n_real; ++i)
                 if (!chunk_acked[i]) work.push_back(i);
@@ -1362,7 +1528,8 @@ void usage() {
     std::fprintf(stderr,
         "usage: bfp_client [-p IP:PORT] [-v VOCAB_BIN] [-m MAC]\n"
         "                  [-L LEAD_LIMIT] [-P POLL_MS] <cmd> [args]\n"
-        "  -r  target upload rate in MB/s, steady-paced per-chunk    (default 2.0)\n"
+        "  -r  target upload rate in MB/s, steady-paced per-chunk    (default 2.0,\n"
+        "      0 = auto-probe: ramp 2/4/6/8/10 MB/s, pick min projected total)\n"
         "      Mirrors Python's structurally-slow loop — burst sends seem\n"
         "       to race the FPGA's eth_ctrl→MIG handshake even at safe averages.\n"
         "  -L  chunks the sender may run ahead of FPGA done_count    (default 1024)\n"
@@ -1434,8 +1601,8 @@ int main(int argc, char** argv) {
             poll_ms = std::atoi(argv[++argi]);
         } else if (a == "-r" && argi + 1 < argc) {
             target_mbps = std::atof(argv[++argi]);
-            if (target_mbps <= 0) {
-                std::fprintf(stderr, "-r rate must be > 0 MB/s\n");
+            if (target_mbps < 0) {
+                std::fprintf(stderr, "-r rate must be ≥ 0 (0 = auto-probe)\n");
                 return 2;
             }
         } else if (a == "-B" && argi + 1 < argc) {

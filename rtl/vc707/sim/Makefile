@@ -119,7 +119,7 @@ obj_dir/Vsoftmax_q15: $(SMOLLM_SRC)/softmax_q15.sv tb_softmax.cpp
 	    -o Vsoftmax_q15
 
 $(EXP_LUT): gen_exp_lut.py
-	python3 gen_exp_lut.py
+	OUT=../generated python3 gen_exp_lut.py
 
 test_softmax.bin: gen_softmax_test.py
 	python3 gen_softmax_test.py
