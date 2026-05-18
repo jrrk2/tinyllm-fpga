@@ -6,8 +6,21 @@
 
 set project microgpt_eth
 
+# Detect existing-project vs fresh-project so `make` can incrementally
+# rebuild without re-adding sources (which Vivado errors on) and
+# without choking on a stale failed run.  Signal: presence of the
+# constraints file in any fileset.
+set is_fresh [expr {[llength [get_files -quiet *microgpt_eth.xdc]] == 0}]
+if {$is_fresh} {
+    puts "INFO: fresh project — adding all sources/IPs/constraints"
+} else {
+    puts "INFO: existing project — incremental rebuild (skipping source-add)"
+}
+
 # Constraints
-add_files -fileset constrs_1 -norecurse constraints/microgpt_eth.xdc
+if {$is_fresh} {
+    add_files -fileset constrs_1 -norecurse constraints/microgpt_eth.xdc
+}
 
 # Absolute path to the weight ROM .hex files. Vivado runs synth from
 # microgpt_eth.runs/synth_1/, where a relative "generated" path can't be
@@ -66,6 +79,8 @@ puts $_bv_fh "localparam logic \[31:0\] BUILD_VERSION = 32'h$_build_low32;"
 close $_bv_fh
 puts "build_version.svh: BUILD_VERSION = 0x$_build_low32  ($_build_stamp)"
 
+if {$is_fresh} {
+
 # PCS/PMA IP — pre-generated under ip/gig_ethernet_pcs_pma_0/
 read_ip { \
     "ip/gig_ethernet_pcs_pma_0/gig_ethernet_pcs_pma_0.srcs/sources_1/ip/gig_ethernet_pcs_pma_0/gig_ethernet_pcs_pma_0.xci" \
@@ -85,6 +100,8 @@ if {[file exists "ip/microgpt_ila_core/microgpt_ila_core.srcs/sources_1/ip/micro
   }
 }
 
+}  ;# end is_fresh (read_ip)
+
 # Include dirs — microgpt core uses src/include/, eth uses src/ for vc707.svh
 set abs_generated [file normalize ../generated]
 set_property include_dirs [list \
@@ -93,6 +110,8 @@ set_property include_dirs [list \
     "src/smollm" \
     $abs_generated \
 ] [current_fileset]
+
+if {$is_fresh} {
 
 # Ethernet MAC and framing (copied from cva6-ethernet)
 read_verilog -sv { \
@@ -173,7 +192,23 @@ set_property -dict { file_type {Verilog Header} is_global_include 1} -objects $f
 
 set_property top vc707_microgpt_eth [current_fileset]
 
+}  ;# end is_fresh (read_verilog block)
+
 update_compile_order -fileset sources_1
+
+# Reset any non-success synth_1 / impl_1 so launch_runs can proceed
+# (Vivado refuses to relaunch a run in Error / Aborted state and the
+# old `make` flow used to nuke the project to sidestep this).
+foreach run_name {synth_1 impl_1} {
+    if {[llength [get_runs -quiet $run_name]] > 0} {
+        set st [get_property STATUS [get_runs $run_name]]
+        if {!([string match -nocase "*Complete*" $st]
+              && ![string match -nocase "*Error*" $st])} {
+            puts "INFO: resetting $run_name (was: $st)"
+            reset_run $run_name
+        }
+    }
+}
 
 synth_design -rtl -name rtl_1
 

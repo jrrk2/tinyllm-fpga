@@ -1430,6 +1430,21 @@ module vc707_microgpt_eth (
   // ================================================================
   //  microgpt core (56.25 MHz core_clk domain)
   // ================================================================
+`ifdef MICROGPT_USE_BFP
+  // BabyGPT exact-core retired in BFP builds — the host never pulses
+  // start_core_reg in USE_BFP=1, so its BabyGPT FSM is dormant.  Tying
+  // its outputs to constants lets Vivado constant-propagate through
+  // the (unreachable) BabyGPT control FSM and prune everything it
+  // touches; saves ~30k Slice LUTs on smollm360 (which otherwise
+  // overflows the XC7VX485T's 303 600-LUT budget at place_design).
+  assign core_busy         = 1'b0;
+  assign core_done         = 1'b0;
+  assign core_next_token   = '0;
+  assign core_argmax_token = '0;
+  assign core_rng_state    = '0;
+  assign core_top_logit    = '0;
+  assign core_logits_flat  = '0;
+`else
   microgpt_exact_core core_inst (
     .clk(core_clk),
     .resetn(core_resetn),
@@ -1448,6 +1463,7 @@ module vc707_microgpt_eth (
     .top_logit_q12(core_top_logit),
     .logits_flat(core_logits_flat)
   );
+`endif
 
   // ----- Core control FSM (core_clk domain) — copied verbatim from
   // de1_soc_microgpt_rtl.sv, with toggle CDC sources renamed for eth_clk.

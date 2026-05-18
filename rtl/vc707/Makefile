@@ -304,16 +304,11 @@ endif
 archive-dir := archive/$(VARIANT)-$(BUILD_STAMP)
 
 $(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(GENERATED_DIR)/exp_lut.hex $(lbfp_stamp) $(BFP_BUILD_DEPS)
-	@# Wipe stale Vivado project state so prologue.tcl creates a fresh
-	@# project — keeping a stale .xpr + new .runs (or vice versa) has bitten
-	@# us with inconsistent synth results.  Only fires for the bitstream
-	@# build target; `make program`/`flash`/`mcs` still re-open the existing
-	@# project via prologue.tcl.  .runs/.srcs/.sim are bundled in because
-	@# they're part of the same project's metadata — removing .xpr alone
-	@# leaves orphan run dirs that confuse create_project.
-	rm -rf microgpt_eth.xpr microgpt_eth.cache microgpt_eth.hw \
-	       microgpt_eth.ip_user_files microgpt_eth.hbs \
-	       microgpt_eth.runs microgpt_eth.srcs microgpt_eth.sim
+	@# No auto-wipe of microgpt_eth.* here — prologue.tcl reopens the
+	@# existing .xpr so synth_1/impl_1 reuse what they can (incremental
+	@# synth/impl saves 30-70% on small RTL edits).  When switching
+	@# VARIANT or after Vivado gets confused, run `make wipe-project`
+	@# (or `make wipe-project all`) for a from-scratch rebuild.
 	mkdir -p $(work-dir)
 	$(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
 	cp microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit ./$(work-dir)/ 2>/dev/null || \
@@ -992,7 +987,17 @@ clean:
 distclean: clean
 	rm -rf $(release-dir) archive host/bfp_client
 
+# Opt-in: nuke the Vivado project so the next `make` runs synth + impl
+# from scratch.  Use after switching VARIANT, changing cfg.svh dims, or
+# when Vivado's run-status tracking gets out of sync with the sources.
+# Day-to-day RTL iteration should NOT need this — incremental synth and
+# impl reuse work whenever inputs are unchanged.
+wipe-project:
+	rm -rf microgpt_eth.xpr microgpt_eth.cache microgpt_eth.hw \
+	       microgpt_eth.ip_user_files microgpt_eth.hbs \
+	       microgpt_eth.runs microgpt_eth.srcs microgpt_eth.sim
+
 .PHONY: all mcs program flash release program-release flash-release demo clean distclean \
         release-bitstream release-model program-release-bitstream flash-release-bitstream demo-model run \
         shakespeare shakespeare-train shakespeare-pack shakespeare-release shakespeare-run \
-        smoke-test smoke-test-shakespeare
+        smoke-test smoke-test-shakespeare wipe-project
