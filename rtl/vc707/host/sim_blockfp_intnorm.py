@@ -3,12 +3,13 @@
 If this produces coherent text, the FPGA's gibberish is a separate bug
 (not the integer-RMSNorm precision).  If it produces gibberish, we know
 RMSNorm widening is the actual blocker."""
+import os
 import sys, math
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-sys.path.insert(0, "/home/jonathan/TALOS-V2/rtl/vc707/host")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sim_blockfp import (
     quantize_q15, dequantize_q15, quantize_int8_row, matvec_int8,
     rope, silu, softmax, calibrate, pow2, MODEL,

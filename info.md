@@ -1,51 +1,43 @@
-# TALOS-V2 RTL Repository
+# tinyllm-fpga — repository layout
 
-This repository is organized around the hand-written RTL implementation of Karpathy-style microGPT inference for the DE1-SoC.
+Block-floating-point inference engine for SmolLM2-135M on Xilinx VC707.
+See [`README.md`](README.md) for the project overview and
+[`rtl/vc707/README.md`](rtl/vc707/README.md) for the full reproduction
+guide.
 
-## Layout
+## Active codepath (VC707 + SmolLM2-135M, BFP, DDR3-streamed)
 
-- `rtl/src/`: synthesizable RTL sources.
-- `rtl/src/include/`: SystemVerilog include fragments used by the core.
-- `rtl/generated/`: exported Q4.12 model ROM hex files.
-- `rtl/microgpt/`: saved trained weights and training dataset used to regenerate ROMs.
-- `rtl/python/`: JTAG host, reference model, and weight export scripts.
-- `rtl/tcl/`: System Console and Quartus TCL helpers.
-- `rtl/sim/`: ModelSim testbenches and simulation launch TCL.
-- `rtl/docs/`: archived notes and longer design writeups.
-- Repository-root `.bat` files: normal build, program, inference, and reference entrypoints.
+- `rtl/vc707/`: board build, host client, Vivado scripts, release area
+  - `rtl/vc707/src/smollm/`: BFP engine (autoregress, multilayer, layer,
+    decode head, matvec, RMSNorm, RoPE, SwiGLU, softmax)
+  - `rtl/vc707/src/vc707_microgpt_eth.sv`: top-level
+  - `rtl/vc707/src/microgpt_eth_ctrl.sv`: FastTrans parser → Avalon-MM
+  - `rtl/vc707/eth/`: SGMII MAC vendored from cva6
+  - `rtl/vc707/host/bfp_client.cpp`: no-torch C++ Ethernet client
+  - `rtl/vc707/host/gen_smollm_blockfp_{cfg,full,ddr}.py`: weight packers
+  - `rtl/vc707/host/finetune_shakespeare.py`: SFT wrapper
+  - `rtl/vc707/sim/`: Verilator testbenches + golden generators
+- `rtl/src/include/`: SystemVerilog include fragments
 
-## Common Commands
+## Legacy / archived (DE1-SoC, int8 microGPT)
 
-From the repository root:
+- `rtl/src/`: int8 microGPT core (DE1-SoC port; not actively maintained)
+- `rtl/python/`: JTAG host + reference scripts for the int8 path
+- `rtl/tcl/`: System Console / Quartus TCL helpers
+- `rtl/sim/`: ModelSim testbenches
+- Repository-root `.bat` files: DE1-SoC build / program / inference wrappers
 
-```bat
-compile_only.bat
-program_fpga.bat
-run_inference.bat --sampler rtl --steps 15 --temperature 0.5 --seed 2 --stream
-reference_microgpt.bat --count 20 --temperature 0.5
-run_core_sim.bat
+## Common commands (VC707 path)
+
+From `rtl/vc707/`:
+
+```sh
+make                        # full Vivado build (~25 min)
+make release-bitstream      # capture .bit + .mcs + vocab + reports
+make release-model          # capture .bin + .hex set + golden tokens
+make program-release        # JTAG-program the captured bitstream
+make flash                  # write BPI flash (persists across reboots)
+make run                    # load BRAMs → upload DDR3 → run → print tokens
 ```
 
-Or from `rtl/`, run the core simulation directly:
-
-```bat
-vsim -c -do "do sim/testbench_core.tcl"
-```
-
-Regenerate fixed-point ROMs from the saved weights:
-
-```bat
-cd rtl
-python python\export_weights.py --weights microgpt\weights_only.npy --outdir generated
-```
-
-## Active RTL Files
-
-- `rtl/src/de1_soc_microgpt_rtl.sv`: DE1-SoC top-level, JTAG/MMIO wrapper, displays, and generation control.
-- `rtl/src/microgpt_exact_core.sv`: one-token-at-a-time microGPT inference FSM.
-- `rtl/src/microgpt_categorical_sampler.sv`: RTL categorical sampler.
-- `rtl/src/systolic_matvec16_tile.sv`: shared 4-lane streamed matvec tile.
-- `rtl/src/rms_scale_engine.sv`: iterative RMSNorm scale engine.
-- `rtl/src/sat_div16_engine.sv`: saturated signed divide engine used by attention.
-
-The RTL is deterministic for a fixed seed/configuration but is not bit-exact to Karpathy's floating-point Python implementation. It uses fixed-point Q4.12 arithmetic, LUT-based exponential weights, saturation, and xorshift-based sampling.
+See `rtl/vc707/README.md` for the full reproduce-from-release walk-through.
