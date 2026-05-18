@@ -1299,11 +1299,24 @@ void print_crc(Udp& u) {
 // ---------------------------------------------------------------------
 std::vector<uint16_t> fetch_tokens(Udp& u, int n_steps) {
     int nwords = (n_steps * 16 + 31) / 32;
-    auto words = reg_read(u, REG_RESULT, static_cast<uint8_t>(nwords), 50);
-    if ((int)words.size() != nwords) {
-        throw std::runtime_error("expected " + std::to_string(nwords)
-                                 + " result words, got "
-                                 + std::to_string(words.size()));
+    // FastTrans MAX_REG_READS caps each FT_REG_READ at 19 words.  When
+    // n_steps > 38 (NPROMPT_MAX + N_GEN = 63 → 32 words) we split into
+    // multiple reads and concatenate.  Keeps the host compatible with
+    // either the legacy (MAX_REG_READS=19) or a future bigger cap.
+    constexpr int MAX_PER_READ = 19;
+    std::vector<uint32_t> words;
+    words.reserve(nwords);
+    uint8_t seq = 50;
+    for (int off = 0; off < nwords; off += MAX_PER_READ) {
+        int chunk = std::min(MAX_PER_READ, nwords - off);
+        auto part = reg_read(u, REG_RESULT + off, static_cast<uint8_t>(chunk), seq++);
+        if ((int)part.size() != chunk) {
+            throw std::runtime_error("expected " + std::to_string(chunk)
+                                     + " result words at offset "
+                                     + std::to_string(off) + ", got "
+                                     + std::to_string(part.size()));
+        }
+        words.insert(words.end(), part.begin(), part.end());
     }
     std::vector<uint16_t> tokens;
     tokens.reserve(n_steps);
