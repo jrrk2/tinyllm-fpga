@@ -63,16 +63,34 @@ rtl/vc707/*.jou
 rtl/vc707/*.str
 rtl/vc707/*.mif
 
-# Vivado IP cache (only the makefile + run.tcl are source — the rest is generated)
-rtl/vc707/ip/gig_ethernet_pcs_pma_0/component.xml
-rtl/vc707/ip/gig_ethernet_pcs_pma_0/example_design/
-rtl/vc707/ip/gig_ethernet_pcs_pma_0/synth/
-rtl/vc707/ip/gig_ethernet_pcs_pma_0/sim/
-rtl/vc707/ip/gig_ethernet_pcs_pma_0/hdl/
-rtl/vc707/ip/gig_ethernet_pcs_pma_0/doc/
-rtl/vc707/ip/microgpt_ila_*/
-rtl/vc707/ip/xlnx_mig_7_ddr3/
+# Vivado IP — only the Makefile + tcl/run.tcl are source (regenerate the
+# IP from scratch).  Everything else is Vivado output: ignore by default,
+# track the source by explicit name (see !patterns below).
+rtl/vc707/ip/*/component.xml
+rtl/vc707/ip/*/example_design/
+rtl/vc707/ip/*/synth/
+rtl/vc707/ip/*/sim/
+rtl/vc707/ip/*/hdl/
+rtl/vc707/ip/*/doc/
+rtl/vc707/ip/*/*.xci
+rtl/vc707/ip/*/*.xml
+rtl/vc707/ip/*/*.gen/
+rtl/vc707/ip/*/*.runs/
+
+# Release area: track small text artifacts (.hex / .svh / .txt / .prm /
+# reports) but never the big binaries — those go to GitHub Releases.
+rtl/vc707/release/*.bit
+rtl/vc707/release/*.mcs
+rtl/vc707/release/lbfp_full_DDR3.bin
+rtl/vc707/release/bfp_vocab.bin
+rtl/vc707/release/models/*/*.bin
+rtl/vc707/release/bitstream/*.bit
+rtl/vc707/release/bitstream/*.mcs
+rtl/vc707/release/bitstream/bfp_vocab.bin
 
 # Fine-tune outputs (HF format model dir)
 generated/shakespeare-smollm/
 generated/tinyshakespeare.txt
+
+# Local Claude Code agent state — per-machine, never commit
+.claude/
