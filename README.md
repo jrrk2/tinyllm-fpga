@@ -20,28 +20,66 @@ image and reading the result tokens.
 | Component | State |
 |-----------|-------|
 | SmolLM2-135M canonical baseline | ✅ matches BFP-sim golden tokens bit-for-bit |
+| Fresh-clone reproduce (clone → curl release → `make run` → golden) | ✅ verified at v0.2.0 |
+| Runtime prompt swap (8-token prompt, no Vivado rebuild) | ✅ `n_prompt_active` auto-set by load-roms |
 | Shakespeare-style fine-tune (swap model at runtime, same bitstream) | ✅ |
 | Throughput | ~2-3 tokens/sec at 40 MHz core clock |
+| Timing | WNS = +0.070 ns, all constraints met |
 | Build target | Vivado 2020.1+, VC707 board |
 
 ## Quick start
 
-From a captured release (no Vivado, no Python, no PyTorch):
+From a fresh clone, with a VC707 wired up and on `192.168.1.x/24`:
 
 ```sh
-cd rtl/vc707
-make host/bfp_client    # ~2 s, needs only g++ + libstdc++
-make run                # load BRAMs + upload DDR3 + run + print tokens
+git clone https://github.com/jrrk2/tinyllm-fpga
+cd tinyllm-fpga/rtl/vc707/release
+
+# Pull the 4 large binaries from the v0.2.0 GitHub release (~397 MB).
+# The repo tracks the small text artifacts (.hex / .prm / cfg / reports);
+# only the .bit / .mcs / .bin / vocab live in Releases.
+BASE=https://github.com/jrrk2/tinyllm-fpga/releases/download/v0.2.0
+for f in vc707_microgpt_eth.bit vc707_microgpt_eth.mcs \
+         lbfp_full_DDR3.bin bfp_vocab.bin; do
+    curl -LO $BASE/$f
+done
+
+# (optional) verify
+md5sum --check <<'EOF'
+3577e1840ccf60512befe520e19ac30b  vc707_microgpt_eth.bit
+a11ca7ded50d023c8dac194becd71918  vc707_microgpt_eth.mcs
+c4d5010afda27fb551ff3f4c09a50ac6  lbfp_full_DDR3.bin
+705e773b7a60775541444d7db8061b30  bfp_vocab.bin
+EOF
+
+cd ..                       # back to rtl/vc707
+make program-release        # JTAG-load the bitstream (~30 s; needs Vivado)
+make run                    # build host, load BRAMs, upload DDR3, decode (~3 min)
 ```
+
+You should see:
+
+```
+RTL_TOKENS: 712 9612 3102 645 260 905 436 441 2408 281 624 198 198 18 504 905 436 441 805
+DECODED:
+##â town when the world was not yet in its
+
+"The world was not only
+```
+
+Building host/bfp_client needs only `g++ -std=c++17`.  No Vivado is
+needed after `program-release` — that's a one-time JTAG load (or use
+`make flash-release` for the BPI flash version that persists across
+power cycles).
 
 See [`rtl/vc707/README.md`](rtl/vc707/README.md) for the full
 reproduction guide, including:
 
-- programming the bitstream (JTAG or BPI flash)
+- changing the prompt at runtime (any length up to NPROMPT_MAX=48)
 - fine-tuning SmolLM2 on a custom corpus and swapping models
 - the FastTrans wire protocol over raw Ethernet
 - the split bitstream-release vs model-release layout
-- building from source
+- building the bitstream from source
 
 ## Architecture (one-paragraph version)
 
