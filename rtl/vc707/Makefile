@@ -500,6 +500,58 @@ flash-release-bitstream: $(release-bs-mcs)
 	MCSFILE=$(release-bs-mcs) $(VIVADO) $(VIVADOFLAGS) -source scripts/flash.tcl
 	@pkill -f 'cs_server|hw_server' 2>/dev/null || true
 
+# ----------------------------------------------------------------------
+# Shakespeare fine-tune flow — convenience wrappers around the generic
+# PREFIX-parameterised targets, so the "swap-a-fine-tuned-model" headline
+# feature is one make invocation per stage instead of a wall of
+# python+env-var commands.
+#
+#   make shakespeare-train     fine-tune SmolLM2-135M on tinyshakespeare
+#                              (~10-30 min on a single GPU; one-time)
+#   make shakespeare-pack      bake .hex set + DDR3.bin from the
+#                              checkpoint (cfg + full + ddr packers)
+#   make shakespeare-release   capture release/models/shake_/
+#   make shakespeare-run       upload + run + decode on the FPGA
+#   make shakespeare           pack + release + run (skip train; assumes
+#                              checkpoint already exists)
+#
+# Override SHAKES_PROMPT to change the demo prompt without re-training.
+# ----------------------------------------------------------------------
+SHAKES_PREFIX := shake_
+SHAKES_MODEL  := $(GENERATED_DIR)/shakespeare-smollm
+SHAKES_PROMPT ?= To be, or not to be,
+SHAKES_NGEN   ?= 32
+
+shakespeare-train:
+	@echo "=== fine-tuning SmolLM2-135M → $(SHAKES_MODEL) ==="
+	python3 host/finetune_shakespeare.py --out $(SHAKES_MODEL)
+
+shakespeare-pack:
+	@if [ ! -f "$(SHAKES_MODEL)/config.json" ]; then \
+	    echo "ERROR: $(SHAKES_MODEL)/config.json missing."; \
+	    echo "       Run 'make shakespeare-train' first (one-time, ~10-30 min on GPU)."; \
+	    exit 1; \
+	fi
+	@echo "=== packing shake_ artifacts from $(SHAKES_MODEL) (PROMPT=$(SHAKES_PROMPT)) ==="
+	MODEL=$(SHAKES_MODEL) PREFIX=$(SHAKES_PREFIX) \
+	  PROMPT="$(SHAKES_PROMPT)" N_GEN=$(SHAKES_NGEN) \
+	  python3 host/gen_smollm_blockfp_cfg.py
+	MODEL=$(SHAKES_MODEL) PREFIX=$(SHAKES_PREFIX) \
+	  PROMPT="$(SHAKES_PROMPT)" N_GEN=$(SHAKES_NGEN) \
+	  python3 host/gen_smollm_blockfp_full.py
+	MODEL=$(SHAKES_MODEL) PREFIX=$(SHAKES_PREFIX) \
+	  PROMPT="$(SHAKES_PROMPT)" N_GEN=$(SHAKES_NGEN) \
+	  python3 host/gen_smollm_blockfp_ddr.py
+	@echo "=== shake_ artifacts in $(GENERATED_DIR)/$(SHAKES_PREFIX)* ==="
+
+shakespeare-release:
+	$(MAKE) release-model PREFIX=$(SHAKES_PREFIX)
+
+shakespeare-run:
+	$(MAKE) run PREFIX=$(SHAKES_PREFIX)
+
+shakespeare: shakespeare-pack shakespeare-release shakespeare-run
+
 # Full demo against the split layout — uploads the model's DDR3 image,
 # loads its BRAMs through the host-write path, then runs inference.
 # Use PREFIX= to pick the model; bitstream comes from release/bitstream/.
@@ -576,4 +628,5 @@ distclean: clean
 	rm -rf $(release-dir) host/bfp_client
 
 .PHONY: all mcs program flash release program-release flash-release demo clean distclean \
-        release-bitstream release-model program-release-bitstream flash-release-bitstream demo-model run
+        release-bitstream release-model program-release-bitstream flash-release-bitstream demo-model run \
+        shakespeare shakespeare-train shakespeare-pack shakespeare-release shakespeare-run

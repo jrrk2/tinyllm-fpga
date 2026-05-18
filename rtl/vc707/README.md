@@ -106,25 +106,33 @@ host/bfp_client -v release/bfp_vocab.bin all release/lbfp_full_DDR3.bin
 
 This is the headline feature of the per-model BRAM design: any
 SmolLM2-135M-class checkpoint can run on the **same bitstream** by
-re-packing the weights and re-uploading.
+re-packing the weights and re-uploading.  Dedicated make targets
+wrap the python scripts:
 
 ```sh
-# (i) Fine-tune (one-time, ~10–30 min on a single GPU).
+make shakespeare-train     # SFT SmolLM2 on tinyshakespeare (~10–30 min, GPU)
+make shakespeare-pack      # bake shake_ .hex set + DDR3.bin (~3 min)
+make shakespeare-release   # capture release/models/shake_/
+make shakespeare-run       # upload + run + decode on the FPGA
+make shakespeare           # pack + release + run (skip train)
+```
+
+Override the demo prompt without re-training or re-packing weights:
+
+```sh
+make shakespeare SHAKES_PROMPT="Hark, what light through yonder window breaks"
+```
+
+Or call the lower-level scripts directly:
+
+```sh
 python host/finetune_shakespeare.py --out generated/shakespeare-smollm
-
-# (ii) Pack the model for the FPGA.  TWO scripts, both honour
-#      MODEL + PREFIX + PROMPT.
-export MODEL=generated/shakespeare-smollm
-export PREFIX=shake_
-export PROMPT="Hark"          # ≤4 tokens until N_PROMPT is lifted in the bitstream
-export N_GEN=32
-python host/gen_smollm_blockfp_full.py    # → shake_*.hex   (~30 s)
-python host/gen_smollm_blockfp_ddr.py     # → shake_DDR3.bin (~2 min, 320 MB)
-
-# (iii) Upload + run, no Vivado rebuild.
-cd host
-MGRT_PREFIX=shake_ ./bfp_client load-roms ../../generated   # ~10 s, self-healing
-./bfp_client all ../../generated/shake_DDR3.bin             # ~3 min
+MODEL=generated/shakespeare-smollm PREFIX=shake_ \
+    PROMPT="To be, or not to be," N_GEN=32 \
+    python host/gen_smollm_blockfp_full.py \
+ && python host/gen_smollm_blockfp_ddr.py
+MGRT_PREFIX=shake_ host/bfp_client load-roms ../generated
+host/bfp_client all ../generated/shake_DDR3.bin
 ```
 
 `load-roms` writes the per-model BRAMs (G1/G2 gammas, final norm,
