@@ -43,6 +43,11 @@ rtl/vc707/pyrtl_layer_*.txt
 # Compiled host binary
 rtl/vc707/host/bfp_client
 
+# Date-stamped per-build archive — each successful synth snapshots
+# bit + reports + cfg here, survives `make clean`.  Too big for git;
+# the v0.2.0 release tarballs cover the canonical builds.
+rtl/vc707/archive/
+
 # Verilator build dirs
 rtl/vc707/sim/obj_dir*/
 rtl/vc707/sim/*.bin

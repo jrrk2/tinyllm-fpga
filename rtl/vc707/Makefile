@@ -186,6 +186,11 @@ lbfp_full_DDR3_stamp := $(GENERATED_DIR)/.lbfp_full_DDR3.stamp
 # 1.7B would need >1 GB DDR3, so no smollm1700 variant — board change
 # required there.
 # ----------------------------------------------------------------------
+# Build stamp — captured once at make-parse time, used to date the
+# archive snapshot below.  Override BUILD_STAMP=manual or similar if
+# you want a deterministic suffix for a specific session.
+BUILD_STAMP ?= $(shell date -u +%Y%m%d-%H%M%S)
+
 VARIANT ?= smollm135
 
 ifeq ($(VARIANT),smollm135)
@@ -224,11 +229,36 @@ ifeq ($(USE_BFP),1)
   BFP_BUILD_DEPS += $(lbfp_full_cfg_stamp)
 endif
 
+# Date-stamped archive — each successful synth gets snapshotted into
+# archive/<VARIANT>-<BUILD_STAMP>/ so historical builds aren't
+# overwritten when the next `make` runs.  Vivado's project dir stays
+# canonical (microgpt_eth.runs/) so incremental synth still works.
+# A symlink `archive/latest` always points at the newest snapshot.
+archive-dir := archive/$(VARIANT)-$(BUILD_STAMP)
+
 $(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(GENERATED_DIR)/exp_lut.hex $(lbfp_stamp) $(BFP_BUILD_DEPS)
 	mkdir -p $(work-dir)
 	$(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
 	cp microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit ./$(work-dir)/ 2>/dev/null || \
 	cp microgpt_eth.runs/impl_1/vc707_microgpt_eth*.bit ./$(work-dir)/ 2>/dev/null || true
+	@# Snapshot bit + reports + cfg into a dated archive so this build
+	@# survives the next `make`.  Cheap: a few MB of copies, ~1 s.
+	@mkdir -p $(archive-dir)/reports
+	@cp microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit       $(archive-dir)/ 2>/dev/null || true
+	@cp microgpt_eth.runs/impl_1/*timing_summary_routed.rpt   $(archive-dir)/reports/ 2>/dev/null || true
+	@cp microgpt_eth.runs/impl_1/*utilization*.rpt            $(archive-dir)/reports/ 2>/dev/null || true
+	@cp microgpt_eth.runs/synth_1/*utilization_synth.rpt      $(archive-dir)/reports/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/lbfp_full_cfg.svh                    $(archive-dir)/ 2>/dev/null || true
+	@cp $(GENERATED_DIR)/build_version.svh                    $(archive-dir)/ 2>/dev/null || true
+	@{ \
+	    echo "build_date: $$(date -u --iso-8601=seconds)"; \
+	    echo "variant:    $(VARIANT)"; \
+	    echo "git_hash:   $$(git rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	    echo "git_dirty:  $$(git diff --shortstat HEAD 2>/dev/null | head -1)"; \
+	    grep -h '^`define LBFP_FULL_' $(GENERATED_DIR)/lbfp_full_cfg.svh 2>/dev/null; \
+	} > $(archive-dir)/build_info.txt
+	@ln -sfn $(VARIANT)-$(BUILD_STAMP) archive/latest
+	@echo "=== snapshot in $(archive-dir)/ (and archive/latest) ==="
 
 # Quick convenience target: bake BFP hex + run the Verilator layer test.
 # Useful for sanity-checking precision after RTL edits before launching a
@@ -287,12 +317,17 @@ $(ips): %.xci :
 # a 25-min rebuild on what should be a 2-min flash.
 # ----------------------------------------------------------------------
 # Resolved at make-parse time — the freshest existing bit/mcs, if any.
+# Search order: live Vivado runs/ first (just-finished build), then work/
+# copy, then archive/latest (most recent successful build, surviving
+# `make clean`), then arbitrary archive dirs.
 EXISTING_BIT := $(firstword $(wildcard \
     microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit \
-    $(work-dir)/vc707_microgpt_eth.bit))
+    $(work-dir)/vc707_microgpt_eth.bit \
+    archive/latest/vc707_microgpt_eth.bit))
 EXISTING_MCS := $(firstword $(wildcard \
     microgpt_eth.runs/impl_1/vc707_microgpt_eth.mcs \
-    $(work-dir)/vc707_microgpt_eth.mcs))
+    $(work-dir)/vc707_microgpt_eth.mcs \
+    archive/latest/vc707_microgpt_eth.mcs))
 
 # Re-bake the BPI image from the current bit.  Falls back to a full
 # Vivado synth only if no bitstream exists anywhere.
@@ -659,13 +694,16 @@ demo: host/bfp_client $(release-ddr) $(release-voc)
 # a captured release survives a fresh build.  Use `make distclean` to
 # blow it away.
 # ----------------------------------------------------------------------
+# `make clean` preserves both release/ AND archive/ — the whole point
+# of the dated snapshots is that they survive a fresh build.
+# `make distclean` wipes everything.
 clean:
 	rm -rf *.log *.jou *.str *.mif $(work-dir) microgpt_eth.cache microgpt_eth.hw \
 	       microgpt_eth.ip_user_files microgpt_eth.runs microgpt_eth.srcs \
 	       microgpt_eth.sim scripts/vivado*
 
 distclean: clean
-	rm -rf $(release-dir) host/bfp_client
+	rm -rf $(release-dir) archive host/bfp_client
 
 .PHONY: all mcs program flash release program-release flash-release demo clean distclean \
         release-bitstream release-model program-release-bitstream flash-release-bitstream demo-model run \
