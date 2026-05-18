@@ -285,6 +285,28 @@ module smollm_layer_bfp #(
   end
 
   // ---------------------------------------------------------------------------
+  // mlp_m BRAM ports: write during S_SWG / S_SWG_WAIT (when sg_y_valid),
+  // read during S_DMV_DRIVE.  rd_addr = cnt + 1 looks ahead by one to
+  // hide BRAM's 1-cycle read latency; default rd_addr=0 in other states
+  // means S_DMV_PRIME (which precedes S_DMV_DRIVE) preloads the first
+  // entry, so the very first DRIVE cycle's rd_data is mlp_m[0].
+  // ---------------------------------------------------------------------------
+  always_comb begin
+    mlp_m_we      = 1'b0;
+    mlp_m_wr_addr = '0;
+    mlp_m_wr_data = '0;
+    mlp_m_rd_addr = '0;
+    if ((state == S_SWG || state == S_SWG_WAIT) && sg_y_valid) begin
+      mlp_m_we      = 1'b1;
+      mlp_m_wr_addr = out_cnt[CW_FFN-1:0];
+      mlp_m_wr_data = sg_y_m;
+    end
+    if (state == S_DMV_DRIVE) begin
+      mlp_m_rd_addr = cnt[CW_FFN-1:0] + 1'b1;
+    end
+  end
+
+  // ---------------------------------------------------------------------------
   // kv_k_m: per-mantissa K cache.  Writes 1 entry/cycle during S_KVWR_M,
   // reads 1 entry/cycle during S_QK_DRIVE (lane 0 of mv_w_m).
   // ---------------------------------------------------------------------------
@@ -418,7 +440,24 @@ module smollm_layer_bfp #(
   logic signed [BFP_EXP_W -1:0] g_e     [0:NT_FFN-1];
   logic signed [BFP_MANT_W-1:0] u_m     [0:FFN-1];
   logic signed [BFP_EXP_W -1:0] u_e     [0:NT_FFN-1];
-  logic signed [BFP_MANT_W-1:0] mlp_m   [0:FFN-1];
+  // mlp_m: was `logic signed [BFP_MANT_W-1:0] mlp_m [0:FFN-1];` (inferred
+  // as ~3 kLUTRAM at FFN=2560).  Now explicit bfp_sdpram (RAMB36E1).
+  // Write side: S_SWG / S_SWG_WAIT when sg_y_valid.
+  // Read side:  S_DMV_DRIVE consumes one entry per cycle, paired with
+  //   mlp_e (LUTRAM, kept inferred — only NT_FFN=160 entries × 4b).
+  // rd_addr is driven one ahead of cnt (lookahead) so BRAM's 1-cycle
+  // read latency lines up with the existing `mv_x_m <= mlp_m_rd_data`
+  // edge timing.  S_DMV_PRIME falls through the default `rd_addr=0`
+  // case, which preloads addr=0 for the first DRIVE cycle.
+  logic                       mlp_m_we;
+  logic [CW_FFN-1:0]          mlp_m_wr_addr;
+  logic [BFP_MANT_W-1:0]      mlp_m_wr_data;
+  logic [CW_FFN-1:0]          mlp_m_rd_addr;
+  wire  [BFP_MANT_W-1:0]      mlp_m_rd_data;
+  bfp_sdpram #(.DEPTH(FFN), .WIDTH(BFP_MANT_W))
+    i_mlp_m_bram (.clk(clk), .rst(rst),
+                  .we(mlp_m_we), .wr_addr(mlp_m_wr_addr), .wr_data(mlp_m_wr_data),
+                  .rd_addr(mlp_m_rd_addr), .rd_data(mlp_m_rd_data));
   logic signed [BFP_EXP_W -1:0] mlp_e   [0:NT_FFN-1];
 
   logic signed [BFP_MANT_W-1:0] d_m     [0:D-1];
@@ -1891,7 +1930,7 @@ module smollm_layer_bfp #(
             else              cnt <= cnt + 1'b1;
           end
           if (sg_y_valid) begin
-            mlp_m[out_cnt[CW_FFN-1:0]] <= sg_y_m;
+            // mlp_m write handled by always_comb (mlp_m_we/_wr_addr/_wr_data)
             if (out_cnt[3:0] == 4'd0)
               mlp_e[out_cnt[CW_FFN-1:0] / BFP_TILE] <= sg_y_e;
             out_cnt <= out_cnt + 1'b1;
@@ -1899,7 +1938,7 @@ module smollm_layer_bfp #(
         end
         S_SWG_WAIT: begin
           if (sg_y_valid) begin
-            mlp_m[out_cnt[CW_FFN-1:0]] <= sg_y_m;
+            // mlp_m write handled by always_comb (mlp_m_we/_wr_addr/_wr_data)
             if (out_cnt[3:0] == 4'd0)
               mlp_e[out_cnt[CW_FFN-1:0] / BFP_TILE] <= sg_y_e;
             out_cnt <= out_cnt + 1'b1;
@@ -1930,7 +1969,7 @@ module smollm_layer_bfp #(
         end
         S_DMV_DRIVE: begin
           mv_valid <= 1'b1;
-          mv_x_m   <= mlp_m[cnt[CW_FFN-1:0]];
+          mv_x_m   <= mlp_m_rd_data;   // bfp_sdpram read; rd_addr=cnt+1 in always_comb
           mv_x_e   <= mlp_e[cnt[CW_FFN-1:0] / BFP_TILE];
           mv_last  <= (cnt == FFN-1);
           if (cnt == FFN-1) state <= S_DMV_DRAIN;
