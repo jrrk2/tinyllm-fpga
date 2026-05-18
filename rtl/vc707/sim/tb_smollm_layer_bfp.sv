@@ -83,8 +83,10 @@ module tb_smollm_layer_bfp (
 
   smollm_layer_bfp #(
     .D(D), .H_Q(H_Q), .H_KV(H_KV), .HD(HD),
-    .FFN(FFN), .MAX_CTX(MAX_CTX), .PREFIX("../generated/lbfp_"),
-    .STREAM_WEIGHTS(1'b0)
+    .FFN(FFN), .MAX_CTX(MAX_CTX), .PREFIX("../generated/lbfp_")
+    // STREAM_WEIGHTS parameter removed from DUT — streamer is now
+    // always present, with ws_base_*=0 + m_axi_*=tied-off the streamer
+    // is dormant (selftest mode).
   ) dut (
     .clk(clk), .rst(rst), .start(start_r),
     .pos(11'd`LBFP_POS), .kv_pos(7'd`LBFP_KV_POS),
@@ -92,7 +94,10 @@ module tb_smollm_layer_bfp (
     .hidden_in_m(hin_m_bus), .hidden_in_e(hin_e_bus),
     .hidden_out_m(hout_m_bus), .hidden_out_e(hout_e_bus),
     .done(dut_done),
+    // Host-write BRAM port — clk_wr shares the single sim clock; not
+    // exercising the write path in this selftest, so tied off.
     .wr_kind(5'd0), .wr_addr(18'd0), .wr_data(16'd0), .wr_en(1'b0),
+    .clk_wr(clk), .wr_rdata(/*unused*/),
     // DDR3 streamer ports tied off (selftest)
     .ws_base_WQ_m('0), .ws_base_WQ_e('0),
     .ws_base_WK_m('0), .ws_base_WK_e('0),
@@ -107,7 +112,8 @@ module tb_smollm_layer_bfp (
     .m_axi_arcache(), .m_axi_arprot(), .m_axi_arqos(),
     .m_axi_rvalid(1'b0), .m_axi_rready(),
     .m_axi_rid('0), .m_axi_rdata('0), .m_axi_rresp('0), .m_axi_rlast(1'b0),
-    .dbg_state(dbg_state), .dbg_cnt(dbg_cnt), .dbg_chunk(dbg_chunk)
+    .dbg_state(dbg_state), .dbg_cnt(dbg_cnt), .dbg_chunk(dbg_chunk),
+    .weight_hash(/*unused*/)
   );
 
   // Trace state changes
