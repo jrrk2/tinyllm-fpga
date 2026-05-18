@@ -174,9 +174,49 @@ lbfp_full_cfg_stamp  := $(GENERATED_DIR)/.lbfp_full_cfg.stamp
 lbfp_full_stamp      := $(GENERATED_DIR)/.lbfp_full.stamp
 lbfp_full_DDR3_stamp := $(GENERATED_DIR)/.lbfp_full_DDR3.stamp
 
+# ----------------------------------------------------------------------
+# VARIANT selects which SmolLM2 model the bitstream is dimensioned for.
+# Same RTL, same LANES=16 engine, no throughput change — just bigger
+# parameters baked into cfg.svh so the synth produces the right BRAM /
+# state-buffer / KV-cache widths.
+#
+#   make                       (default: smollm135 = canonical 135M)
+#   make VARIANT=smollm360     360M (D=960, NL=32, FFN=2560, ~870 MB DDR3)
+#
+# 1.7B would need >1 GB DDR3, so no smollm1700 variant — board change
+# required there.
+# ----------------------------------------------------------------------
+VARIANT ?= smollm135
+
+ifeq ($(VARIANT),smollm135)
+  SMOLLM_MODEL := HuggingFaceTB/SmolLM2-135M
+  SMOLLM_D     := 576
+  SMOLLM_H_Q   := 9
+  SMOLLM_H_KV  := 3
+  SMOLLM_HD    := 64
+  SMOLLM_FFN   := 1536
+  SMOLLM_NL    := 30
+else ifeq ($(VARIANT),smollm360)
+  SMOLLM_MODEL := HuggingFaceTB/SmolLM2-360M
+  SMOLLM_D     := 960
+  SMOLLM_H_Q   := 15
+  SMOLLM_H_KV  := 5
+  SMOLLM_HD    := 64
+  SMOLLM_FFN   := 2560
+  SMOLLM_NL    := 32
+else
+  $(error VARIANT=$(VARIANT) not recognised — use smollm135 or smollm360)
+endif
+
+# Threaded into every packer invocation so cfg.svh, the .hex set, and
+# the DDR3 image all agree on the variant.
+SMOLLM_ENV := MODEL=$(SMOLLM_MODEL) D=$(SMOLLM_D) H_Q=$(SMOLLM_H_Q) \
+              H_KV=$(SMOLLM_H_KV) HD=$(SMOLLM_HD) FFN=$(SMOLLM_FFN) \
+              NL=$(SMOLLM_NL)
+
 $(lbfp_full_cfg_stamp): host/gen_smollm_blockfp_cfg.py
-	@echo "=== generating lbfp_full_cfg.svh + PROMPT_TOKENS.txt ==="
-	python3 host/gen_smollm_blockfp_cfg.py
+	@echo "=== generating lbfp_full_cfg.svh + PROMPT_TOKENS.txt (VARIANT=$(VARIANT)) ==="
+	$(SMOLLM_ENV) python3 host/gen_smollm_blockfp_cfg.py
 	@touch $@
 
 BFP_BUILD_DEPS :=
@@ -201,8 +241,8 @@ bfp-sim: $(lbfp_stamp)
 # ~270 MB).  Bake-and-run takes ~10 min wall, then compares 18 generated
 # tokens against the Python BFP golden.
 $(lbfp_full_stamp): host/gen_smollm_blockfp_full.py
-	@echo "=== baking SmolLM2-135M block-FP weights (30 layers, full dims) ==="
-	python3 host/gen_smollm_blockfp_full.py
+	@echo "=== baking $(SMOLLM_MODEL) block-FP weights ($(SMOLLM_NL) layers, D=$(SMOLLM_D)) ==="
+	$(SMOLLM_ENV) python3 host/gen_smollm_blockfp_full.py
 	@touch $@
 
 bfp-full: $(lbfp_full_stamp)
@@ -219,8 +259,8 @@ bfp-autoregress: $(lbfp_full_stamp)
 # (optionally) the matching .hex consumed by the Verilator stream tb.
 # The .bin alone is ≈ 320 MB, the .hex doubles that — keep it gated.
 $(lbfp_full_DDR3_stamp): host/gen_smollm_blockfp_ddr.py $(lbfp_full_stamp)
-	@echo "=== baking lbfp_full_DDR3.bin ==="
-	python3 host/gen_smollm_blockfp_ddr.py
+	@echo "=== baking lbfp_full_DDR3.bin ($(SMOLLM_MODEL)) ==="
+	$(SMOLLM_ENV) python3 host/gen_smollm_blockfp_ddr.py
 	@touch $@
 
 # Same end-to-end demo but with weights streamed from a DDR3 image via
