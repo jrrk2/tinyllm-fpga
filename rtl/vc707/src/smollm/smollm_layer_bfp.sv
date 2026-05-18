@@ -46,7 +46,7 @@ module smollm_layer_bfp #(
   input  wire                                start,
   input  wire [10:0]                         pos,
   input  wire [6:0]                          kv_pos,       // up to MAX_CTX-1
-  input  wire [4:0]                          layer_idx,    // 0..NL-1
+  input  wire [$clog2(NL+1)-1:0]             layer_idx,    // 0..NL-1
   input  wire signed [D*BFP_MANT_W-1:0]      hidden_in_m,
   input  wire signed [(D/BFP_TILE)*BFP_EXP_W-1:0] hidden_in_e,
   output logic signed [D*BFP_MANT_W-1:0]     hidden_out_m,
@@ -455,11 +455,20 @@ module smollm_layer_bfp #(
   } state_t;
   state_t state;
 
-  // Generic counters
-  logic [11:0]      cnt;
-  logic [6:0]       chunk;
-  logic [4:0]       head_idx;
-  logic [4:0]       kv_t;
+  // Generic counters.
+  // - chunk: iterates over CHUNKS_D/KV/FFN/HD inside a single matvec.
+  //   FFN dominates (CHUNKS_FFN=160 at 360M, 96 at 135M, 512 at 1.7B);
+  //   use $clog2(CHUNKS_FFN+1) so the width tracks FFN automatically.
+  //   Previously hardcoded 7 bits → silent overflow + FSM hang at any
+  //   FFN ≥ 2048 (CHUNKS_FFN ≥ 128).
+  // - kv_t: iterates over kv_pos = 0..MAX_CTX-1 during attention.
+  //   Previously hardcoded 5 bits → broken latent at any active prompt
+  //   + N_GEN > 32 even on the current 135M build; tied to CW_CTX now
+  //   so it scales with MAX_CTX.
+  logic [11:0]                              cnt;
+  logic [$clog2(CHUNKS_FFN+1)-1:0]          chunk;
+  logic [4:0]                               head_idx;
+  logic [CW_CTX-1:0]                        kv_t;
   logic signed [BFP_EXP_W-1:0] score_emax;
 
   // ---------------------------------------------------------------------------

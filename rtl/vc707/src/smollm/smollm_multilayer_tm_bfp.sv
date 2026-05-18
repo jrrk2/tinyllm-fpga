@@ -110,7 +110,10 @@ module smollm_multilayer_tm_bfp #(
 
   // Inner layer wires.
   logic                                lay_start;
-  logic [4:0]                          lay_idx;
+  // Layer index — was hardcoded 5 bits, fits NL=30 (135M) and NL=32
+  // (360M) exactly but no headroom beyond.  Now derived from NL so any
+  // future SmolLM2 variant scales automatically.
+  logic [$clog2(NL+1)-1:0]             lay_idx;
   wire  signed [D*BFP_MANT_W-1:0]      lay_hidden_out_m;
   wire  signed [NT_D*BFP_EXP_W-1:0]    lay_hidden_out_e;
   wire                                 lay_done;
