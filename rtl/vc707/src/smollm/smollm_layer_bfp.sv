@@ -210,9 +210,7 @@ module smollm_layer_bfp #(
       kv_v_chk_wr_addr = KVV_AW'(layer_idx * MAX_CTX * KVV_CHUNKS_PER_KVPOS
                                  + kv_pos * KVV_CHUNKS_PER_KVPOS
                                  + cnt[CW_KV-1:4]);
-      for (int gl = 0; gl < LANES; gl++)
-        kv_v_chk_wr_data[gl*BFP_MANT_W +: BFP_MANT_W] =
-          v_m[cnt[CW_KV-1:4] * LANES + gl];
+      kv_v_chk_wr_data = v_m_rd_data_packed;
     end
     // Default rd_addr points at addr(cnt) using the current head_grp /
     // chunk.  The S_AV_PREFETCH and S_AV_DRIVE states drive cnt so the
@@ -452,6 +450,34 @@ module smollm_layer_bfp #(
       (state == S_ROPEK_RQ_B) ? krq_data : kmv_data;
   end
 
+  // v_m: single LANES-parallel write (S_VMV_REQ, matvec drain → requant).
+  // Reads are LANES-parallel at LANES-aligned base from TWO consumers:
+  //   - always_comb @ S_KVWR_M&cnt[3:0]==15 → kv_v_chk_wr_data (tile = cnt>>4)
+  //   - always_ff  @ S_AV_DRIVE&consume_t==kv_pos → mv_w_m  (tile = head_grp*(HD/LANES)+chunk)
+  // S_KVWR_M reads sequence: cnt[3:0] cycles 0..15; we need rd_data_packed
+  //   stable for cnt[3:0]==15, which means rd_addr_tile = cnt>>4 throughout
+  //   (the BRAM re-issues the same tile address every cycle of the 16-step
+  //   window).  S_AV_DRIVE reads at a single iteration (consume_t==kv_pos);
+  //   driving tile from S_AV_PREFETCH onward gives the BRAM ≥1 cycle to settle.
+  assign v_m_we           = (state == S_VMV_REQ);
+  assign v_m_wr_addr_tile = VMT_AW'(chunk);
+  always_comb begin
+    case (state)
+      S_KVWR_M:    v_m_rd_addr_tile = VMT_AW'(cnt[CW_KV-1:4]);
+      S_AV_PREFETCH,
+      S_AV_DRIVE:  v_m_rd_addr_tile =
+                     VMT_AW'((head_grp * HD + chunk * LANES) / LANES);
+      default:     v_m_rd_addr_tile = '0;
+    endcase
+  end
+  for (genvar pack_ii = 0; pack_ii < LANES; pack_ii++) begin : g_v_m_pack
+    assign v_m_wr_data_packed[pack_ii*BFP_MANT_W +: BFP_MANT_W] =
+      requant_mant(
+        mv_out_m_drain_r[pack_ii*BFP_MANT_W +: BFP_MANT_W],
+        mv_out_e_drain_r[pack_ii*BFP_EXP_W  +: BFP_EXP_W ],
+        mv_drain_emax_f);
+  end
+
   // ---------------------------------------------------------------------------
   // kv_k_m: per-mantissa K cache.  Writes 1 entry/cycle during S_KVWR_M,
   // reads 1 entry/cycle during S_QK_DRIVE (lane 0 of mv_w_m).
@@ -614,7 +640,31 @@ module smollm_layer_bfp #(
     .rd_data        (k_m_rd_data)
   );
   logic signed [BFP_EXP_W -1:0] k_e     [0:NT_KV-1];
-  logic signed [BFP_MANT_W-1:0] v_m     [0:H_KV*HD-1];
+  // v_m: packed bfp_sdpram_packed_pr (packed write + LANES-parallel read).
+  // Both write (S_VMV_REQ, LANES-parallel at chunk*LANES) and reads
+  //   - S_KVWR_M @ cnt[3:0]==15 (always_comb above), tile = cnt[CW_KV-1:4]
+  //   - S_AV_DRIVE @ consume_t==kv_pos (in always_ff), tile = head_grp*(HD/LANES)+chunk
+  // hit LANES contiguous entries at LANES-aligned base.  rd_addr_tile is
+  // state-conditional, driven 1 cycle ahead of consumption.
+  localparam int VMT_AW = $clog2(((H_KV*HD)+LANES-1)/LANES);
+  logic                                    v_m_we;
+  logic [VMT_AW-1:0]                       v_m_wr_addr_tile;
+  logic [LANES*BFP_MANT_W-1:0]             v_m_wr_data_packed;
+  logic [VMT_AW-1:0]                       v_m_rd_addr_tile;
+  wire  [LANES*BFP_MANT_W-1:0]             v_m_rd_data_packed;
+  bfp_sdpram_packed_pr #(
+    .LANES         (LANES),
+    .LOGICAL_DEPTH (H_KV*HD),
+    .WIDTH         (BFP_MANT_W)
+  ) i_v_m_bram (
+    .clk            (clk),
+    .rst            (rst),
+    .we             (v_m_we),
+    .wr_addr_tile   (v_m_wr_addr_tile),
+    .wr_data_packed (v_m_wr_data_packed),
+    .rd_addr_tile   (v_m_rd_addr_tile),
+    .rd_data_packed (v_m_rd_data_packed)
+  );
   logic signed [BFP_EXP_W -1:0] v_e     [0:NT_KV-1];
 
   // q_rot_m: explicit lane-striped bfp_sdpram (LANES BRAMs × NT_D-deep).
@@ -1559,13 +1609,9 @@ module smollm_layer_bfp #(
           state <= S_VMV_REQ;
         end
         S_VMV_REQ: begin : vmv_pipeB
+          // v_m LANES-parallel write driven by v_m_we + g_v_m_pack above.
           automatic logic signed [BFP_EXP_W-1:0] emax_f;
           emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
-          for (ii = 0; ii < LANES; ii++)
-            v_m[chunk * LANES + ii] <= requant_mant(
-              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
-              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
-              emax_f);
           v_e[chunk] <= emax_f;
           state <= S_VMV_NEXT;
         end
@@ -1907,7 +1953,7 @@ module smollm_layer_bfp #(
             for (ii = 0; ii < LANES; ii++) begin
               automatic logic signed [BFP_MANT_W-1:0] m_raw;
               if (consume_t == kv_pos)
-                m_raw = $signed(v_m[head_grp * HD + chunk * LANES + ii]);
+                m_raw = $signed(v_m_rd_data_packed[ii*BFP_MANT_W +: BFP_MANT_W]);
               else
                 m_raw = $signed(kv_v_chk_rd_data[ii*BFP_MANT_W +: BFP_MANT_W]);
               if (shamt >= 16)     mv_w_m[ii*BFP_MANT_W +: BFP_MANT_W] <= '0;
@@ -2378,7 +2424,7 @@ module smollm_layer_bfp #(
         $writememh("rtl_kpre_e.hex", k_e);
       end
       if (prev_state == 6'd15 && state == 6'd16) begin
-        $writememh("rtl_v_m.hex", v_m);
+        // v_m packed in i_v_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_v_e.hex", v_e);
       end
       // State numbers shifted by +2 vs original because of new S_ROPEQ_RQ + S_ROPEK_RQ states.
