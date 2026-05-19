@@ -370,7 +370,7 @@ $(lbfp_full_DDR3_stamp): host/gen_smollm_blockfp_ddr.py $(lbfp_full_stamp)
 # AXI fetch + streamer pipeline against the BRAM-mode golden tokens.
 # Requires the (~670 MB) hex image — generated with LBFP_EMIT_HEX=1.
 bfp-autoregress-stream: $(lbfp_full_stamp)
-	OUT=$(GENERATED_DIR) LBFP_EMIT_HEX=1 python3 host/gen_smollm_blockfp_ddr.py
+	$(SMOLLM_ENV) LBFP_EMIT_HEX=1 python3 host/gen_smollm_blockfp_ddr.py
 	$(MAKE) -C sim bfp-autoregress-stream
 
 .PHONY: bfp-sim bfp-full bfp-autoregress bfp-autoregress-stream
