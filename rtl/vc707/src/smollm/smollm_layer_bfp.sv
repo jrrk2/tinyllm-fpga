@@ -376,6 +376,48 @@ module smollm_layer_bfp #(
         mv_drain_emax_f);
   end
 
+  // q_m: write side multiplexes between S_QMV_REQ (matvec drain → requant)
+  // and S_ROPEQ_RQ_B (q_rot tile → tile-quant requant).  Read side has two
+  // sequential consumers — S_ROPEQ (per-element into rp_x_m, 1-cycle ahead
+  // lookahead `head_idx*HD + cnt + 1`) and S_QK_DRIVE (per-element into
+  // mv_x_m, addr = `head_idx*HD + cnt` because S_QK_PREFETCH absorbs the
+  // 1-cycle lag).  S_ROPEQ_WAIT drives `(head_idx+1)*HD` so the BRAM has
+  // the next head's element 0 already-fetched when S_ROPEQ resumes.
+  assign q_m_we           = (state == S_QMV_REQ) || (state == S_ROPEQ_RQ_B);
+  assign q_m_wr_addr_tile =
+      (state == S_ROPEQ_RQ_B) ? ($clog2((D+LANES-1)/LANES))'(cnt[$clog2(NT_D+1)-1:0])
+                              : ($clog2((D+LANES-1)/LANES))'(chunk);
+  always_comb begin
+    case (state)
+      S_ROPEQ:        q_m_rd_addr = CW_D'(head_idx * HD) + cnt[CW_D-1:0] + 1'b1;
+      S_ROPEQ_WAIT:   q_m_rd_addr = CW_D'((head_idx + 1) * HD);
+      S_QK_PRIME,
+      S_QK_PREFETCH,
+      S_QK_DRIVE:     q_m_rd_addr = CW_D'(head_idx * HD) + cnt[CW_D-1:0];
+      default:        q_m_rd_addr = '0;
+    endcase
+  end
+  // wr_data_packed: per-lane combinational mux on state.
+  //   S_QMV_REQ:    requant(mv_out_*_drain_r, mv_drain_emax_f)
+  //   S_ROPEQ_RQ_B: requant(q_rot_m_rd_data_packed, q_rot_e[base+lane], rq_emax)
+  //                 where base = cnt * BFP_TILE = cnt * LANES (BFP_TILE==LANES==16).
+  wire signed [BFP_EXP_W-1:0] q_rq_emax =
+      (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
+  for (genvar pack_ii = 0; pack_ii < LANES; pack_ii++) begin : g_q_m_pack
+    wire [BFP_MANT_W-1:0] qmv_data =
+        requant_mant(
+          mv_out_m_drain_r[pack_ii*BFP_MANT_W +: BFP_MANT_W],
+          mv_out_e_drain_r[pack_ii*BFP_EXP_W  +: BFP_EXP_W ],
+          mv_drain_emax_f);
+    wire [BFP_MANT_W-1:0] qrq_data =
+        requant_mant(
+          $signed(q_rot_m_rd_data_packed[pack_ii*BFP_MANT_W +: BFP_MANT_W]),
+          q_rot_e[cnt[$clog2(NT_D+1)-1:0] * BFP_TILE + pack_ii],
+          q_rq_emax);
+    assign q_m_wr_data_packed[pack_ii*BFP_MANT_W +: BFP_MANT_W] =
+      (state == S_ROPEQ_RQ_B) ? qrq_data : qmv_data;
+  end
+
   // ---------------------------------------------------------------------------
   // kv_k_m: per-mantissa K cache.  Writes 1 entry/cycle during S_KVWR_M,
   // reads 1 entry/cycle during S_QK_DRIVE (lane 0 of mv_w_m).
@@ -486,7 +528,32 @@ module smollm_layer_bfp #(
                  .rd_addr(n1_m_rd_addr), .rd_data(n1_m_rd_data));
   logic signed [BFP_EXP_W -1:0] n1_e    [0:NT_D-1];
 
-  logic signed [BFP_MANT_W-1:0] q_m     [0:D-1];
+  // q_m: packed bfp_sdpram.  TWO LANES-parallel write sites:
+  //   S_QMV_REQ:    chunk-indexed, src = mv_out_*_drain_r (matvec drain)
+  //   S_ROPEQ_RQ_B: cnt-indexed (tile), src = q_rot_m_rd_data_packed (rope)
+  // TWO sequential reads:
+  //   S_ROPEQ:      `rp_x_m <= q_m_rd_data` per cnt
+  //   S_QK_DRIVE:   `mv_x_m <= q_m_rd_data` per cnt (consume_j = cnt-1)
+  // Both reads use 1-cycle BRAM latency; rd_addr lookahead is state-conditional
+  // (see the comb-mux below the BRAM decl).
+  logic                            q_m_we;
+  logic [$clog2((D+LANES-1)/LANES)-1:0] q_m_wr_addr_tile;
+  logic [LANES*BFP_MANT_W-1:0]     q_m_wr_data_packed;
+  logic [CW_D-1:0]                 q_m_rd_addr;
+  wire  [BFP_MANT_W-1:0]           q_m_rd_data;
+  bfp_sdpram_packed #(
+    .LANES         (LANES),
+    .LOGICAL_DEPTH (D),
+    .WIDTH         (BFP_MANT_W)
+  ) i_q_m_bram (
+    .clk            (clk),
+    .rst            (rst),
+    .we             (q_m_we),
+    .wr_addr_tile   (q_m_wr_addr_tile),
+    .wr_data_packed (q_m_wr_data_packed),
+    .rd_addr        (q_m_rd_addr),
+    .rd_data        (q_m_rd_data)
+  );
   logic signed [BFP_EXP_W -1:0] q_e     [0:NT_D-1];
 
   logic signed [BFP_MANT_W-1:0] k_m     [0:H_KV*HD-1];
@@ -1314,14 +1381,9 @@ module smollm_layer_bfp #(
           state <= S_QMV_REQ;
         end
         S_QMV_REQ: begin : qmv_pipeB
-          // Stage 2: final max + 16-lane parallel requant + write.
+          // Stage 2: final max + write (q_m_we + g_q_m_pack drive the packed BRAM).
           automatic logic signed [BFP_EXP_W-1:0] emax_f;
           emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
-          for (ii = 0; ii < LANES; ii++)
-            q_m[chunk * LANES + ii] <= requant_mant(
-              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
-              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
-              emax_f);
           q_e[chunk] <= emax_f;
           state <= S_QMV_NEXT;
         end
@@ -1470,7 +1532,7 @@ module smollm_layer_bfp #(
         // ===================================================================
         S_ROPEQ: begin
           rp_valid <= 1'b1;
-          rp_x_m   <= q_m[head_idx * HD + cnt[CW_HD-1:0]];
+          rp_x_m   <= q_m_rd_data;
           rp_x_e   <= q_e[(head_idx * HD + cnt[CW_HD-1:0]) / BFP_TILE];
           if (cnt == HD-1) begin
             state <= S_ROPEQ_WAIT; cnt <= '0;
@@ -1515,16 +1577,10 @@ module smollm_layer_bfp #(
           state <= S_ROPEQ_RQ_B;
         end
         S_ROPEQ_RQ_B: begin : rq_q_b
+          // q_m LANES-parallel write driven by q_m_we + g_q_m_pack
+          // (qrq_data branch selected because state==S_ROPEQ_RQ_B).
           automatic logic signed [BFP_EXP_W-1:0] emax_f;
-          automatic int base;
-          base = cnt[$clog2(NT_D+1)-1:0] * BFP_TILE;
           emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
-          for (ii = 0; ii < BFP_TILE; ii++) begin
-            if (base + ii < D)
-              q_m[base + ii] <= requant_mant(
-                $signed(q_rot_m_rd_data_packed[ii*BFP_MANT_W +: BFP_MANT_W]),
-                q_rot_e[base + ii], emax_f);
-          end
           q_e[cnt[$clog2(NT_D+1)-1:0]] <= emax_f;
           if (cnt == NT_D - 1) begin
             head_idx <= '0; cnt <= '0;
@@ -1646,7 +1702,7 @@ module smollm_layer_bfp #(
           automatic logic [CW_HD-1:0] consume_j;
           consume_j = cnt[CW_HD-1:0] - 1'b1;
           mv_valid <= 1'b1;
-          mv_x_m   <= q_m[head_idx * HD + consume_j];
+          mv_x_m   <= q_m_rd_data;
           mv_x_e   <= q_e[(head_idx * HD + consume_j) / BFP_TILE];
           mv_last  <= (consume_j == HD-1);
           // Lane 0: K from kv_k_m / kv_k_e BRAMs.  Since S_KVWR_M wrote
@@ -2269,7 +2325,7 @@ module smollm_layer_bfp #(
         $writememh("rtl_n1_e.hex", n1_e);
       end
       if (prev_state == 6'd7 && state == 6'd8) begin
-        $writememh("rtl_qpre_m.hex", q_m);
+        // q_m now packed in i_q_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_qpre_e.hex", q_e);
       end
       if (prev_state == 6'd11 && state == 6'd12) begin
@@ -2283,10 +2339,8 @@ module smollm_layer_bfp #(
       // State numbers shifted by +2 vs original because of new S_ROPEQ_RQ + S_ROPEK_RQ states.
       // S_KVWR_M = 22 (was 20) — state right after RQ/RoPE is complete.
       if (state == 6'd22 && prev_state == 6'd21) begin
-        // Post-rope-requant Q + K
-        $writememh("rtl_q_m.hex", q_m);
+        // Post-rope-requant Q + K — q_m / k_m packed in BRAM, dump suppressed.
         $writememh("rtl_q_e.hex", q_e);
-        $writememh("rtl_k_m.hex", k_m);
         $writememh("rtl_k_e.hex", k_e);
       end
       // After attention (transition to S_OMV_PRIME)
