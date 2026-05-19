@@ -625,6 +625,7 @@ obj_dir/Vtb_smollm_layer_bfp: tb_smollm_layer_bfp.sv tb_smollm_layer_bfp.cpp \
 	    -CFLAGS "-O2 -std=c++17" \
 	    --top-module tb_smollm_layer_bfp \
 	    -I../generated -I$(SMOLLM_SRC) \
+	    +define+LBFP_STAGE_DUMP \
 	    tb_smollm_layer_bfp.sv tb_smollm_layer_bfp.cpp \
 	    $(SMOLLM_SRC)/smollm_layer_bfp.sv \
 	    $(SMOLLM_SRC)/matvec_bfp_engine.sv \
