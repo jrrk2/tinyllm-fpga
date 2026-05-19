@@ -313,6 +313,21 @@ module smollm_layer_bfp #(
   assign n2_m_wr_data = rn_y_m;
   assign n2_m_rd_addr = cnt[CW_D-1:0];
 
+  // q_rot_m: written in S_ROPEQ_WAIT (one entry per rp_y_valid cycle),
+  // read LANES-parallel in S_ROPEQ_RQ_B (rd_addr pre-driven in
+  // S_ROPEQ_RQ_A so BRAM latency aligns).
+  assign q_rot_m_we      = (state == S_ROPEQ_WAIT) && rp_y_valid;
+  assign q_rot_m_wr_addr = CW_D'(head_idx * HD + cnt[CW_HD-1:0]);
+  assign q_rot_m_wr_data = rp_y_m;
+  assign q_rot_m_rd_addr = cnt[$clog2(NT_D+1)-1:0];
+
+  // k_rot_m: same pattern, written in S_ROPEK_WAIT, read LANES-parallel
+  // in S_ROPEK_RQ_B (rd_addr pre-driven in S_ROPEK_RQ_A).
+  assign k_rot_m_we      = (state == S_ROPEK_WAIT) && rp_y_valid;
+  assign k_rot_m_wr_addr = ($clog2(H_KV*HD))'(head_idx * HD + cnt[CW_HD-1:0]);
+  assign k_rot_m_wr_data = rp_y_m;
+  assign k_rot_m_rd_addr = cnt[$clog2(NT_KV+1)-1:0];
+
   // ---------------------------------------------------------------------------
   // kv_k_m: per-mantissa K cache.  Writes 1 entry/cycle during S_KVWR_M,
   // reads 1 entry/cycle during S_QK_DRIVE (lane 0 of mv_w_m).
@@ -431,9 +446,52 @@ module smollm_layer_bfp #(
   logic signed [BFP_MANT_W-1:0] v_m     [0:H_KV*HD-1];
   logic signed [BFP_EXP_W -1:0] v_e     [0:NT_KV-1];
 
-  logic signed [BFP_MANT_W-1:0] q_rot_m [0:D-1];
+  // q_rot_m: explicit lane-striped bfp_sdpram (LANES BRAMs × NT_D-deep).
+  // Writes: 1 entry/cycle from S_ROPEQ_WAIT at idx = head_idx*HD + cnt[CW_HD-1:0]
+  //   → lane = idx[3:0], wr_addr_within_lane = idx[CW_D-1:4].
+  // Reads:  LANES-parallel from S_ROPEQ_RQ_B at base = cnt*BFP_TILE
+  //   → rd_addr = cnt[$clog2(NT_D+1)-1:0]; output is 16-element tile.
+  //   rd_addr drive happens during S_ROPEQ_RQ_A (one cycle ahead) so
+  //   the BRAM's 1-cycle latency lines up with B's consumption.
+  logic                            q_rot_m_we;
+  logic [CW_D-1:0]                 q_rot_m_wr_addr;
+  logic [BFP_MANT_W-1:0]           q_rot_m_wr_data;
+  logic [$clog2(NT_D+1)-1:0]       q_rot_m_rd_addr;
+  wire  [LANES*BFP_MANT_W-1:0]     q_rot_m_rd_data_packed;
+  bfp_sdpram_striped #(
+    .LANES         (LANES),
+    .LOGICAL_DEPTH (D),
+    .WIDTH         (BFP_MANT_W)
+  ) i_q_rot_m_bram (
+    .clk            (clk),
+    .rst            (rst),
+    .we             (q_rot_m_we),
+    .wr_addr        (q_rot_m_wr_addr),
+    .wr_data        (q_rot_m_wr_data),
+    .rd_addr        (q_rot_m_rd_addr),
+    .rd_data_packed (q_rot_m_rd_data_packed)
+  );
   logic signed [BFP_EXP_W -1:0] q_rot_e [0:D-1];
-  logic signed [BFP_MANT_W-1:0] k_rot_m [0:H_KV*HD-1];
+  // k_rot_m: same lane-striped bfp_sdpram pattern as q_rot_m.
+  // Logical depth H_KV*HD (=320 at smollm360), striped across LANES BRAMs.
+  logic                            k_rot_m_we;
+  logic [$clog2(H_KV*HD)-1:0]      k_rot_m_wr_addr;
+  logic [BFP_MANT_W-1:0]           k_rot_m_wr_data;
+  logic [$clog2(NT_KV+1)-1:0]      k_rot_m_rd_addr;
+  wire  [LANES*BFP_MANT_W-1:0]     k_rot_m_rd_data_packed;
+  bfp_sdpram_striped #(
+    .LANES         (LANES),
+    .LOGICAL_DEPTH (H_KV*HD),
+    .WIDTH         (BFP_MANT_W)
+  ) i_k_rot_m_bram (
+    .clk            (clk),
+    .rst            (rst),
+    .we             (k_rot_m_we),
+    .wr_addr        (k_rot_m_wr_addr),
+    .wr_data        (k_rot_m_wr_data),
+    .rd_addr        (k_rot_m_rd_addr),
+    .rd_data_packed (k_rot_m_rd_data_packed)
+  );
   logic signed [BFP_EXP_W -1:0] k_rot_e [0:H_KV*HD-1];
 
   logic signed [BFP_MANT_W-1:0] scores_m  [0:MAX_CTX-1];
@@ -1310,7 +1368,7 @@ module smollm_layer_bfp #(
         end
         S_ROPEQ_WAIT: begin
           if (rp_y_valid) begin
-            q_rot_m[head_idx * HD + cnt[CW_HD-1:0]] <= rp_y_m;
+            // q_rot_m write handled by always_comb-equivalent assigns above
             q_rot_e[head_idx * HD + cnt[CW_HD-1:0]] <= rp_y_e;
             cnt <= cnt + 1'b1;
           end
@@ -1353,8 +1411,9 @@ module smollm_layer_bfp #(
           emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
           for (ii = 0; ii < BFP_TILE; ii++) begin
             if (base + ii < D)
-              q_m[base + ii] <= requant_mant(q_rot_m[base + ii],
-                                             q_rot_e[base + ii], emax_f);
+              q_m[base + ii] <= requant_mant(
+                $signed(q_rot_m_rd_data_packed[ii*BFP_MANT_W +: BFP_MANT_W]),
+                q_rot_e[base + ii], emax_f);
           end
           q_e[cnt[$clog2(NT_D+1)-1:0]] <= emax_f;
           if (cnt == NT_D - 1) begin
@@ -1377,7 +1436,7 @@ module smollm_layer_bfp #(
         end
         S_ROPEK_WAIT: begin
           if (rp_y_valid) begin
-            k_rot_m[head_idx * HD + cnt[CW_HD-1:0]] <= rp_y_m;
+            // k_rot_m write handled by always_comb-equivalent assigns above
             k_rot_e[head_idx * HD + cnt[CW_HD-1:0]] <= rp_y_e;
             cnt <= cnt + 1'b1;
           end
@@ -1416,8 +1475,9 @@ module smollm_layer_bfp #(
           emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
           for (ii = 0; ii < BFP_TILE; ii++) begin
             if (base + ii < H_KV*HD)
-              k_m[base + ii] <= requant_mant(k_rot_m[base + ii],
-                                              k_rot_e[base + ii], emax_f);
+              k_m[base + ii] <= requant_mant(
+                $signed(k_rot_m_rd_data_packed[ii*BFP_MANT_W +: BFP_MANT_W]),
+                k_rot_e[base + ii], emax_f);
           end
           k_e[cnt[$clog2(NT_KV+1)-1:0]] <= emax_f;
           if (cnt == NT_KV - 1) begin
