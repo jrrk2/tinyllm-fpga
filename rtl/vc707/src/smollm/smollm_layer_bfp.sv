@@ -300,6 +300,19 @@ module smollm_layer_bfp #(
   assign mlp_m_wr_data = sg_y_m;
   assign mlp_m_rd_addr = cnt[CW_FFN-1:0];
 
+  // n1_m: written in S_NORM1_WAIT (one cycle per cnt step), read by all
+  // three of Q/K/V matvec DRIVE states using cnt as the index.
+  assign n1_m_we      = (state == S_NORM1_WAIT) && rn_y_valid;
+  assign n1_m_wr_addr = cnt[CW_D-1:0];
+  assign n1_m_wr_data = rn_y_m;
+  assign n1_m_rd_addr = cnt[CW_D-1:0];
+
+  // n2_m: written in S_NORM2_WAIT, read by both G and U matvec DRIVE states.
+  assign n2_m_we      = (state == S_NORM2_WAIT) && rn_y_valid;
+  assign n2_m_wr_addr = cnt[CW_D-1:0];
+  assign n2_m_wr_data = rn_y_m;
+  assign n2_m_rd_addr = cnt[CW_D-1:0];
+
   // ---------------------------------------------------------------------------
   // kv_k_m: per-mantissa K cache.  Writes 1 entry/cycle during S_KVWR_M,
   // reads 1 entry/cycle during S_QK_DRIVE (lane 0 of mv_w_m).
@@ -396,7 +409,18 @@ module smollm_layer_bfp #(
   logic signed [BFP_MANT_W-1:0] hin_m   [0:D-1];
   logic signed [BFP_EXP_W -1:0] hin_e   [0:NT_D-1];
 
-  logic signed [BFP_MANT_W-1:0] n1_m    [0:D-1];
+  // n1_m: explicit bfp_sdpram (same pattern as mlp_m).  Single-write
+  // from S_NORM1_WAIT, single registered-read in S_QMV/KMV/VMV_DRIVE.
+  // n1_e stays inferred (NT_D ≤ 60 × 4b — too small for BRAM tile).
+  logic                       n1_m_we;
+  logic [CW_D-1:0]            n1_m_wr_addr;
+  logic [BFP_MANT_W-1:0]      n1_m_wr_data;
+  logic [CW_D-1:0]            n1_m_rd_addr;
+  wire  [BFP_MANT_W-1:0]      n1_m_rd_data;
+  bfp_sdpram #(.DEPTH(D), .WIDTH(BFP_MANT_W))
+    i_n1_m_bram (.clk(clk), .rst(rst),
+                 .we(n1_m_we), .wr_addr(n1_m_wr_addr), .wr_data(n1_m_wr_data),
+                 .rd_addr(n1_m_rd_addr), .rd_data(n1_m_rd_data));
   logic signed [BFP_EXP_W -1:0] n1_e    [0:NT_D-1];
 
   logic signed [BFP_MANT_W-1:0] q_m     [0:D-1];
@@ -427,7 +451,17 @@ module smollm_layer_bfp #(
   logic signed [BFP_MANT_W-1:0] h1_m    [0:D-1];
   logic signed [BFP_EXP_W -1:0] h1_e    [0:NT_D-1];
 
-  logic signed [BFP_MANT_W-1:0] n2_m    [0:D-1];
+  // n2_m: explicit bfp_sdpram (same pattern as n1_m / mlp_m).  Single-
+  // write from S_NORM2_WAIT, single registered-read in S_GMV/UMV_DRIVE.
+  logic                       n2_m_we;
+  logic [CW_D-1:0]            n2_m_wr_addr;
+  logic [BFP_MANT_W-1:0]      n2_m_wr_data;
+  logic [CW_D-1:0]            n2_m_rd_addr;
+  wire  [BFP_MANT_W-1:0]      n2_m_rd_data;
+  bfp_sdpram #(.DEPTH(D), .WIDTH(BFP_MANT_W))
+    i_n2_m_bram (.clk(clk), .rst(rst),
+                 .we(n2_m_we), .wr_addr(n2_m_wr_addr), .wr_data(n2_m_wr_data),
+                 .rd_addr(n2_m_rd_addr), .rd_data(n2_m_rd_data));
   logic signed [BFP_EXP_W -1:0] n2_e    [0:NT_D-1];
 
   logic signed [BFP_MANT_W-1:0] g_m     [0:FFN-1];
@@ -436,13 +470,12 @@ module smollm_layer_bfp #(
   logic signed [BFP_EXP_W -1:0] u_e     [0:NT_FFN-1];
   // mlp_m: was `logic signed [BFP_MANT_W-1:0] mlp_m [0:FFN-1];` (inferred
   // as ~3 kLUTRAM at FFN=2560).  Now explicit bfp_sdpram (RAMB36E1).
-  // Write side: S_SWG / S_SWG_WAIT when sg_y_valid.
-  // Read side:  S_DMV_DRIVE consumes one entry per cycle, paired with
-  //   mlp_e (LUTRAM, kept inferred — only NT_FFN=160 entries × 4b).
-  // rd_addr is driven one ahead of cnt (lookahead) so BRAM's 1-cycle
-  // read latency lines up with the existing `mv_x_m <= mlp_m_rd_data`
-  // edge timing.  S_DMV_PRIME falls through the default `rd_addr=0`
-  // case, which preloads addr=0 for the first DRIVE cycle.
+  // Write side: S_SWG / S_SWG_WAIT when sg_y_valid (single write/cycle).
+  // Read side:  S_DMV_DRIVE consumes one entry per cycle.  The bfp_sdpram's
+  // own internal output register provides the same 1-cycle latency the
+  // OLD `mv_x_m <= mlp_m[cnt]` had — mv_x_m_eff mux at the matvec instance
+  // selects mlp_m_rd_data when state==S_DMV_DRIVE.  rd_addr tracks cnt
+  // directly (no lookahead).  mlp_e stays inferred (NT_FFN=160 × 4b).
   logic                       mlp_m_we;
   logic [CW_FFN-1:0]          mlp_m_wr_addr;
   logic [BFP_MANT_W-1:0]      mlp_m_wr_data;
@@ -628,8 +661,11 @@ module smollm_layer_bfp #(
   // their source into the mv_x_m register, which is the fallback.
   // Extend this chain as further arrays migrate to bfp_sdpram.
   wire signed [BFP_MANT_W-1:0] mv_x_m_eff =
-        (state == S_DMV_DRIVE) ? mlp_m_rd_data
-                               : mv_x_m;
+        (state == S_QMV_DRIVE || state == S_KMV_DRIVE
+                              || state == S_VMV_DRIVE) ? n1_m_rd_data :
+        (state == S_GMV_DRIVE || state == S_UMV_DRIVE) ? n2_m_rd_data :
+        (state == S_DMV_DRIVE)                         ? mlp_m_rd_data :
+                                                         mv_x_m;
 
   matvec_bfp_engine #(.LANES(LANES)) i_mv (
     .clk(clk), .rst(rst | eng_rst),
@@ -1051,7 +1087,7 @@ module smollm_layer_bfp #(
 
         S_NORM1_WAIT: begin
           if (rn_y_valid) begin
-            n1_m[cnt[CW_D-1:0]] <= rn_y_m;
+            // n1_m write handled by always_comb-equivalent assigns above
             if (cnt[3:0] == 4'd0)
               n1_e[cnt[CW_D-1:0] / BFP_TILE] <= rn_y_e;
             if (cnt == D-1) begin
@@ -1086,7 +1122,7 @@ module smollm_layer_bfp #(
         end
         S_QMV_DRIVE: begin
           mv_valid <= 1'b1;
-          mv_x_m   <= n1_m[cnt[CW_D-1:0]];
+          // mv_x_m comes from n1_m_rd_data via the mv_x_m_eff mux.
           mv_x_e   <= n1_e[cnt[CW_D-1:0] / BFP_TILE];
           mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_QMV_DRAIN;
@@ -1155,7 +1191,7 @@ module smollm_layer_bfp #(
         end
         S_KMV_DRIVE: begin
           mv_valid <= 1'b1;
-          mv_x_m   <= n1_m[cnt[CW_D-1:0]];
+          // mv_x_m comes from n1_m_rd_data via the mv_x_m_eff mux.
           mv_x_e   <= n1_e[cnt[CW_D-1:0] / BFP_TILE];
           mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_KMV_DRAIN;
@@ -1218,7 +1254,7 @@ module smollm_layer_bfp #(
         end
         S_VMV_DRIVE: begin
           mv_valid <= 1'b1;
-          mv_x_m   <= n1_m[cnt[CW_D-1:0]];
+          // mv_x_m comes from n1_m_rd_data via the mv_x_m_eff mux.
           mv_x_e   <= n1_e[cnt[CW_D-1:0] / BFP_TILE];
           mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_VMV_DRAIN;
@@ -1789,7 +1825,7 @@ module smollm_layer_bfp #(
         end
         S_NORM2_WAIT: begin
           if (rn_y_valid) begin
-            n2_m[cnt[CW_D-1:0]] <= rn_y_m;
+            // n2_m write handled by always_comb-equivalent assigns above
             if (cnt[3:0] == 4'd0)
               n2_e[cnt[CW_D-1:0] / BFP_TILE] <= rn_y_e;
             if (cnt == D-1) begin
@@ -1819,7 +1855,7 @@ module smollm_layer_bfp #(
         end
         S_GMV_DRIVE: begin
           mv_valid <= 1'b1;
-          mv_x_m   <= n2_m[cnt[CW_D-1:0]];
+          // mv_x_m comes from n2_m_rd_data via the mv_x_m_eff mux.
           mv_x_e   <= n2_e[cnt[CW_D-1:0] / BFP_TILE];
           mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_GMV_DRAIN;
@@ -1882,7 +1918,7 @@ module smollm_layer_bfp #(
         end
         S_UMV_DRIVE: begin
           mv_valid <= 1'b1;
-          mv_x_m   <= n2_m[cnt[CW_D-1:0]];
+          // mv_x_m comes from n2_m_rd_data via the mv_x_m_eff mux.
           mv_x_e   <= n2_e[cnt[CW_D-1:0] / BFP_TILE];
           mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_UMV_DRAIN;
@@ -2069,7 +2105,7 @@ module smollm_layer_bfp #(
     else begin
       prev_state <= state;
       if (prev_state == 6'd3 && state == 6'd4) begin
-        $writememh("rtl_n1_m.hex", n1_m);
+        $writememh("rtl_n1_m.hex", i_n1_m_bram.mem);
         $writememh("rtl_n1_e.hex", n1_e);
       end
       if (prev_state == 6'd7 && state == 6'd8) begin
@@ -2118,7 +2154,7 @@ module smollm_layer_bfp #(
       end
       // After NORM2 (transition to S_GMV)
       if (prev_state == 6'd40 && state == 6'd41) begin
-        $writememh("rtl_n2_m.hex", n2_m);
+        $writememh("rtl_n2_m.hex", i_n2_m_bram.mem);
         $writememh("rtl_n2_e.hex", n2_e);
       end
       // After GMV
@@ -2133,7 +2169,7 @@ module smollm_layer_bfp #(
       end
       // After SWG
       if (prev_state == 6'd50 && state == 6'd51) begin
-        $writememh("rtl_mlp_m.hex", mlp_m);
+        $writememh("rtl_mlp_m.hex", i_mlp_m_bram.mem);
         $writememh("rtl_mlp_e.hex", mlp_e);
       end
       // After DMV
