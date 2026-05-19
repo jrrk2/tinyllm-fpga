@@ -502,6 +502,31 @@ module smollm_layer_bfp #(
         mv_drain_emax_f);
   end
 
+  // hin_m: 1-entry/cycle write from hidden_in_m during S_LATCH_IN.
+  // rd_addr=cnt+1 during S_NORM1 (registered) and S_RES1 (comb).
+  assign hin_m_we      = (state == S_LATCH_IN);
+  assign hin_m_wr_addr = cnt[CW_D-1:0];
+  assign hin_m_wr_data = hidden_in_m[cnt[CW_D-1:0]*BFP_MANT_W +: BFP_MANT_W];
+  always_comb begin
+    case (state)
+      S_NORM1, S_RES1: hin_m_rd_addr = cnt[CW_D-1:0] + 1'b1;
+      default:         hin_m_rd_addr = '0;
+    endcase
+  end
+
+  // h1_m: 1-entry/cycle write during S_RES1 / S_RES1_WAIT when residual
+  // output is valid (gated by rs_y_valid).  wr_addr = out_cnt.
+  // rd_addr=cnt+1 during S_NORM2 (registered) and S_RES2 (comb).
+  assign h1_m_we      = ((state == S_RES1) || (state == S_RES1_WAIT)) && rs_y_valid;
+  assign h1_m_wr_addr = out_cnt[CW_D-1:0];
+  assign h1_m_wr_data = rs_y_m;
+  always_comb begin
+    case (state)
+      S_NORM2, S_RES2: h1_m_rd_addr = cnt[CW_D-1:0] + 1'b1;
+      default:         h1_m_rd_addr = '0;
+    endcase
+  end
+
   // ---------------------------------------------------------------------------
   // kv_k_m: per-mantissa K cache.  Writes 1 entry/cycle during S_KVWR_M,
   // reads 1 entry/cycle during S_QK_DRIVE (lane 0 of mv_w_m).
@@ -595,7 +620,19 @@ module smollm_layer_bfp #(
   // ---------------------------------------------------------------------------
   // Working buffers
   // ---------------------------------------------------------------------------
-  logic signed [BFP_MANT_W-1:0] hin_m   [0:D-1];
+  // hin_m: bfp_sdpram (flat, single-port).  Write 1 entry/cycle from
+  // hidden_in_m during S_LATCH_IN.  Read combinationally into rs_a_m_c
+  // during S_RES1 (cnt+1 lookahead) and registered into rn_x_m during
+  // S_NORM1 (also cnt+1 lookahead so the OLD 1-cycle path is preserved).
+  logic                       hin_m_we;
+  logic [CW_D-1:0]            hin_m_wr_addr;
+  logic [BFP_MANT_W-1:0]      hin_m_wr_data;
+  logic [CW_D-1:0]            hin_m_rd_addr;
+  wire  [BFP_MANT_W-1:0]      hin_m_rd_data;
+  bfp_sdpram #(.DEPTH(D), .WIDTH(BFP_MANT_W))
+    i_hin_m_bram (.clk(clk), .rst(rst),
+                  .we(hin_m_we), .wr_addr(hin_m_wr_addr), .wr_data(hin_m_wr_data),
+                  .rd_addr(hin_m_rd_addr), .rd_data(hin_m_rd_data));
   logic signed [BFP_EXP_W -1:0] hin_e   [0:NT_D-1];
 
   // n1_m: explicit bfp_sdpram (same pattern as mlp_m).  Single-write
@@ -793,7 +830,19 @@ module smollm_layer_bfp #(
   );
   logic signed [BFP_EXP_W -1:0] o_e     [0:NT_D-1];
 
-  logic signed [BFP_MANT_W-1:0] h1_m    [0:D-1];
+  // h1_m: bfp_sdpram, same shape as hin_m.  Writes 1 entry/cycle during
+  // S_RES1 / S_RES1_WAIT (gated by rs_y_valid, addressed by out_cnt).
+  // Reads combinationally into rs_a_m_c during S_RES2 (cnt+1 lookahead)
+  // and registered into rn_x_m during S_NORM2 (cnt+1 lookahead).
+  logic                       h1_m_we;
+  logic [CW_D-1:0]            h1_m_wr_addr;
+  logic [BFP_MANT_W-1:0]      h1_m_wr_data;
+  logic [CW_D-1:0]            h1_m_rd_addr;
+  wire  [BFP_MANT_W-1:0]      h1_m_rd_data;
+  bfp_sdpram #(.DEPTH(D), .WIDTH(BFP_MANT_W))
+    i_h1_m_bram (.clk(clk), .rst(rst),
+                 .we(h1_m_we), .wr_addr(h1_m_wr_addr), .wr_data(h1_m_wr_data),
+                 .rd_addr(h1_m_rd_addr), .rd_data(h1_m_rd_data));
   logic signed [BFP_EXP_W -1:0] h1_e    [0:NT_D-1];
 
   // n2_m: explicit bfp_sdpram (same pattern as n1_m / mlp_m).  Single-
@@ -1197,14 +1246,14 @@ module smollm_layer_bfp #(
     rs_valid_c = 1'b0;
     rs_last_c  = 1'b0;
     if (rs_drive_res1) begin
-      rs_a_m_c   = hin_m[cnt[CW_D-1:0]];
+      rs_a_m_c   = hin_m_rd_data;
       rs_a_e_c   = hin_e[cnt[CW_D-1:0] / BFP_TILE];
       rs_b_m_c   = o_m_rd_data;
       rs_b_e_c   = o_e  [cnt[CW_D-1:0] / BFP_TILE];
       rs_valid_c = rs_in_ready && (cnt < D);
       rs_last_c  = rs_in_ready && (cnt == D-1);
     end else if (rs_drive_res2) begin
-      rs_a_m_c   = h1_m[cnt[CW_D-1:0]];
+      rs_a_m_c   = h1_m_rd_data;
       rs_a_e_c   = h1_e[cnt[CW_D-1:0] / BFP_TILE];
       rs_b_m_c   = d_m_rd_data;
       rs_b_e_c   = d_e [cnt[CW_D-1:0] / BFP_TILE];
@@ -1461,8 +1510,9 @@ module smollm_layer_bfp #(
         end
 
         // Copy hidden_in bus into BRAM-style arrays one element/cycle.
+        // hin_m mantissa write handled by hin_m_we above; hin_e is still
+        // an inferred small (NT_D × 8b) LUTRAM array.
         S_LATCH_IN: begin
-          hin_m[cnt[CW_D-1:0]] <= hidden_in_m[cnt[CW_D-1:0]*BFP_MANT_W +: BFP_MANT_W];
           if (cnt < NT_D)
             hin_e[cnt[CW_D-1:0]] <= hidden_in_e[cnt[CW_D-1:0]*BFP_EXP_W +: BFP_EXP_W];
           if (cnt == D-1) begin
@@ -1477,7 +1527,7 @@ module smollm_layer_bfp #(
         // -------------------------------------------------------------------
         S_NORM1: begin
           rn_valid <= 1'b1;
-          rn_x_m   <= hin_m[cnt[CW_D-1:0]];
+          rn_x_m   <= hin_m_rd_data;
           rn_x_e   <= hin_e[cnt[CW_D-1:0] / BFP_TILE];
           rn_g_m   <= rom_G1_m[layer_idx * D    + cnt[CW_D-1:0]];
           rn_g_e   <= rom_G1_e[layer_idx * NT_D + cnt[CW_D-1:0] / BFP_TILE];
@@ -2154,21 +2204,21 @@ module smollm_layer_bfp #(
         // ===================================================================
         S_RES1: begin
           // (comb drive is via rs_drive_res1 / cnt above)
+          // h1_m mantissa write handled by h1_m_we above.
           if (rs_in_ready && rs_valid_c) begin
             if (cnt == D-1) state <= S_RES1_WAIT;
             else            cnt <= cnt + 1'b1;
           end
           // Capture outputs concurrently — engine emits during S_LOAD gaps.
           if (rs_y_valid) begin
-            h1_m[out_cnt[CW_D-1:0]] <= rs_y_m;
             if (out_cnt[3:0] == 4'd0)
               h1_e[out_cnt[CW_D-1:0] / BFP_TILE] <= rs_y_e;
             out_cnt <= out_cnt + 1'b1;
           end
         end
         S_RES1_WAIT: begin
+          // h1_m mantissa write handled by h1_m_we above.
           if (rs_y_valid) begin
-            h1_m[out_cnt[CW_D-1:0]] <= rs_y_m;
             if (out_cnt[3:0] == 4'd0)
               h1_e[out_cnt[CW_D-1:0] / BFP_TILE] <= rs_y_e;
             out_cnt <= out_cnt + 1'b1;
@@ -2187,7 +2237,7 @@ module smollm_layer_bfp #(
         // ===================================================================
         S_NORM2: begin
           rn_valid <= 1'b1;
-          rn_x_m   <= h1_m[cnt[CW_D-1:0]];
+          rn_x_m   <= h1_m_rd_data;
           rn_x_e   <= h1_e[cnt[CW_D-1:0] / BFP_TILE];
           rn_g_m   <= rom_G2_m[layer_idx * D    + cnt[CW_D-1:0]];
           rn_g_e   <= rom_G2_e[layer_idx * NT_D + cnt[CW_D-1:0] / BFP_TILE];
@@ -2510,7 +2560,7 @@ module smollm_layer_bfp #(
       end
       // After RES1 (transition to S_NORM2)
       if (prev_state == 6'd38 && state == 6'd39) begin
-        $writememh("rtl_h1_m.hex", h1_m);
+        $writememh("rtl_h1_m.hex", i_h1_m_bram.mem);
         $writememh("rtl_h1_e.hex", h1_e);
       end
       // After NORM2 (transition to S_GMV)
