@@ -87,8 +87,10 @@
 
 // Total DDR3 image size in 128-bit entries (one entry per mock_axi_slave
 // mem[] slot).  Conservatively rounded up — extra entries init to 0.
-// 24 Mi × 16 B = 384 MB
-`define LBFP_DDR3_ENTRIES   (24 * 1024 * 1024)
+// 64 Mi × 16 B = 1024 MB.  Bumped from 24 Mi because smollm360 image is
+// ~860 MB (53 Mi entries) — overshot the previous budget designed for
+// smollm135's ~320 MB image.
+`define LBFP_DDR3_ENTRIES   (64 * 1024 * 1024)
 
 // matvec_id encoding consumed by weight_streamer_bfp_mt.sv:
 //   0=Q, 1=K, 2=V, 3=O, 4=G, 5=U, 6=DN

@@ -285,26 +285,20 @@ module smollm_layer_bfp #(
   end
 
   // ---------------------------------------------------------------------------
-  // mlp_m BRAM ports: write during S_SWG / S_SWG_WAIT (when sg_y_valid),
-  // read during S_DMV_DRIVE.  rd_addr = cnt + 1 looks ahead by one to
-  // hide BRAM's 1-cycle read latency; default rd_addr=0 in other states
-  // means S_DMV_PRIME (which precedes S_DMV_DRIVE) preloads the first
-  // entry, so the very first DRIVE cycle's rd_data is mlp_m[0].
+  // mlp_m BRAM ports — pure wire drives (no FSM modification needed).
+  // - rd_addr tracks cnt directly.  The bfp_sdpram's own internal output
+  //   register provides the 1-cycle latency that the OLD `mv_x_m <=
+  //   mlp_m[cnt]` had, so mlp_m_rd_data at cycle T = mlp_m[cnt at T-1].
+  //   Matvec is fed via the mv_x_m_eff mux below, which selects rd_data
+  //   in S_DMV_DRIVE and the existing mv_x_m register elsewhere.  No
+  //   extra register, no lookahead.
+  // - we asserts only in the write states; outside those states the BRAM
+  //   is read-only.  wr_addr / wr_data are valid when we is high.
   // ---------------------------------------------------------------------------
-  always_comb begin
-    mlp_m_we      = 1'b0;
-    mlp_m_wr_addr = '0;
-    mlp_m_wr_data = '0;
-    mlp_m_rd_addr = '0;
-    if ((state == S_SWG || state == S_SWG_WAIT) && sg_y_valid) begin
-      mlp_m_we      = 1'b1;
-      mlp_m_wr_addr = out_cnt[CW_FFN-1:0];
-      mlp_m_wr_data = sg_y_m;
-    end
-    if (state == S_DMV_DRIVE) begin
-      mlp_m_rd_addr = cnt[CW_FFN-1:0] + 1'b1;
-    end
-  end
+  assign mlp_m_we      = (state == S_SWG || state == S_SWG_WAIT) && sg_y_valid;
+  assign mlp_m_wr_addr = out_cnt[CW_FFN-1:0];
+  assign mlp_m_wr_data = sg_y_m;
+  assign mlp_m_rd_addr = cnt[CW_FFN-1:0];
 
   // ---------------------------------------------------------------------------
   // kv_k_m: per-mantissa K cache.  Writes 1 entry/cycle during S_KVWR_M,
@@ -627,10 +621,20 @@ module smollm_layer_bfp #(
       weight_hash <= {weight_hash[30:0], weight_hash[31]} ^ mv_w_xor;
   end
 
+  // mv_x_m_eff mux — for DRIVE states whose activation source has been
+  // converted to a bfp_sdpram instance, route the BRAM's registered
+  // output directly (the BRAM provides the same 1-cycle latency the
+  // OLD `mv_x_m <= arr[cnt]` had).  Other DRIVE states still write
+  // their source into the mv_x_m register, which is the fallback.
+  // Extend this chain as further arrays migrate to bfp_sdpram.
+  wire signed [BFP_MANT_W-1:0] mv_x_m_eff =
+        (state == S_DMV_DRIVE) ? mlp_m_rd_data
+                               : mv_x_m;
+
   matvec_bfp_engine #(.LANES(LANES)) i_mv (
     .clk(clk), .rst(rst | eng_rst),
     .start_matvec(mv_start),
-    .in_x_mant(mv_x_m), .in_x_exp(mv_x_e),
+    .in_x_mant(mv_x_m_eff), .in_x_exp(mv_x_e),
     .in_valid(mv_valid), .last_elem(mv_last),
     .w_mant(mv_w_m_eff), .w_exp(mv_w_e_eff),
     .out_mant(mv_out_m), .out_exp(mv_out_e), .out_valid(mv_out_valid)
@@ -1969,7 +1973,10 @@ module smollm_layer_bfp #(
         end
         S_DMV_DRIVE: begin
           mv_valid <= 1'b1;
-          mv_x_m   <= mlp_m_rd_data;   // bfp_sdpram read; rd_addr=cnt+1 in always_comb
+          // mv_x_m no longer written here — mlp_m's bfp_sdpram output
+          // register supplies it through the mv_x_m_eff mux at the
+          // matvec instance.  Same edge-timing as the OLD inferred
+          // `mv_x_m <= mlp_m[cnt]` (1-cycle latency, no lookahead).
           mv_x_e   <= mlp_e[cnt[CW_FFN-1:0] / BFP_TILE];
           mv_last  <= (cnt == FFN-1);
           if (cnt == FFN-1) state <= S_DMV_DRAIN;

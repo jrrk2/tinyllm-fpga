@@ -590,6 +590,27 @@ bfp-layer: obj_dir/Vtb_smollm_layer_bfp
 	@echo "=== running smollm_layer_bfp sim ==="
 	@./obj_dir/Vtb_smollm_layer_bfp
 
+# ---------------------- bfp-sdpram-compare ----------------------
+# Constrained-random equivalence check between the inferred-array RAM
+# pattern (the OLD style smollm_layer_bfp used for mlp_m etc.) and
+# bfp_sdpram.  Drives identical {we,wr_addr,wr_data,rd_addr} stimulus
+# into both and asserts cycle-by-cycle bit equality.  Fast (~1 s) and
+# self-contained — doesn't need the smollm weight bake or DDR3 hex.
+bfp-sdpram-compare: obj_dir/Vtb_bfp_sdpram_compare
+	@echo "=== running tb_bfp_sdpram_compare ==="
+	@./obj_dir/Vtb_bfp_sdpram_compare
+
+obj_dir/Vtb_bfp_sdpram_compare: tb_bfp_sdpram_compare.sv tb_bfp_sdpram_compare.cpp \
+                                $(SMOLLM_SRC)/bfp_sdpram.sv
+	$(VERILATOR) -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-fatal -cc --exe --build \
+	    -j 0 --x-assign 0 --x-initial 0 \
+	    -CFLAGS "-O2 -std=c++17" \
+	    --top-module tb_bfp_sdpram_compare \
+	    -I$(SMOLLM_SRC) \
+	    tb_bfp_sdpram_compare.sv tb_bfp_sdpram_compare.cpp \
+	    $(SMOLLM_SRC)/bfp_sdpram.sv \
+	    -o Vtb_bfp_sdpram_compare
+
 obj_dir/Vtb_smollm_layer_bfp: tb_smollm_layer_bfp.sv tb_smollm_layer_bfp.cpp \
                               $(SMOLLM_SRC)/smollm_layer_bfp.sv \
                               $(SMOLLM_SRC)/matvec_bfp_engine.sv \
