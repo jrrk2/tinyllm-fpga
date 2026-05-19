@@ -1111,13 +1111,28 @@ module smollm_layer_bfp #(
   // OLD `mv_x_m <= arr[cnt]` had).  Other DRIVE states still write
   // their source into the mv_x_m register, which is the fallback.
   // Extend this chain as further arrays migrate to bfp_sdpram.
-  wire signed [BFP_MANT_W-1:0] mv_x_m_eff =
-        (state == S_QMV_DRIVE || state == S_KMV_DRIVE
-                              || state == S_VMV_DRIVE) ? n1_m_rd_data :
-        (state == S_GMV_DRIVE || state == S_UMV_DRIVE) ? n2_m_rd_data :
-        (state == S_DMV_DRIVE)                         ? mlp_m_rd_data :
-        (state == S_OMV_DRIVE)                         ? attn_m_rd_data :
-                                                         mv_x_m;
+  // DRIVE + matching DRAIN both route their array's BRAM rd_data:
+  // matvec_bfp_engine consumes the LAST element on the cycle last_elem
+  // samples high, which is the FIRST cycle of S_*_DRAIN (state has
+  // already advanced from DRIVE).  Since the conversion removed
+  // `mv_x_m <= arr[cnt]` from the DRIVE bodies, a mux that misses the
+  // DRAIN state would deliver a stale mv_x_m as element D-1.
+  // cnt is not reset on DRIVE→DRAIN so the BRAM rd_addr still points at
+  // D-1 and rd_data carries arr[D-1] for the DRAIN first cycle.
+  // Other states fall back to mv_x_m (the still-registered path used
+  // by S_QK_DRIVE / S_AV_DRIVE etc).
+  logic signed [BFP_MANT_W-1:0] mv_x_m_eff;
+  always_comb begin
+    unique case (state)
+      S_QMV_DRIVE, S_KMV_DRIVE, S_VMV_DRIVE,
+      S_QMV_DRAIN, S_KMV_DRAIN, S_VMV_DRAIN: mv_x_m_eff = n1_m_rd_data;
+      S_GMV_DRIVE, S_UMV_DRIVE,
+      S_GMV_DRAIN, S_UMV_DRAIN:              mv_x_m_eff = n2_m_rd_data;
+      S_DMV_DRIVE, S_DMV_DRAIN:              mv_x_m_eff = mlp_m_rd_data;
+      S_OMV_DRIVE, S_OMV_DRAIN:              mv_x_m_eff = attn_m_rd_data;
+      default:                               mv_x_m_eff = mv_x_m;
+    endcase
+  end
 
   matvec_bfp_engine #(.LANES(LANES)) i_mv (
     .clk(clk), .rst(rst | eng_rst),
