@@ -478,6 +478,30 @@ module smollm_layer_bfp #(
         mv_drain_emax_f);
   end
 
+  // g_m / u_m: write side = S_GMV_REQ / S_UMV_REQ matvec drain.
+  // Read side: comb read in always_comb (sg_g_m_c / sg_u_m_c during S_SWG).
+  // rd_addr = cnt+1 during S_SWG.
+  assign g_m_we           = (state == S_GMV_REQ);
+  assign g_m_wr_addr_tile = ($clog2((FFN+LANES-1)/LANES))'(chunk);
+  assign g_m_rd_addr      = (state == S_SWG) ? cnt[CW_FFN-1:0] + 1'b1 : '0;
+  assign u_m_we           = (state == S_UMV_REQ);
+  assign u_m_wr_addr_tile = ($clog2((FFN+LANES-1)/LANES))'(chunk);
+  assign u_m_rd_addr      = (state == S_SWG) ? cnt[CW_FFN-1:0] + 1'b1 : '0;
+  for (genvar pack_ii = 0; pack_ii < LANES; pack_ii++) begin : g_g_m_pack
+    assign g_m_wr_data_packed[pack_ii*BFP_MANT_W +: BFP_MANT_W] =
+      requant_mant(
+        mv_out_m_drain_r[pack_ii*BFP_MANT_W +: BFP_MANT_W],
+        mv_out_e_drain_r[pack_ii*BFP_EXP_W  +: BFP_EXP_W ],
+        mv_drain_emax_f);
+  end
+  for (genvar pack_ii = 0; pack_ii < LANES; pack_ii++) begin : g_u_m_pack
+    assign u_m_wr_data_packed[pack_ii*BFP_MANT_W +: BFP_MANT_W] =
+      requant_mant(
+        mv_out_m_drain_r[pack_ii*BFP_MANT_W +: BFP_MANT_W],
+        mv_out_e_drain_r[pack_ii*BFP_EXP_W  +: BFP_EXP_W ],
+        mv_drain_emax_f);
+  end
+
   // ---------------------------------------------------------------------------
   // kv_k_m: per-mantissa K cache.  Writes 1 entry/cycle during S_KVWR_M,
   // reads 1 entry/cycle during S_QK_DRIVE (lane 0 of mv_w_m).
@@ -785,9 +809,47 @@ module smollm_layer_bfp #(
                  .rd_addr(n2_m_rd_addr), .rd_data(n2_m_rd_data));
   logic signed [BFP_EXP_W -1:0] n2_e    [0:NT_D-1];
 
-  logic signed [BFP_MANT_W-1:0] g_m     [0:FFN-1];
+  // g_m / u_m: packed bfp_sdpram, mirrors o_m / d_m.  Single LANES-parallel
+  // write (S_GMV_REQ / S_UMV_REQ) and single combinational read in the
+  // always_comb that drives the SwiGLU engine.  Use cnt+1 lookahead during
+  // S_SWG so g_m_rd_data / u_m_rd_data line up with the consumer.
+  logic                            g_m_we;
+  logic [$clog2((FFN+LANES-1)/LANES)-1:0] g_m_wr_addr_tile;
+  logic [LANES*BFP_MANT_W-1:0]     g_m_wr_data_packed;
+  logic [CW_FFN-1:0]               g_m_rd_addr;
+  wire  [BFP_MANT_W-1:0]           g_m_rd_data;
+  bfp_sdpram_packed #(
+    .LANES         (LANES),
+    .LOGICAL_DEPTH (FFN),
+    .WIDTH         (BFP_MANT_W)
+  ) i_g_m_bram (
+    .clk            (clk),
+    .rst            (rst),
+    .we             (g_m_we),
+    .wr_addr_tile   (g_m_wr_addr_tile),
+    .wr_data_packed (g_m_wr_data_packed),
+    .rd_addr        (g_m_rd_addr),
+    .rd_data        (g_m_rd_data)
+  );
   logic signed [BFP_EXP_W -1:0] g_e     [0:NT_FFN-1];
-  logic signed [BFP_MANT_W-1:0] u_m     [0:FFN-1];
+  logic                            u_m_we;
+  logic [$clog2((FFN+LANES-1)/LANES)-1:0] u_m_wr_addr_tile;
+  logic [LANES*BFP_MANT_W-1:0]     u_m_wr_data_packed;
+  logic [CW_FFN-1:0]               u_m_rd_addr;
+  wire  [BFP_MANT_W-1:0]           u_m_rd_data;
+  bfp_sdpram_packed #(
+    .LANES         (LANES),
+    .LOGICAL_DEPTH (FFN),
+    .WIDTH         (BFP_MANT_W)
+  ) i_u_m_bram (
+    .clk            (clk),
+    .rst            (rst),
+    .we             (u_m_we),
+    .wr_addr_tile   (u_m_wr_addr_tile),
+    .wr_data_packed (u_m_wr_data_packed),
+    .rd_addr        (u_m_rd_addr),
+    .rd_data        (u_m_rd_data)
+  );
   logic signed [BFP_EXP_W -1:0] u_e     [0:NT_FFN-1];
   // mlp_m: was `logic signed [BFP_MANT_W-1:0] mlp_m [0:FFN-1];` (inferred
   // as ~3 kLUTRAM at FFN=2560).  Now explicit bfp_sdpram (RAMB36E1).
@@ -1069,9 +1131,9 @@ module smollm_layer_bfp #(
     sg_valid_c = 1'b0;
     sg_last_c  = 1'b0;
     if (sg_drive) begin
-      sg_g_m_c   = g_m[cnt[CW_FFN-1:0]];
+      sg_g_m_c   = g_m_rd_data;
       sg_g_e_c   = g_e[cnt[CW_FFN-1:0] / BFP_TILE];
-      sg_u_m_c   = u_m[cnt[CW_FFN-1:0]];
+      sg_u_m_c   = u_m_rd_data;
       sg_u_e_c   = u_e[cnt[CW_FFN-1:0] / BFP_TILE];
       // NB: gate in_valid by in_ready (mirrors the standalone testbench).
       // This makes the 1-cycle valid_r pipeline inside swiglu_bfp line up
@@ -2189,13 +2251,9 @@ module smollm_layer_bfp #(
           state <= S_GMV_REQ;
         end
         S_GMV_REQ: begin : gmv_pipeB
+          // g_m LANES-parallel write driven by g_m_we + g_g_m_pack above.
           automatic logic signed [BFP_EXP_W-1:0] emax_f;
           emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
-          for (ii = 0; ii < LANES; ii++)
-            g_m[chunk * LANES + ii] <= requant_mant(
-              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
-              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
-              emax_f);
           g_e[chunk] <= emax_f;
           state <= S_GMV_NEXT;
         end
@@ -2252,13 +2310,9 @@ module smollm_layer_bfp #(
           state <= S_UMV_REQ;
         end
         S_UMV_REQ: begin : umv_pipeB
+          // u_m LANES-parallel write driven by u_m_we + g_u_m_pack above.
           automatic logic signed [BFP_EXP_W-1:0] emax_f;
           emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
-          for (ii = 0; ii < LANES; ii++)
-            u_m[chunk * LANES + ii] <= requant_mant(
-              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
-              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
-              emax_f);
           u_e[chunk] <= emax_f;
           state <= S_UMV_NEXT;
         end
@@ -2466,12 +2520,12 @@ module smollm_layer_bfp #(
       end
       // After GMV
       if (prev_state == 6'd44 && state == 6'd45) begin
-        $writememh("rtl_g_m.hex", g_m);
+        // g_m packed in i_g_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_g_e.hex", g_e);
       end
       // After UMV
       if (prev_state == 6'd48 && state == 6'd49) begin
-        $writememh("rtl_u_m.hex", u_m);
+        // u_m packed in i_u_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_u_e.hex", u_e);
       end
       // After SWG
