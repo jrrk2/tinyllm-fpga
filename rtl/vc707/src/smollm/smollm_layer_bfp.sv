@@ -2636,7 +2636,16 @@ module smollm_layer_bfp #(
       end
       // Post-RoPE requant — both Q and K finished, transitioning to KVWR.
       if (prev_state == S_ROPEK_RQ_B && state == S_KVWR_M) begin
-        // Post-rope-requant Q + K — q_m / k_m packed in BRAM, dump suppressed.
+        for (int t = 0; t < (D + LANES - 1) / LANES; t++)
+          for (int l = 0; l < LANES; l++)
+            sim_q_m_flat[t*LANES + l] =
+                i_q_m_bram.i_word_ram.mem[t][l*BFP_MANT_W +: BFP_MANT_W];
+        for (int t = 0; t < (H_KV*HD + LANES - 1) / LANES; t++)
+          for (int l = 0; l < LANES; l++)
+            sim_k_m_flat[t*LANES + l] =
+                i_k_m_bram.i_word_ram.mem[t][l*BFP_MANT_W +: BFP_MANT_W];
+        $writememh("rtl_q_m.hex", sim_q_m_flat);
+        $writememh("rtl_k_m.hex", sim_k_m_flat);
         $writememh("rtl_q_e.hex", q_e);
         $writememh("rtl_k_e.hex", k_e);
       end
