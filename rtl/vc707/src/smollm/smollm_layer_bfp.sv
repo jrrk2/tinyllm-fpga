@@ -162,12 +162,25 @@ module smollm_layer_bfp #(
   // In production these ROMs are filled at boot via the wr_kind port
   // (host upload).  The bfp-layer testbench leaves wr_en tied to 0, so
   // without this init the RMSNorm gammas would all be zero and every
-  // matvec would receive zero activations regardless of weights.
+  // matvec would receive zero activations regardless of weights.  We
+  // also seed the KV cache: kv_k_m / kv_k_e / kv_v_e are direct
+  // single-element-per-line .hex matches for the bfp_sdpram mem arrays;
+  // kv_v_chk stores LANES-packed mantissas so we load a flat shadow
+  // and pack lane-by-lane below.
+  logic [BFP_MANT_W-1:0] sim_vinit_flat [0:NL*MAX_CTX*H_KV*HD-1];
   initial begin
     $readmemh("../generated/lbfp_G1_m.hex", rom_G1_m);
     $readmemh("../generated/lbfp_G1_e.hex", rom_G1_e);
     $readmemh("../generated/lbfp_G2_m.hex", rom_G2_m);
     $readmemh("../generated/lbfp_G2_e.hex", rom_G2_e);
+    $readmemh("../generated/lbfp_K_INIT_m.hex", i_kv_k_m_bram.mem);
+    $readmemh("../generated/lbfp_K_INIT_e.hex", i_kv_k_e_bram.mem);
+    $readmemh("../generated/lbfp_V_INIT_e.hex", i_kv_v_e_bram.mem);
+    $readmemh("../generated/lbfp_V_INIT_m.hex", sim_vinit_flat);
+    for (int e = 0; e < NL*MAX_CTX*KVV_CHUNKS_PER_KVPOS; e++)
+      for (int l = 0; l < LANES; l++)
+        i_kv_v_chk_bram.mem[e][l*BFP_MANT_W +: BFP_MANT_W] =
+            sim_vinit_flat[e*LANES + l];
   end
 `endif
 
