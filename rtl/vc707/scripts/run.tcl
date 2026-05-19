@@ -172,6 +172,7 @@ read_verilog -sv { \
     src/smollm/residual_bfp.sv \
     src/smollm/bfp_sdpram.sv \
     src/smollm/bfp_sdpram_striped.sv \
+    src/smollm/bfp_sdpram_packed.sv \
     src/smollm/weight_streamer_bfp_mt.sv \
     src/smollm/smollm_layer_bfp.sv \
     src/smollm/embed_lookup_bfp.sv \

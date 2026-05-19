@@ -328,6 +328,27 @@ module smollm_layer_bfp #(
   assign k_rot_m_wr_data = rp_y_m;
   assign k_rot_m_rd_addr = cnt[$clog2(NT_KV+1)-1:0];
 
+  // attn_m: packed bfp_sdpram (LANES entries per BRAM word).
+  // Write side: S_AV_REQ pack-and-store of the 16 requant_mant outputs.
+  //   Same combinational requant_mant calls as the OLD for-loop, just
+  //   assembled into the packed wr_data bus instead of writing the
+  //   inferred array.  emax_f reused combinationally.
+  // Read side:  S_OMV_DRIVE single-element read; rd_addr = cnt, output
+  //   feeds mv_x_m_eff mux.
+  assign attn_m_we           = (state == S_AV_REQ);
+  assign attn_m_wr_addr_tile = ($clog2((D+LANES-1)/LANES))'(
+                                  (av_row_base + chunk * LANES) / LANES);
+  assign attn_m_rd_addr      = cnt[CW_D-1:0];
+  for (genvar pack_ii = 0; pack_ii < LANES; pack_ii++) begin : g_attn_m_pack
+    wire signed [BFP_EXP_W-1:0] av_emax_f_pack =
+        (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
+    assign attn_m_wr_data_packed[pack_ii*BFP_MANT_W +: BFP_MANT_W] =
+      requant_mant(
+        mv_out_m_drain_r[pack_ii*BFP_MANT_W +: BFP_MANT_W],
+        mv_out_e_drain_r[pack_ii*BFP_EXP_W  +: BFP_EXP_W ],
+        av_emax_f_pack);
+  end
+
   // ---------------------------------------------------------------------------
   // kv_k_m: per-mantissa K cache.  Writes 1 entry/cycle during S_KVWR_M,
   // reads 1 entry/cycle during S_QK_DRIVE (lane 0 of mv_w_m).
@@ -500,7 +521,28 @@ module smollm_layer_bfp #(
   logic signed [BFP_MANT_W-1:0] probs_m   [0:MAX_CTX-1];
   logic signed [BFP_EXP_W -1:0] probs_e_shared;
 
-  logic signed [BFP_MANT_W-1:0] attn_m  [0:D-1];
+  // attn_m: packed bfp_sdpram (LANES entries per BRAM word).
+  // Write: S_AV_REQ, LANES-parallel for-loop → packed_wr_data combinational.
+  // Read:  S_OMV_DRIVE, single-element `mv_x_m <= attn_m[cnt]` → wire from
+  //        packed wrapper's rd_data (1-cycle latency, lane-mux is internal).
+  logic                            attn_m_we;
+  logic [$clog2((D+LANES-1)/LANES)-1:0] attn_m_wr_addr_tile;
+  logic [LANES*BFP_MANT_W-1:0]     attn_m_wr_data_packed;
+  logic [CW_D-1:0]                 attn_m_rd_addr;
+  wire  [BFP_MANT_W-1:0]           attn_m_rd_data;
+  bfp_sdpram_packed #(
+    .LANES         (LANES),
+    .LOGICAL_DEPTH (D),
+    .WIDTH         (BFP_MANT_W)
+  ) i_attn_m_bram (
+    .clk            (clk),
+    .rst            (rst),
+    .we             (attn_m_we),
+    .wr_addr_tile   (attn_m_wr_addr_tile),
+    .wr_data_packed (attn_m_wr_data_packed),
+    .rd_addr        (attn_m_rd_addr),
+    .rd_data        (attn_m_rd_data)
+  );
   logic signed [BFP_EXP_W -1:0] attn_e  [0:NT_D-1];
 
   logic signed [BFP_MANT_W-1:0] o_m     [0:D-1];
@@ -723,6 +765,7 @@ module smollm_layer_bfp #(
                               || state == S_VMV_DRIVE) ? n1_m_rd_data :
         (state == S_GMV_DRIVE || state == S_UMV_DRIVE) ? n2_m_rd_data :
         (state == S_DMV_DRIVE)                         ? mlp_m_rd_data :
+        (state == S_OMV_DRIVE)                         ? attn_m_rd_data :
                                                          mv_x_m;
 
   matvec_bfp_engine #(.LANES(LANES)) i_mv (
@@ -1737,11 +1780,9 @@ module smollm_layer_bfp #(
         S_AV_REQ: begin : av_pipeB
           automatic logic signed [BFP_EXP_W-1:0] emax_f;
           emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
-          for (ii = 0; ii < LANES; ii++)
-            attn_m[av_row_base + chunk * LANES + ii] <= requant_mant(
-              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
-              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
-              emax_f);
+          // attn_m's LANES-parallel write handled by g_attn_m_pack +
+          // attn_m_we above (packed bfp_sdpram).  Only the exponent
+          // companion attn_e (LUTRAM) is still updated here.
           attn_e[(av_row_base + chunk * LANES) / BFP_TILE] <= emax_f;
           state <= S_AV_NEXT;
         end
@@ -1785,7 +1826,7 @@ module smollm_layer_bfp #(
         end
         S_OMV_DRIVE: begin
           mv_valid <= 1'b1;
-          mv_x_m   <= attn_m[cnt[CW_D-1:0]];
+          // mv_x_m comes from attn_m_rd_data via the mv_x_m_eff mux.
           mv_x_e   <= attn_e[cnt[CW_D-1:0] / BFP_TILE];
           mv_last  <= (cnt == D-1);
           if (cnt == D-1) state <= S_OMV_DRAIN;
