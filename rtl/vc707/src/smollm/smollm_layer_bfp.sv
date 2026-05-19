@@ -181,6 +181,29 @@ module smollm_layer_bfp #(
       for (int l = 0; l < LANES; l++)
         i_kv_v_chk_bram.mem[e][l*BFP_MANT_W +: BFP_MANT_W] =
             sim_vinit_flat[e*LANES + l];
+    $display("[lay] kv_k_m[0]=%h kv_k_m[1]=%h kv_k_m[63]=%h",
+             i_kv_k_m_bram.mem[0], i_kv_k_m_bram.mem[1], i_kv_k_m_bram.mem[63]);
+    $display("[lay] kv_k_e[0]=%h kv_v_e[0]=%h",
+             i_kv_k_e_bram.mem[0], i_kv_v_e_bram.mem[0]);
+    $display("[lay] kv_v_chk[0]=%h", i_kv_v_chk_bram.mem[0]);
+  end
+
+  // Snapshot q_m's packed tiles after the Q matvec + RoPE finish, so we
+  // can see whether Q is being computed/stored correctly even though we
+  // no longer dump q_m via $writememh (packed BRAM).
+  always_ff @(posedge clk) begin
+    if (state == S_ROPEQ_RQ_B && cnt == NT_D - 1) begin
+      $display("[lay] post-RoPE q_m tiles: t0=%h t1=%h t2=%h t3=%h",
+               i_q_m_bram.i_word_ram.mem[0],
+               i_q_m_bram.i_word_ram.mem[1],
+               i_q_m_bram.i_word_ram.mem[2],
+               i_q_m_bram.i_word_ram.mem[3]);
+      $display("[lay] post-RoPE k_m tiles: t0=%h t1=%h t2=%h t3=%h",
+               i_k_m_bram.i_word_ram.mem[0],
+               i_k_m_bram.i_word_ram.mem[1],
+               i_k_m_bram.i_word_ram.mem[2],
+               i_k_m_bram.i_word_ram.mem[3]);
+    end
   end
 `endif
 
@@ -379,7 +402,14 @@ module smollm_layer_bfp #(
   // mv_out_*_drain_r); read is combinational with cnt+1 lookahead.
   assign o_m_we           = (state == S_OMV_REQ);
   assign o_m_wr_addr_tile = ($clog2((D+LANES-1)/LANES))'(chunk);
-  assign o_m_rd_addr      = (state == S_RES1) ? cnt[CW_D-1:0] + 1'b1 : '0;
+  // Gate the +1 lookahead on rs_in_ready: cnt only advances when the
+  // residual is ready (in_ready=1 && rs_valid_c).  When residual is
+  // stalled (e.g. starting up from IDLE→LOAD, or during S_EMIT cycles),
+  // cnt stays put and we must keep rd_addr at cnt so the BRAM doesn't
+  // pre-fetch the next element and feed it as the stalled-cycle input.
+  assign o_m_rd_addr      = (state == S_RES1)
+                              ? cnt[CW_D-1:0] + {{(CW_D-1){1'b0}}, rs_in_ready}
+                              : '0;
   for (genvar pack_ii = 0; pack_ii < LANES; pack_ii++) begin : g_o_m_pack
     assign o_m_wr_data_packed[pack_ii*BFP_MANT_W +: BFP_MANT_W] =
       requant_mant(
@@ -391,7 +421,9 @@ module smollm_layer_bfp #(
   // d_m: same pattern, read in S_RES2.
   assign d_m_we           = (state == S_DMV_REQ);
   assign d_m_wr_addr_tile = ($clog2((D+LANES-1)/LANES))'(chunk);
-  assign d_m_rd_addr      = (state == S_RES2) ? cnt[CW_D-1:0] + 1'b1 : '0;
+  assign d_m_rd_addr      = (state == S_RES2)
+                              ? cnt[CW_D-1:0] + {{(CW_D-1){1'b0}}, rs_in_ready}
+                              : '0;
   for (genvar pack_ii = 0; pack_ii < LANES; pack_ii++) begin : g_d_m_pack
     assign d_m_wr_data_packed[pack_ii*BFP_MANT_W +: BFP_MANT_W] =
       requant_mant(
@@ -509,10 +541,18 @@ module smollm_layer_bfp #(
   // rd_addr = cnt+1 during S_SWG.
   assign g_m_we           = (state == S_GMV_REQ);
   assign g_m_wr_addr_tile = ($clog2((FFN+LANES-1)/LANES))'(chunk);
-  assign g_m_rd_addr      = (state == S_SWG) ? cnt[CW_FFN-1:0] + 1'b1 : '0;
+  // See hin_m/o_m rd_addr above — same gated-lookahead pattern: only
+  // pre-fetch when SwiGLU is ready to advance cnt next cycle.
+  assign g_m_rd_addr      = (state == S_SWG)
+                              ? cnt[CW_FFN-1:0]
+                                + {{(CW_FFN-1){1'b0}}, sg_in_ready}
+                              : '0;
   assign u_m_we           = (state == S_UMV_REQ);
   assign u_m_wr_addr_tile = ($clog2((FFN+LANES-1)/LANES))'(chunk);
-  assign u_m_rd_addr      = (state == S_SWG) ? cnt[CW_FFN-1:0] + 1'b1 : '0;
+  assign u_m_rd_addr      = (state == S_SWG)
+                              ? cnt[CW_FFN-1:0]
+                                + {{(CW_FFN-1){1'b0}}, sg_in_ready}
+                              : '0;
   for (genvar pack_ii = 0; pack_ii < LANES; pack_ii++) begin : g_g_m_pack
     assign g_m_wr_data_packed[pack_ii*BFP_MANT_W +: BFP_MANT_W] =
       requant_mant(
@@ -535,8 +575,10 @@ module smollm_layer_bfp #(
   assign hin_m_wr_data = hidden_in_m[cnt[CW_D-1:0]*BFP_MANT_W +: BFP_MANT_W];
   always_comb begin
     case (state)
-      S_NORM1, S_RES1: hin_m_rd_addr = cnt[CW_D-1:0] + 1'b1;
-      default:         hin_m_rd_addr = '0;
+      S_NORM1: hin_m_rd_addr = cnt[CW_D-1:0] + 1'b1;
+      S_RES1:  hin_m_rd_addr = cnt[CW_D-1:0]
+                                + {{(CW_D-1){1'b0}}, rs_in_ready};
+      default: hin_m_rd_addr = '0;
     endcase
   end
 
@@ -548,8 +590,10 @@ module smollm_layer_bfp #(
   assign h1_m_wr_data = rs_y_m;
   always_comb begin
     case (state)
-      S_NORM2, S_RES2: h1_m_rd_addr = cnt[CW_D-1:0] + 1'b1;
-      default:         h1_m_rd_addr = '0;
+      S_NORM2: h1_m_rd_addr = cnt[CW_D-1:0] + 1'b1;
+      S_RES2:  h1_m_rd_addr = cnt[CW_D-1:0]
+                                + {{(CW_D-1){1'b0}}, rs_in_ready};
+      default: h1_m_rd_addr = '0;
     endcase
   end
 
@@ -2554,84 +2598,102 @@ module smollm_layer_bfp #(
   always_comb dbg_chunk = chunk;
 
 `ifdef LBFP_STAGE_DUMP
-  // Sim-only intermediate dumps.  $writememh executes on the cycle the
-  // FSM transitions OUT of each post-stage state.  Vivado will warn-skip
-  // these; Verilator writes the listed array to a hex file.
-  logic [5:0] prev_state;
+  // Sim-only intermediate dumps.  $writememh runs on the cycle the FSM
+  // transitions OUT of each post-stage state.  Triggers use the enum
+  // names so they survive FSM reordering (the previous numeric literals
+  // had drifted several places out of date after Phase 2 added more
+  // states).  Vivado warn-skips $writememh; Verilator emits the file.
+  state_t prev_state;
+  // Unpack buffers for packed-BRAM arrays (q_m, k_m, v_m, attn_m, o_m,
+  // d_m, g_m, u_m).  Filled lane-by-lane when each stage's dump fires.
+  logic [BFP_MANT_W-1:0] sim_o_m_flat   [0:D-1];
+  logic [BFP_MANT_W-1:0] sim_d_m_flat   [0:D-1];
+  logic [BFP_MANT_W-1:0] sim_q_m_flat   [0:D-1];
+  logic [BFP_MANT_W-1:0] sim_k_m_flat   [0:H_KV*HD-1];
+  logic [BFP_MANT_W-1:0] sim_v_m_flat   [0:H_KV*HD-1];
+  logic [BFP_MANT_W-1:0] sim_attn_m_flat[0:D-1];
+  logic [BFP_MANT_W-1:0] sim_g_m_flat   [0:FFN-1];
+  logic [BFP_MANT_W-1:0] sim_u_m_flat   [0:FFN-1];
   always_ff @(posedge clk) begin
-    if (rst) prev_state <= 6'h3f;
+    if (rst) prev_state <= S_IDLE;
     else begin
       prev_state <= state;
-      if (prev_state == 6'd3 && state == 6'd4) begin
+      if (prev_state == S_NORM1_WAIT && state == S_QMV_PRIME) begin
         $writememh("rtl_n1_m.hex", i_n1_m_bram.mem);
         $writememh("rtl_n1_e.hex", n1_e);
       end
-      if (prev_state == 6'd7 && state == 6'd8) begin
+      if (prev_state == S_QMV_REQ && state == S_QMV_NEXT) begin
         // q_m now packed in i_q_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_qpre_e.hex", q_e);
       end
-      if (prev_state == 6'd11 && state == 6'd12) begin
+      if (prev_state == S_KMV_REQ && state == S_KMV_NEXT) begin
         // k_m now packed in i_k_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_kpre_e.hex", k_e);
       end
-      if (prev_state == 6'd15 && state == 6'd16) begin
+      if (prev_state == S_VMV_REQ && state == S_VMV_NEXT) begin
         // v_m packed in i_v_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_v_e.hex", v_e);
       end
-      // State numbers shifted by +2 vs original because of new S_ROPEQ_RQ + S_ROPEK_RQ states.
-      // S_KVWR_M = 22 (was 20) — state right after RQ/RoPE is complete.
-      if (state == 6'd22 && prev_state == 6'd21) begin
+      // Post-RoPE requant — both Q and K finished, transitioning to KVWR.
+      if (prev_state == S_ROPEK_RQ_B && state == S_KVWR_M) begin
         // Post-rope-requant Q + K — q_m / k_m packed in BRAM, dump suppressed.
         $writememh("rtl_q_e.hex", q_e);
         $writememh("rtl_k_e.hex", k_e);
       end
-      // After attention (transition to S_OMV_PRIME)
-      if (prev_state == 6'd32 && state == 6'd33) begin
+      // After attention (S_AV_NEXT → S_OMV_PRIME)
+      if (prev_state == S_AV_NEXT && state == S_OMV_PRIME) begin
         // attn_m is now packed (LANES entries per BRAM word) inside
         // i_attn_m_bram.i_word_ram.mem — dump suppressed pending an
         // unpacking helper.  [[task-4]]
         $writememh("rtl_attn_e.hex", attn_e);
       end
-      // After softmax wait (S_SM_WAIT=28 → S_AV_PRIME=29): scores + probs ready
-      if (prev_state == 6'd28 && state == 6'd29) begin
+      // After softmax wait (S_SM_WAIT → S_AV_PRIME): scores + probs ready.
+      if (prev_state == S_SM_WAIT && state == S_AV_PRIME) begin
         $writememh("rtl_scores_m.hex", scores_m);
         $writememh("rtl_qkscore_e.hex", qk_score_e);
         $writememh("rtl_probs_m.hex", probs_m);
         $display("scores_e_shared=%0d probs_e_shared=%0d",
                  $signed(scores_e_shared), $signed(probs_e_shared));
       end
-      // After O matvec (transition to S_RES1)
-      if (prev_state == 6'd36 && state == 6'd37) begin
-        // o_m is now packed inside i_o_m_bram.i_word_ram.mem (see attn_m).
+      // After O matvec (S_OMV_NEXT → S_RES1).
+      if (prev_state == S_OMV_NEXT && state == S_RES1) begin
+        // o_m is packed in i_o_m_bram.i_word_ram.mem (LANES entries per
+        // 256-bit word).  Unpack lane-by-lane into a flat shadow for the
+        // diff harness.
+        for (int t = 0; t < (D + LANES - 1) / LANES; t++)
+          for (int l = 0; l < LANES; l++)
+            sim_o_m_flat[t*LANES + l] =
+                i_o_m_bram.i_word_ram.mem[t][l*BFP_MANT_W +: BFP_MANT_W];
+        $writememh("rtl_o_m.hex", sim_o_m_flat);
         $writememh("rtl_o_e.hex", o_e);
       end
-      // After RES1 (transition to S_NORM2)
-      if (prev_state == 6'd38 && state == 6'd39) begin
+      // After RES1 (S_RES1_WAIT → S_NORM2).
+      if (prev_state == S_RES1_WAIT && state == S_NORM2) begin
         $writememh("rtl_h1_m.hex", i_h1_m_bram.mem);
         $writememh("rtl_h1_e.hex", h1_e);
       end
-      // After NORM2 (transition to S_GMV)
-      if (prev_state == 6'd40 && state == 6'd41) begin
+      // After NORM2 (S_NORM2_WAIT → S_GMV_PRIME).
+      if (prev_state == S_NORM2_WAIT && state == S_GMV_PRIME) begin
         $writememh("rtl_n2_m.hex", i_n2_m_bram.mem);
         $writememh("rtl_n2_e.hex", n2_e);
       end
-      // After GMV
-      if (prev_state == 6'd44 && state == 6'd45) begin
+      // After GMV (S_GMV_NEXT → S_UMV_PRIME).
+      if (prev_state == S_GMV_NEXT && state == S_UMV_PRIME) begin
         // g_m packed in i_g_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_g_e.hex", g_e);
       end
-      // After UMV
-      if (prev_state == 6'd48 && state == 6'd49) begin
+      // After UMV (S_UMV_NEXT → S_SWG).
+      if (prev_state == S_UMV_NEXT && state == S_SWG) begin
         // u_m packed in i_u_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_u_e.hex", u_e);
       end
-      // After SWG
-      if (prev_state == 6'd50 && state == 6'd51) begin
+      // After SWG (S_SWG_WAIT → S_DMV_PRIME).
+      if (prev_state == S_SWG_WAIT && state == S_DMV_PRIME) begin
         $writememh("rtl_mlp_m.hex", i_mlp_m_bram.mem);
         $writememh("rtl_mlp_e.hex", mlp_e);
       end
-      // After DMV
-      if (prev_state == 6'd54 && state == 6'd55) begin
+      // After DMV (S_DMV_NEXT → S_RES2).
+      if (prev_state == S_DMV_NEXT && state == S_RES2) begin
         // d_m is now packed inside i_d_m_bram.i_word_ram.mem (see attn_m).
         $writememh("rtl_d_e.hex", d_e);
       end
