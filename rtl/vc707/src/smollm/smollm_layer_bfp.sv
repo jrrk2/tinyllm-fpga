@@ -339,14 +339,41 @@ module smollm_layer_bfp #(
   assign attn_m_wr_addr_tile = ($clog2((D+LANES-1)/LANES))'(
                                   (av_row_base + chunk * LANES) / LANES);
   assign attn_m_rd_addr      = cnt[CW_D-1:0];
+  // emax_f for the matvec-output requant (shared across packed writers
+  // that use mv_out_*_drain_r as the source — attn_m / o_m / d_m).
+  wire signed [BFP_EXP_W-1:0] mv_drain_emax_f =
+      (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
   for (genvar pack_ii = 0; pack_ii < LANES; pack_ii++) begin : g_attn_m_pack
-    wire signed [BFP_EXP_W-1:0] av_emax_f_pack =
-        (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
     assign attn_m_wr_data_packed[pack_ii*BFP_MANT_W +: BFP_MANT_W] =
       requant_mant(
         mv_out_m_drain_r[pack_ii*BFP_MANT_W +: BFP_MANT_W],
         mv_out_e_drain_r[pack_ii*BFP_EXP_W  +: BFP_EXP_W ],
-        av_emax_f_pack);
+        mv_drain_emax_f);
+  end
+
+  // o_m: same shape as attn_m's write side (LANES-parallel requant of
+  // mv_out_*_drain_r); read is combinational with cnt+1 lookahead.
+  assign o_m_we           = (state == S_OMV_REQ);
+  assign o_m_wr_addr_tile = ($clog2((D+LANES-1)/LANES))'(chunk);
+  assign o_m_rd_addr      = (state == S_RES1) ? cnt[CW_D-1:0] + 1'b1 : '0;
+  for (genvar pack_ii = 0; pack_ii < LANES; pack_ii++) begin : g_o_m_pack
+    assign o_m_wr_data_packed[pack_ii*BFP_MANT_W +: BFP_MANT_W] =
+      requant_mant(
+        mv_out_m_drain_r[pack_ii*BFP_MANT_W +: BFP_MANT_W],
+        mv_out_e_drain_r[pack_ii*BFP_EXP_W  +: BFP_EXP_W ],
+        mv_drain_emax_f);
+  end
+
+  // d_m: same pattern, read in S_RES2.
+  assign d_m_we           = (state == S_DMV_REQ);
+  assign d_m_wr_addr_tile = ($clog2((D+LANES-1)/LANES))'(chunk);
+  assign d_m_rd_addr      = (state == S_RES2) ? cnt[CW_D-1:0] + 1'b1 : '0;
+  for (genvar pack_ii = 0; pack_ii < LANES; pack_ii++) begin : g_d_m_pack
+    assign d_m_wr_data_packed[pack_ii*BFP_MANT_W +: BFP_MANT_W] =
+      requant_mant(
+        mv_out_m_drain_r[pack_ii*BFP_MANT_W +: BFP_MANT_W],
+        mv_out_e_drain_r[pack_ii*BFP_EXP_W  +: BFP_EXP_W ],
+        mv_drain_emax_f);
   end
 
   // ---------------------------------------------------------------------------
@@ -545,7 +572,28 @@ module smollm_layer_bfp #(
   );
   logic signed [BFP_EXP_W -1:0] attn_e  [0:NT_D-1];
 
-  logic signed [BFP_MANT_W-1:0] o_m     [0:D-1];
+  // o_m: packed bfp_sdpram.  Write S_OMV_REQ (LANES-parallel for-loop),
+  // read combinationally into rs_b_m_c during S_RES1 — rd_addr driven
+  // as `cnt+1` for 1-cycle lookahead so the BRAM-registered output
+  // matches what the OLD async LUTRAM read gave at the same cycle.
+  logic                            o_m_we;
+  logic [$clog2((D+LANES-1)/LANES)-1:0] o_m_wr_addr_tile;
+  logic [LANES*BFP_MANT_W-1:0]     o_m_wr_data_packed;
+  logic [CW_D-1:0]                 o_m_rd_addr;
+  wire  [BFP_MANT_W-1:0]           o_m_rd_data;
+  bfp_sdpram_packed #(
+    .LANES         (LANES),
+    .LOGICAL_DEPTH (D),
+    .WIDTH         (BFP_MANT_W)
+  ) i_o_m_bram (
+    .clk            (clk),
+    .rst            (rst),
+    .we             (o_m_we),
+    .wr_addr_tile   (o_m_wr_addr_tile),
+    .wr_data_packed (o_m_wr_data_packed),
+    .rd_addr        (o_m_rd_addr),
+    .rd_data        (o_m_rd_data)
+  );
   logic signed [BFP_EXP_W -1:0] o_e     [0:NT_D-1];
 
   logic signed [BFP_MANT_W-1:0] h1_m    [0:D-1];
@@ -587,7 +635,26 @@ module smollm_layer_bfp #(
                   .rd_addr(mlp_m_rd_addr), .rd_data(mlp_m_rd_data));
   logic signed [BFP_EXP_W -1:0] mlp_e   [0:NT_FFN-1];
 
-  logic signed [BFP_MANT_W-1:0] d_m     [0:D-1];
+  // d_m: same pattern as o_m.  Write S_DMV_REQ, read combinationally
+  // into rs_b_m_c during S_RES2 with `cnt+1` lookahead.
+  logic                            d_m_we;
+  logic [$clog2((D+LANES-1)/LANES)-1:0] d_m_wr_addr_tile;
+  logic [LANES*BFP_MANT_W-1:0]     d_m_wr_data_packed;
+  logic [CW_D-1:0]                 d_m_rd_addr;
+  wire  [BFP_MANT_W-1:0]           d_m_rd_data;
+  bfp_sdpram_packed #(
+    .LANES         (LANES),
+    .LOGICAL_DEPTH (D),
+    .WIDTH         (BFP_MANT_W)
+  ) i_d_m_bram (
+    .clk            (clk),
+    .rst            (rst),
+    .we             (d_m_we),
+    .wr_addr_tile   (d_m_wr_addr_tile),
+    .wr_data_packed (d_m_wr_data_packed),
+    .rd_addr        (d_m_rd_addr),
+    .rd_data        (d_m_rd_data)
+  );
   logic signed [BFP_EXP_W -1:0] d_e     [0:NT_D-1];
 
   logic signed [BFP_MANT_W-1:0] hout_m  [0:D-1];
@@ -897,14 +964,14 @@ module smollm_layer_bfp #(
     if (rs_drive_res1) begin
       rs_a_m_c   = hin_m[cnt[CW_D-1:0]];
       rs_a_e_c   = hin_e[cnt[CW_D-1:0] / BFP_TILE];
-      rs_b_m_c   = o_m  [cnt[CW_D-1:0]];
+      rs_b_m_c   = o_m_rd_data;
       rs_b_e_c   = o_e  [cnt[CW_D-1:0] / BFP_TILE];
       rs_valid_c = rs_in_ready && (cnt < D);
       rs_last_c  = rs_in_ready && (cnt == D-1);
     end else if (rs_drive_res2) begin
       rs_a_m_c   = h1_m[cnt[CW_D-1:0]];
       rs_a_e_c   = h1_e[cnt[CW_D-1:0] / BFP_TILE];
-      rs_b_m_c   = d_m [cnt[CW_D-1:0]];
+      rs_b_m_c   = d_m_rd_data;
       rs_b_e_c   = d_e [cnt[CW_D-1:0] / BFP_TILE];
       rs_valid_c = rs_in_ready && (cnt < D);
       rs_last_c  = rs_in_ready && (cnt == D-1);
@@ -1851,11 +1918,7 @@ module smollm_layer_bfp #(
         S_OMV_REQ: begin : omv_pipeB
           automatic logic signed [BFP_EXP_W-1:0] emax_f;
           emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
-          for (ii = 0; ii < LANES; ii++)
-            o_m[chunk * LANES + ii] <= requant_mant(
-              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
-              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
-              emax_f);
+          // o_m write handled by g_o_m_pack + o_m_we above (packed bfp_sdpram).
           o_e[chunk] <= emax_f;
           state <= S_OMV_NEXT;
         end
@@ -2138,11 +2201,7 @@ module smollm_layer_bfp #(
         S_DMV_REQ: begin : dmv_pipeB
           automatic logic signed [BFP_EXP_W-1:0] emax_f;
           emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
-          for (ii = 0; ii < LANES; ii++)
-            d_m[chunk * LANES + ii] <= requant_mant(
-              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
-              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
-              emax_f);
+          // d_m write handled by g_d_m_pack + d_m_we above (packed bfp_sdpram).
           d_e[chunk] <= emax_f;
           state <= S_DMV_NEXT;
         end
@@ -2232,7 +2291,9 @@ module smollm_layer_bfp #(
       end
       // After attention (transition to S_OMV_PRIME)
       if (prev_state == 6'd32 && state == 6'd33) begin
-        $writememh("rtl_attn_m.hex", attn_m);
+        // attn_m is now packed (LANES entries per BRAM word) inside
+        // i_attn_m_bram.i_word_ram.mem — dump suppressed pending an
+        // unpacking helper.  [[task-4]]
         $writememh("rtl_attn_e.hex", attn_e);
       end
       // After softmax wait (S_SM_WAIT=28 → S_AV_PRIME=29): scores + probs ready
@@ -2245,7 +2306,7 @@ module smollm_layer_bfp #(
       end
       // After O matvec (transition to S_RES1)
       if (prev_state == 6'd36 && state == 6'd37) begin
-        $writememh("rtl_o_m.hex", o_m);
+        // o_m is now packed inside i_o_m_bram.i_word_ram.mem (see attn_m).
         $writememh("rtl_o_e.hex", o_e);
       end
       // After RES1 (transition to S_NORM2)
@@ -2275,7 +2336,7 @@ module smollm_layer_bfp #(
       end
       // After DMV
       if (prev_state == 6'd54 && state == 6'd55) begin
-        $writememh("rtl_d_m.hex", d_m);
+        // d_m is now packed inside i_d_m_bram.i_word_ram.mem (see attn_m).
         $writememh("rtl_d_e.hex", d_e);
       end
     end
