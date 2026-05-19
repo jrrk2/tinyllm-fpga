@@ -68,6 +68,14 @@ module weight_streamer_bfp_mt #(
   input  wire  [AXI_DATA_WIDTH-1:0] m_axi_rdata,
   input  wire  [1:0]                m_axi_rresp,
   input  wire                       m_axi_rlast
+`ifdef VERILATOR
+  ,
+  // Sim-only: which of {WQ,WK,WV,WO,WG,WU,WDN} the layer is asking for,
+  // so the shadow loader picks the right .hex.  In production this
+  // distinction comes from matrix_base_m's DDR3 offset (per-matrix bases
+  // in autoregress_bfp_top).  In selftest all bases are 0.
+  input  wire [2:0]                 sim_matvec_id
+`endif
 );
 
   // ------------------------------------------------------------------
@@ -363,8 +371,109 @@ module weight_streamer_bfp_mt #(
     e_sub_r <= e_sub_sel;
   end
 
-  always_comb weight_m_out = bank_m_rd[m_sub_r * 256 +: 256];
-  always_comb weight_e_out = bank_e_rd[e_sub_r * 128 +: 128];
+`ifdef VERILATOR
+  // ------------------------------------------------------------------
+  //  Sim-only selftest weight shadow.
+  //
+  //  Loaded from the per-matvec .hex files emitted by emit_W_concat in
+  //  gen_smollm_blockfp_full.py (256-bit packed-lane mantissa words, one
+  //  per (chunk, col) — selftest assumes NL=1 so layer_idx isn't plumbed).
+  //  Activated when the testbench drives axi_mb_m==0 at the first
+  //  load_req (= ws_base_*=0 selftest config); production reads still
+  //  flow through bank_m / bank_e.
+  // ------------------------------------------------------------------
+  localparam int SIM_M_DEPTH = 16384;    // chunk × col, large enough for selftest
+  localparam int SIM_E_DEPTH = 1024;     // chunk × tile
+  // $readmemh needs a single-dim destination; use one array per matvec_id
+  // rather than a 2-D shadow[7][...] (this is a Verilator limitation).
+  logic [255:0] sim_shadow_m_Q  [0:SIM_M_DEPTH-1];
+  logic [255:0] sim_shadow_m_K  [0:SIM_M_DEPTH-1];
+  logic [255:0] sim_shadow_m_V  [0:SIM_M_DEPTH-1];
+  logic [255:0] sim_shadow_m_O  [0:SIM_M_DEPTH-1];
+  logic [255:0] sim_shadow_m_G  [0:SIM_M_DEPTH-1];
+  logic [255:0] sim_shadow_m_U  [0:SIM_M_DEPTH-1];
+  logic [255:0] sim_shadow_m_DN [0:SIM_M_DEPTH-1];
+  logic [127:0] sim_shadow_e_Q  [0:SIM_E_DEPTH-1];
+  logic [127:0] sim_shadow_e_K  [0:SIM_E_DEPTH-1];
+  logic [127:0] sim_shadow_e_V  [0:SIM_E_DEPTH-1];
+  logic [127:0] sim_shadow_e_O  [0:SIM_E_DEPTH-1];
+  logic [127:0] sim_shadow_e_G  [0:SIM_E_DEPTH-1];
+  logic [127:0] sim_shadow_e_U  [0:SIM_E_DEPTH-1];
+  logic [127:0] sim_shadow_e_DN [0:SIM_E_DEPTH-1];
+
+  initial begin
+    $readmemh("../generated/lbfp_WQ_m.hex",  sim_shadow_m_Q );
+    $readmemh("../generated/lbfp_WK_m.hex",  sim_shadow_m_K );
+    $readmemh("../generated/lbfp_WV_m.hex",  sim_shadow_m_V );
+    $readmemh("../generated/lbfp_WO_m.hex",  sim_shadow_m_O );
+    $readmemh("../generated/lbfp_WG_m.hex",  sim_shadow_m_G );
+    $readmemh("../generated/lbfp_WU_m.hex",  sim_shadow_m_U );
+    $readmemh("../generated/lbfp_WDN_m.hex", sim_shadow_m_DN);
+    $readmemh("../generated/lbfp_WQ_e.hex",  sim_shadow_e_Q );
+    $readmemh("../generated/lbfp_WK_e.hex",  sim_shadow_e_K );
+    $readmemh("../generated/lbfp_WV_e.hex",  sim_shadow_e_V );
+    $readmemh("../generated/lbfp_WO_e.hex",  sim_shadow_e_O );
+    $readmemh("../generated/lbfp_WG_e.hex",  sim_shadow_e_G );
+    $readmemh("../generated/lbfp_WU_e.hex",  sim_shadow_e_U );
+    $readmemh("../generated/lbfp_WDN_e.hex", sim_shadow_e_DN);
+  end
+
+  // Detect selftest mode: first load_req with axi_mb_m == 0.
+  logic selftest;
+  initial selftest = 1'b0;
+  always_ff @(posedge clk_axi) begin
+    if (rst_axi) selftest <= 1'b0;
+    else if (ws_state == WS_IDLE && start_load_axi && axi_mb_m == 0) begin
+      selftest <= 1'b1;
+      $display("[ws] selftest mode activated");
+    end
+  end
+
+  // (debug $displays removed — shadow path verified working.)
+
+  // 1-cycle latency shadow read (matches bank_m_rd's pipeline).  rd_col
+  // / rd_tile / chunk_idx / sim_matvec_id are all valid inputs already.
+  logic [255:0] sim_m_rd;
+  logic [127:0] sim_e_rd;
+  logic [13:0]  sim_m_idx, sim_e_idx;
+  always_comb begin
+    sim_m_idx = chunk_idx * in_dim       + rd_col;
+    sim_e_idx = chunk_idx * in_dim_tiles + rd_tile;
+  end
+  always_ff @(posedge clk_core) begin
+    case (sim_matvec_id)
+      3'd0: sim_m_rd <= sim_shadow_m_Q [sim_m_idx];
+      3'd1: sim_m_rd <= sim_shadow_m_K [sim_m_idx];
+      3'd2: sim_m_rd <= sim_shadow_m_V [sim_m_idx];
+      3'd3: sim_m_rd <= sim_shadow_m_O [sim_m_idx];
+      3'd4: sim_m_rd <= sim_shadow_m_G [sim_m_idx];
+      3'd5: sim_m_rd <= sim_shadow_m_U [sim_m_idx];
+      3'd6: sim_m_rd <= sim_shadow_m_DN[sim_m_idx];
+      default: sim_m_rd <= '0;
+    endcase
+    case (sim_matvec_id)
+      3'd0: sim_e_rd <= sim_shadow_e_Q [sim_e_idx];
+      3'd1: sim_e_rd <= sim_shadow_e_K [sim_e_idx];
+      3'd2: sim_e_rd <= sim_shadow_e_V [sim_e_idx];
+      3'd3: sim_e_rd <= sim_shadow_e_O [sim_e_idx];
+      3'd4: sim_e_rd <= sim_shadow_e_G [sim_e_idx];
+      3'd5: sim_e_rd <= sim_shadow_e_U [sim_e_idx];
+      3'd6: sim_e_rd <= sim_shadow_e_DN[sim_e_idx];
+      default: sim_e_rd <= '0;
+    endcase
+  end
+`endif
+
+  always_comb weight_m_out =
+`ifdef VERILATOR
+                             selftest ? sim_m_rd :
+`endif
+                             bank_m_rd[m_sub_r * 256 +: 256];
+  always_comb weight_e_out =
+`ifdef VERILATOR
+                             selftest ? sim_e_rd :
+`endif
+                             bank_e_rd[e_sub_r * 128 +: 128];
 
   // ------------------------------------------------------------------
   //  Ready/busy CDC: ready_axi → ready (clk_core).

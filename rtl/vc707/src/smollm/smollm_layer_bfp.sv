@@ -158,6 +158,19 @@ module smollm_layer_bfp #(
   (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] rom_G1_e [0:NL*NT_D-1];
   (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] rom_G2_e [0:NL*NT_D-1];
 
+`ifdef VERILATOR
+  // In production these ROMs are filled at boot via the wr_kind port
+  // (host upload).  The bfp-layer testbench leaves wr_en tied to 0, so
+  // without this init the RMSNorm gammas would all be zero and every
+  // matvec would receive zero activations regardless of weights.
+  initial begin
+    $readmemh("../generated/lbfp_G1_m.hex", rom_G1_m);
+    $readmemh("../generated/lbfp_G1_e.hex", rom_G1_e);
+    $readmemh("../generated/lbfp_G2_m.hex", rom_G2_m);
+    $readmemh("../generated/lbfp_G2_e.hex", rom_G2_e);
+  end
+`endif
+
   // kv_k_m / kv_k_e / kv_v_e / kv_v_m_chk all live in explicit RAMB36E1
   // primitives via bfp_sdpram.  Vivado's inferencer refused BRAM for the
   // three kv_k_*/kv_v_e arrays ("Infeasible attribute ram_style=block")
@@ -1426,6 +1439,9 @@ module smollm_layer_bfp #(
     .m_axi_rdata   (m_axi_rdata),
     .m_axi_rresp   (m_axi_rresp),
     .m_axi_rlast   (m_axi_rlast)
+`ifdef VERILATOR
+    , .sim_matvec_id (ws_matvec_id)
+`endif
   );
 
   // ---------------------------------------------------------------------------
