@@ -235,7 +235,7 @@ module smollm_layer_bfp #(
       kv_k_m_wr_addr = KKM_AW'(layer_idx * MAX_CTX * H_KV * HD
                                 + kv_pos * H_KV * HD
                                 + cnt[CW_KV-1:0]);
-      kv_k_m_wr_data = k_m[cnt[CW_KV-1:0]];
+      kv_k_m_wr_data = k_m_rd_data;
     end
     // Default rd_addr: QK_DRIVE pattern (kv_t × stride + head_grp × HD + cnt).
     // S_QK_PREFETCH sets cnt=0 so addr(t=kv_t, j=0) is latched; DRIVE
@@ -418,6 +418,40 @@ module smollm_layer_bfp #(
       (state == S_ROPEQ_RQ_B) ? qrq_data : qmv_data;
   end
 
+  // k_m: mirror of q_m.  Writes in S_KMV_REQ (chunk-indexed, matvec drain
+  // source) and S_ROPEK_RQ_B (cnt-tile-indexed, k_rot source).  Reads in
+  // S_ROPEK (rp_x_m, head_idx*HD+cnt lookahead, S_ROPEK_WAIT prefetch) and
+  // S_KVWR_M (cnt+1 lookahead so the comb-driver always_comb at top
+  // gets k_m[cnt] = k_m_rd_data at the cycle it's needed).
+  assign k_m_we           = (state == S_KMV_REQ) || (state == S_ROPEK_RQ_B);
+  assign k_m_wr_addr_tile =
+      (state == S_ROPEK_RQ_B) ? ($clog2((H_KV*HD+LANES-1)/LANES))'(cnt[$clog2(NT_KV+1)-1:0])
+                              : ($clog2((H_KV*HD+LANES-1)/LANES))'(chunk);
+  always_comb begin
+    case (state)
+      S_ROPEK:        k_m_rd_addr = CW_KV'(head_idx * HD) + cnt[CW_KV-1:0] + 1'b1;
+      S_ROPEK_WAIT:   k_m_rd_addr = CW_KV'((head_idx + 1) * HD);
+      S_KVWR_M:       k_m_rd_addr = cnt[CW_KV-1:0] + 1'b1;
+      default:        k_m_rd_addr = '0;
+    endcase
+  end
+  wire signed [BFP_EXP_W-1:0] k_rq_emax =
+      (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
+  for (genvar pack_ii = 0; pack_ii < LANES; pack_ii++) begin : g_k_m_pack
+    wire [BFP_MANT_W-1:0] kmv_data =
+        requant_mant(
+          mv_out_m_drain_r[pack_ii*BFP_MANT_W +: BFP_MANT_W],
+          mv_out_e_drain_r[pack_ii*BFP_EXP_W  +: BFP_EXP_W ],
+          mv_drain_emax_f);
+    wire [BFP_MANT_W-1:0] krq_data =
+        requant_mant(
+          $signed(k_rot_m_rd_data_packed[pack_ii*BFP_MANT_W +: BFP_MANT_W]),
+          k_rot_e[cnt[$clog2(NT_KV+1)-1:0] * BFP_TILE + pack_ii],
+          k_rq_emax);
+    assign k_m_wr_data_packed[pack_ii*BFP_MANT_W +: BFP_MANT_W] =
+      (state == S_ROPEK_RQ_B) ? krq_data : kmv_data;
+  end
+
   // ---------------------------------------------------------------------------
   // kv_k_m: per-mantissa K cache.  Writes 1 entry/cycle during S_KVWR_M,
   // reads 1 entry/cycle during S_QK_DRIVE (lane 0 of mv_w_m).
@@ -556,7 +590,29 @@ module smollm_layer_bfp #(
   );
   logic signed [BFP_EXP_W -1:0] q_e     [0:NT_D-1];
 
-  logic signed [BFP_MANT_W-1:0] k_m     [0:H_KV*HD-1];
+  // k_m: packed bfp_sdpram, same pattern as q_m but H_KV*HD-deep.
+  // Writes: S_KMV_REQ (chunk) + S_ROPEK_RQ_B (cnt-tile).
+  // Reads:  S_ROPEK (rp_x_m), S_KVWR_M (kv_k_m_wr_data — comb-fed by
+  //         always_comb at top of module).  S_KVWR_M consumes 1 entry
+  //         per cycle starting at cnt=0, so rd_addr=cnt+1 lookahead.
+  logic                                    k_m_we;
+  logic [$clog2((H_KV*HD+LANES-1)/LANES)-1:0] k_m_wr_addr_tile;
+  logic [LANES*BFP_MANT_W-1:0]             k_m_wr_data_packed;
+  logic [CW_KV-1:0]                        k_m_rd_addr;
+  wire  [BFP_MANT_W-1:0]                   k_m_rd_data;
+  bfp_sdpram_packed #(
+    .LANES         (LANES),
+    .LOGICAL_DEPTH (H_KV*HD),
+    .WIDTH         (BFP_MANT_W)
+  ) i_k_m_bram (
+    .clk            (clk),
+    .rst            (rst),
+    .we             (k_m_we),
+    .wr_addr_tile   (k_m_wr_addr_tile),
+    .wr_data_packed (k_m_wr_data_packed),
+    .rd_addr        (k_m_rd_addr),
+    .rd_data        (k_m_rd_data)
+  );
   logic signed [BFP_EXP_W -1:0] k_e     [0:NT_KV-1];
   logic signed [BFP_MANT_W-1:0] v_m     [0:H_KV*HD-1];
   logic signed [BFP_EXP_W -1:0] v_e     [0:NT_KV-1];
@@ -1444,13 +1500,9 @@ module smollm_layer_bfp #(
           state <= S_KMV_REQ;
         end
         S_KMV_REQ: begin : kmv_pipeB
+          // k_m LANES-parallel write driven by k_m_we + g_k_m_pack (kmv_data).
           automatic logic signed [BFP_EXP_W-1:0] emax_f;
           emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
-          for (ii = 0; ii < LANES; ii++)
-            k_m[chunk * LANES + ii] <= requant_mant(
-              mv_out_m_drain_r[ii*BFP_MANT_W +: BFP_MANT_W],
-              mv_out_e_drain_r[ii*BFP_EXP_W  +: BFP_EXP_W ],
-              emax_f);
           k_e[chunk] <= emax_f;
           state <= S_KMV_NEXT;
         end
@@ -1594,7 +1646,7 @@ module smollm_layer_bfp #(
         // RoPE K — H_KV heads
         S_ROPEK: begin
           rp_valid <= 1'b1;
-          rp_x_m   <= k_m[head_idx * HD + cnt[CW_HD-1:0]];
+          rp_x_m   <= k_m_rd_data;
           rp_x_e   <= k_e[(head_idx * HD + cnt[CW_HD-1:0]) / BFP_TILE];
           if (cnt == HD-1) begin
             state <= S_ROPEK_WAIT; cnt <= '0;
@@ -1635,16 +1687,9 @@ module smollm_layer_bfp #(
           state <= S_ROPEK_RQ_B;
         end
         S_ROPEK_RQ_B: begin : rq_k_b
+          // k_m LANES-parallel write driven by k_m_we + g_k_m_pack (krq_data).
           automatic logic signed [BFP_EXP_W-1:0] emax_f;
-          automatic int base;
-          base = cnt[$clog2(NT_KV+1)-1:0] * BFP_TILE;
           emax_f = (emax_h0_r > emax_h1_r) ? emax_h0_r : emax_h1_r;
-          for (ii = 0; ii < BFP_TILE; ii++) begin
-            if (base + ii < H_KV*HD)
-              k_m[base + ii] <= requant_mant(
-                $signed(k_rot_m_rd_data_packed[ii*BFP_MANT_W +: BFP_MANT_W]),
-                k_rot_e[base + ii], emax_f);
-          end
           k_e[cnt[$clog2(NT_KV+1)-1:0]] <= emax_f;
           if (cnt == NT_KV - 1) begin
             cnt <= '0;
@@ -2329,7 +2374,7 @@ module smollm_layer_bfp #(
         $writememh("rtl_qpre_e.hex", q_e);
       end
       if (prev_state == 6'd11 && state == 6'd12) begin
-        $writememh("rtl_kpre_m.hex", k_m);
+        // k_m now packed in i_k_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_kpre_e.hex", k_e);
       end
       if (prev_state == 6'd15 && state == 6'd16) begin
