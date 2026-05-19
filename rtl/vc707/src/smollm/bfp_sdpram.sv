@@ -52,10 +52,21 @@ module bfp_sdpram #(
   localparam int ROW_BITS   = (N_ROWS > 1) ? $clog2(N_ROWS) : 1;
 
   // Address split: low 10 bits = within-tile row; remaining MSBs = tile row select.
-  wire [9:0]            rd_off = rd_addr[9:0];
-  wire [9:0]            wr_off = wr_addr[9:0];
-  wire [ROW_BITS-1:0]   rd_row = rd_addr[ADDR_WIDTH-1:10];
-  wire [ROW_BITS-1:0]   wr_row = wr_addr[ADDR_WIDTH-1:10];
+  // When DEPTH ≤ TILE_DEPTH (N_ROWS=1) there are no row-select bits — the
+  // part-select [ADDR_WIDTH-1:10] would be malformed (e.g. [9:10] for D=960
+  // → ADDR_WIDTH=10).  Generate-if elides the slice for the single-row case.
+  wire [9:0]            rd_off = ADDR_WIDTH >= 10 ? rd_addr[9:0]
+                                                  : {{(10-ADDR_WIDTH){1'b0}}, rd_addr};
+  wire [9:0]            wr_off = ADDR_WIDTH >= 10 ? wr_addr[9:0]
+                                                  : {{(10-ADDR_WIDTH){1'b0}}, wr_addr};
+  wire [ROW_BITS-1:0]   rd_row, wr_row;
+  if (N_ROWS > 1) begin : g_row_select
+    assign rd_row = rd_addr[ADDR_WIDTH-1:10];
+    assign wr_row = wr_addr[ADDR_WIDTH-1:10];
+  end else begin : g_no_row_select
+    assign rd_row = '0;
+    assign wr_row = '0;
+  end
 
   // 1-cycle delay on rd_row so the output mux selects the right tile
   // the cycle the BRAM core register presents its data.
