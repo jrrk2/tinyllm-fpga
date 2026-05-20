@@ -462,7 +462,12 @@ module weight_streamer_bfp_mt #(
   // / rd_tile / chunk_idx / sim_matvec_id are all valid inputs already.
   logic [255:0] sim_m_rd;
   logic [127:0] sim_e_rd;
-  logic [13:0]  sim_m_idx, sim_e_idx;
+  // Width must cover SIM_M_DEPTH (≈ D × max(D, FFN) / 16) so sim_m_idx
+  // doesn't wrap modulo 2^14 — that wrap silently corrupted weight
+  // fetches past chunk 16 of the Q matvec at smollm360 dims, where
+  // chunk*D + col first crosses 16384.
+  logic [$clog2(SIM_M_DEPTH)-1:0] sim_m_idx;
+  logic [$clog2(SIM_E_DEPTH)-1:0] sim_e_idx;
   always_comb begin
     sim_m_idx = chunk_idx * in_dim       + rd_col;
     sim_e_idx = chunk_idx * in_dim_tiles + rd_tile;
