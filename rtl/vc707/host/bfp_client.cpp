@@ -1624,7 +1624,8 @@ void usage() {
         "                     in <dir> via the host-write protocol\n"
         "  verify-roms <dir>  read every BRAM entry back and compare to\n"
         "                     the .hex files (~7 s; per-entry round-trip)\n"
-        "  all     <bin>      upload → verify → restart → tokens\n",
+        "  all     <bin>      load-roms → verify-roms → upload → restart\n"
+        "                     → tokens (rom dir = bin's parent)\n",
         FPGA_MAC, DEFAULT_PEER_IP);
 }
 
@@ -1818,6 +1819,21 @@ int main(int argc, char** argv) {
             auto bv = reg_read(u, REG_BUILD_VERSION, 1, 1)[0];
             std::printf("[all] FPGA at %s:%u  BUILD_VERSION = 0x%08x\n",
                         peer_ip.c_str(), peer_port, bv);
+            // ROM directory — derive from bin's parent dir.  A fresh
+            // bitstream has all-zero G1/G2/NORM_W/PROMPT BRAMs; without
+            // load-roms the forward pass collapses to <|endoftext|> for
+            // every emitted token regardless of the DDR3 image.  Keep
+            // verify-roms in the chain too so a corrupted upload (or a
+            // mid-build silent BRAM clobber) is caught before tokens.
+            std::string rom_dir;
+            {
+                auto slash = bin.find_last_of('/');
+                rom_dir = (slash == std::string::npos) ? "." : bin.substr(0, slash);
+            }
+            std::printf("[all] load-roms %s\n", rom_dir.c_str());
+            if (int rc = load_roms(u, rom_dir); rc != 0) return rc;
+            std::printf("[all] verify-roms %s\n", rom_dir.c_str());
+            if (int rc = verify_roms(u, rom_dir); rc != 0) return rc;
             upload(u, peer_ip, peer_port, bin, 0, 4,
                    lead_limit, poll_ms, target_mbps, backlog_limit);
             // Settle: the BFP autoregress auto-restarts in a perpetual
