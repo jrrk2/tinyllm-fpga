@@ -401,6 +401,16 @@ module weight_streamer_bfp_mt #(
   logic [127:0] sim_shadow_e_U  [0:SIM_E_DEPTH-1];
   logic [127:0] sim_shadow_e_DN [0:SIM_E_DEPTH-1];
 
+  // Shadow-array load fires only for the bfp-layer selftest tb, which
+  // sets +define+LBFP_STREAMER_SELFTEST at Verilator-build time.  The
+  // per-matvec .hex files are sized for the D=64 selftest geometry
+  // (SIM_M_DEPTH=16384 lines); real-model weights (smollm135/360) far
+  // exceed that and would abort with "$readmem file address beyond
+  // bounds of array".  Other testbenches (tb_full_bfp, tb_autoregress_
+  // bfp_stream) and FPGA synth get all-zero shadows here — which is
+  // fine because their weight path is the real bank_m/bank_e fetch via
+  // mock_axi_slave / DDR3, not the selftest fast-path.
+`ifdef LBFP_STREAMER_SELFTEST
   initial begin
     $readmemh("../generated/lbfp_WQ_m.hex",  sim_shadow_m_Q );
     $readmemh("../generated/lbfp_WK_m.hex",  sim_shadow_m_K );
@@ -417,10 +427,17 @@ module weight_streamer_bfp_mt #(
     $readmemh("../generated/lbfp_WU_e.hex",  sim_shadow_e_U );
     $readmemh("../generated/lbfp_WDN_e.hex", sim_shadow_e_DN);
   end
+`endif
 
   // Detect selftest mode: first load_req with axi_mb_m == 0.
+  // Gated by LBFP_STREAMER_SELFTEST — full-model testbenches
+  // (tb_full_bfp, tb_autoregress_bfp_stream) drive zero-offset loads
+  // through the real AXI path and must NOT be reinterpreted as
+  // selftest, or the streamer ignores the real weights and serves
+  // all-zero shadows instead.
   logic selftest;
   initial selftest = 1'b0;
+`ifdef LBFP_STREAMER_SELFTEST
   always_ff @(posedge clk_axi) begin
     if (rst_axi) selftest <= 1'b0;
     else if (ws_state == WS_IDLE && start_load_axi && axi_mb_m == 0) begin
@@ -428,6 +445,7 @@ module weight_streamer_bfp_mt #(
       $display("[ws] selftest mode activated");
     end
   end
+`endif
 
   // (debug $displays removed — shadow path verified working.)
 

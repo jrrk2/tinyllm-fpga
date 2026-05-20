@@ -111,6 +111,14 @@ module autoregress_bfp_top #(
   // Power-on contents are all-zero — autoregress would treat that as
   // <|endoftext|> tokens until host calls bfp_client load-roms.
   (* ram_style = "block" *) logic [15:0] prompt_rom [0:NPROMPT_MAX-1];
+`ifdef VERILATOR
+  // Sim has no host-write driver for prompt_rom, so the testbench would
+  // otherwise see all-zero prompt tokens and the autoregress would loop
+  // emitting <|endoftext|> forever (token 0 → embed[0] → argmax back to
+  // 0 → repeat).  Load directly from the same .hex the FPGA load-roms
+  // would upload.
+  initial $readmemh("../generated/lbfp_full_PROMPT.hex", prompt_rom);
+`endif
   logic [15:0] rd_prompt;
   logic [4:0]  wr_kind_q;
   always_ff @(posedge clk_wr) begin

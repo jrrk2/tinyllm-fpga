@@ -626,6 +626,7 @@ obj_dir/Vtb_smollm_layer_bfp: tb_smollm_layer_bfp.sv tb_smollm_layer_bfp.cpp \
 	    --top-module tb_smollm_layer_bfp \
 	    -I../generated -I$(SMOLLM_SRC) \
 	    +define+LBFP_STAGE_DUMP \
+	    +define+LBFP_STREAMER_SELFTEST \
 	    tb_smollm_layer_bfp.sv tb_smollm_layer_bfp.cpp \
 	    $(SMOLLM_SRC)/smollm_layer_bfp.sv \
 	    $(SMOLLM_SRC)/matvec_bfp_engine.sv \
@@ -658,7 +659,11 @@ obj_dir/Vtb_full_bfp: tb_full_bfp.sv tb_full_bfp.cpp \
                      $(SMOLLM_SRC)/swiglu_bfp.sv \
                      $(SMOLLM_SRC)/softmax_bfp.sv \
                      $(SMOLLM_SRC)/residual_bfp.sv \
-                     $(SMOLLM_SRC)/cordic_sincos.sv
+                     $(SMOLLM_SRC)/cordic_sincos.sv \
+                     $(SMOLLM_SRC)/bfp_sdpram.sv \
+                     $(SMOLLM_SRC)/bfp_sdpram_packed.sv \
+                     $(SMOLLM_SRC)/bfp_sdpram_packed_pr.sv \
+                     $(SMOLLM_SRC)/bfp_sdpram_striped.sv
 	$(VERILATOR) -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-fatal -cc --exe --build \
 	    -j 0 --x-assign 0 --x-initial 0 \
 	    -CFLAGS "-O2 -std=c++17" \
@@ -676,6 +681,10 @@ obj_dir/Vtb_full_bfp: tb_full_bfp.sv tb_full_bfp.cpp \
 	    $(SMOLLM_SRC)/softmax_bfp.sv \
 	    $(SMOLLM_SRC)/residual_bfp.sv \
 	    $(SMOLLM_SRC)/cordic_sincos.sv \
+	    $(SMOLLM_SRC)/bfp_sdpram.sv \
+	    $(SMOLLM_SRC)/bfp_sdpram_packed.sv \
+	    $(SMOLLM_SRC)/bfp_sdpram_packed_pr.sv \
+	    $(SMOLLM_SRC)/bfp_sdpram_striped.sv \
 	    -o Vtb_full_bfp
 
 # ---------------------- tb_autoregress_bfp -> alias to streaming -----------------------
@@ -714,7 +723,11 @@ obj_dir/Vtb_autoregress_bfp_stream: tb_autoregress_bfp_stream.sv tb_autoregress_
                                     $(SMOLLM_SRC)/swiglu_bfp.sv \
                                     $(SMOLLM_SRC)/softmax_bfp.sv \
                                     $(SMOLLM_SRC)/residual_bfp.sv \
-                                    $(SMOLLM_SRC)/cordic_sincos.sv
+                                    $(SMOLLM_SRC)/cordic_sincos.sv \
+                                    $(SMOLLM_SRC)/bfp_sdpram.sv \
+                                    $(SMOLLM_SRC)/bfp_sdpram_packed.sv \
+                                    $(SMOLLM_SRC)/bfp_sdpram_packed_pr.sv \
+                                    $(SMOLLM_SRC)/bfp_sdpram_striped.sv
 	$(VERILATOR) -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-fatal -cc --exe --build \
 	    -j 0 --x-assign 0 --x-initial 0 \
 	    -CFLAGS "-O2 -std=c++17" \
@@ -735,6 +748,10 @@ obj_dir/Vtb_autoregress_bfp_stream: tb_autoregress_bfp_stream.sv tb_autoregress_
 	    $(SMOLLM_SRC)/softmax_bfp.sv \
 	    $(SMOLLM_SRC)/residual_bfp.sv \
 	    $(SMOLLM_SRC)/cordic_sincos.sv \
+	    $(SMOLLM_SRC)/bfp_sdpram.sv \
+	    $(SMOLLM_SRC)/bfp_sdpram_packed.sv \
+	    $(SMOLLM_SRC)/bfp_sdpram_packed_pr.sv \
+	    $(SMOLLM_SRC)/bfp_sdpram_striped.sv \
 	    -o Vtb_autoregress_bfp_stream
 
 clean:

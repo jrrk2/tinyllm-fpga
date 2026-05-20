@@ -75,6 +75,17 @@ module smollm_decode_head_bfp #(
   (* ram_style = "block" *) logic signed [BFP_MANT_W-1:0] rom_NW_m [0:D-1];
   (* ram_style = "block" *) logic signed [BFP_EXP_W -1:0] rom_NW_e [0:NT_D-1];
 
+`ifdef VERILATOR
+  // Sim has no host-write driver for norm_w (the FPGA's load-roms
+  // kind=4/5 fills these via wr_*).  Without preload, rom_NW_m stays at
+  // zero, the final RMSNorm output is all-zero, lm_head logits are all
+  // zero, and argmax pins to lane 0 chunk 0 = token 0 every step.
+  initial begin
+    $readmemh("../generated/lbfp_full_NORM_W_m.hex", rom_NW_m);
+    $readmemh("../generated/lbfp_full_NORM_W_e.hex", rom_NW_e);
+  end
+`endif
+
   // norm_w is host-loaded at boot via the wr_* port (kind=4 for NW_m,
   // kind=5 for NW_e).  Write port is on clk_wr (eth_clk); read port
   // stays on clk (core_clk) — true-dual-port BRAM, no CDC.
@@ -319,8 +330,16 @@ module smollm_decode_head_bfp #(
           state    <= S_LATCH;
           cnt      <= '0;
           chunk    <= '0;
+          // Sentinel value (matches reset above): -1.0 * 2^127, the most
+          // negative value representable.  Using -128 here re-introduces
+          // the bug fixed in the reset path — best_m=16'sh8000 with
+          // best_e=-128 is -2^-128 (a tiny negative near zero), which
+          // any real positive logit beats but every real *negative* logit
+          // loses to → token_out stays at 0 for any all-negative-logits
+          // step.  Each fresh `start` would reset back to the buggy
+          // sentinel, masking the reset-path fix.
           best_m   <= 16'sh8000;
-          best_e   <= -8'sd128;
+          best_e   <= 8'sd127;
           best_idx <= '0;
           ws_phase <= WSP_KICK;
         end
