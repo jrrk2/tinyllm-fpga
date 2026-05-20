@@ -4,38 +4,68 @@
 
 VINC      := /home/local/share/verilator/include
 SMOLLM    := ../../src/smollm
-TOP       := matvec_bfp_engine
 
-OBJDIR    := obj_dir
-DUT_LIB   := $(OBJDIR)/V$(TOP)__ALL.a
+# Per-module Verilator builds.  Each lives in obj_dir_<TOP>/ so they
+# don't share state.
+OBJDIR_MV := obj_dir_mv
+OBJDIR_SW := obj_dir_sw
+DUT_MV    := $(OBJDIR_MV)/Vmatvec_bfp_engine__ALL.a
+DUT_SW    := $(OBJDIR_SW)/Vswiglu_bfp__ALL.a
 
-# Verilator generates the per-module C++ headers + .a archive.
-$(DUT_LIB): $(SMOLLM)/$(TOP).sv $(SMOLLM)/bfp_format.svh
+$(DUT_MV): $(SMOLLM)/matvec_bfp_engine.sv $(SMOLLM)/bfp_format.svh
 	verilator -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-fatal \
 	          -CFLAGS "-fPIC -O2 -std=c++17" \
 	          --cc --build -j 0 --x-assign 0 --x-initial 0 \
+	          --Mdir $(OBJDIR_MV) \
 	          -I../../generated -I$(SMOLLM) \
-	          --top-module $(TOP) \
-	          $(SMOLLM)/$(TOP).sv
+	          --top-module matvec_bfp_engine \
+	          $(SMOLLM)/matvec_bfp_engine.sv
 
-# Verilator's runtime support (verilated.o + verilated_threads.o) needs to
-# be -fPIC too.
-$(OBJDIR)/verilated.o: $(VINC)/verilated.cpp
-	g++ -fPIC -O2 -std=c++17 -I$(VINC) -I$(OBJDIR) -c $(VINC)/verilated.cpp -o $@
-$(OBJDIR)/verilated_threads.o: $(VINC)/verilated_threads.cpp
-	g++ -fPIC -O2 -std=c++17 -I$(VINC) -I$(OBJDIR) -c $(VINC)/verilated_threads.cpp -o $@
+$(DUT_SW): $(SMOLLM)/swiglu_bfp.sv $(SMOLLM)/bfp_format.svh
+	verilator -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-fatal \
+	          -CFLAGS "-fPIC -O2 -std=c++17" \
+	          --cc --build -j 0 --x-assign 0 --x-initial 0 \
+	          --Mdir $(OBJDIR_SW) \
+	          -I../../generated -I$(SMOLLM) \
+	          --top-module swiglu_bfp \
+	          $(SMOLLM)/swiglu_bfp.sv
 
-libmv_cosim.so: mv_cosim.cpp $(DUT_LIB) $(OBJDIR)/verilated.o $(OBJDIR)/verilated_threads.o
+# Backward-compat (existing flow): point legacy OBJDIR/DUT_LIB at the
+# matvec build so any consumer that hasn't moved over still works.
+OBJDIR    := $(OBJDIR_MV)
+DUT_LIB   := $(DUT_MV)
+
+# Per-DUT verilated runtime objects (must be -fPIC for the .so).
+$(OBJDIR_MV)/verilated.o: $(VINC)/verilated.cpp
+	g++ -fPIC -O2 -std=c++17 -I$(VINC) -I$(OBJDIR_MV) -c $(VINC)/verilated.cpp -o $@
+$(OBJDIR_MV)/verilated_threads.o: $(VINC)/verilated_threads.cpp
+	g++ -fPIC -O2 -std=c++17 -I$(VINC) -I$(OBJDIR_MV) -c $(VINC)/verilated_threads.cpp -o $@
+$(OBJDIR_SW)/verilated.o: $(VINC)/verilated.cpp
+	g++ -fPIC -O2 -std=c++17 -I$(VINC) -I$(OBJDIR_SW) -c $(VINC)/verilated.cpp -o $@
+$(OBJDIR_SW)/verilated_threads.o: $(VINC)/verilated_threads.cpp
+	g++ -fPIC -O2 -std=c++17 -I$(VINC) -I$(OBJDIR_SW) -c $(VINC)/verilated_threads.cpp -o $@
+
+libmv_cosim.so: mv_cosim.cpp $(DUT_MV) $(OBJDIR_MV)/verilated.o $(OBJDIR_MV)/verilated_threads.o
 	g++ -fPIC -shared -O2 -std=c++17 \
-	    -I$(VINC) -I$(VINC)/vltstd -I$(OBJDIR) \
+	    -I$(VINC) -I$(VINC)/vltstd -I$(OBJDIR_MV) \
 	    mv_cosim.cpp \
-	    $(OBJDIR)/verilated.o $(OBJDIR)/verilated_threads.o \
-	    $(DUT_LIB) \
+	    $(OBJDIR_MV)/verilated.o $(OBJDIR_MV)/verilated_threads.o \
+	    $(DUT_MV) \
 	    -lpthread -latomic \
 	    -o libmv_cosim.so
 	@echo "[cosim] $$(readlink -f libmv_cosim.so)"
 
+libsw_cosim.so: sw_cosim.cpp $(DUT_SW) $(OBJDIR_SW)/verilated.o $(OBJDIR_SW)/verilated_threads.o
+	g++ -fPIC -shared -O2 -std=c++17 \
+	    -I$(VINC) -I$(VINC)/vltstd -I$(OBJDIR_SW) \
+	    sw_cosim.cpp \
+	    $(OBJDIR_SW)/verilated.o $(OBJDIR_SW)/verilated_threads.o \
+	    $(DUT_SW) \
+	    -lpthread -latomic \
+	    -o libsw_cosim.so
+	@echo "[cosim] $$(readlink -f libsw_cosim.so)"
+
 clean:
-	rm -rf obj_dir libmv_cosim.so
+	rm -rf obj_dir_mv obj_dir_sw libmv_cosim.so libsw_cosim.so
 
 .PHONY: clean
