@@ -733,6 +733,7 @@ obj_dir/Vtb_autoregress_bfp_stream: tb_autoregress_bfp_stream.sv tb_autoregress_
 	    -CFLAGS "-O2 -std=c++17" \
 	    --top-module tb_autoregress_bfp_stream \
 	    -I../generated -I$(SMOLLM_SRC) \
+	    $(if $(LBFP_DUMP_LAYER),+define+LBFP_STAGE_DUMP +define+LBFP_DUMP_LAYER=$(LBFP_DUMP_LAYER),) \
 	    tb_autoregress_bfp_stream.sv tb_autoregress_bfp_stream.cpp \
 	    mock_axi_slave.sv \
 	    $(SMOLLM_SRC)/autoregress_bfp_top.sv \

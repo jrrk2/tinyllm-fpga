@@ -1472,7 +1472,10 @@ module smollm_layer_bfp #(
     .AXI_ID_WIDTH   (AXI_ID_WIDTH),
     .IN_DIM_MAX     (FFN > D ? FFN : D),
     .IN_DIM_BITS    (12),
-    .CHUNK_BITS     (7)
+    .CHUNK_BITS     (7),
+    // Sim-only selftest shadow size = max matvec line count.  Largest
+    // is max(D*D, D*FFN, FFN*D)/16 = D * max(D, FFN) / 16.
+    .SIM_M_DEPTH_P  ((D * (D > FFN ? D : FFN)) / 16 + 16)
   ) i_ws (
     .clk_core      (clk),
     .rst_core      (rst),
@@ -2625,28 +2628,38 @@ module smollm_layer_bfp #(
   logic [BFP_MANT_W-1:0] sim_attn_m_flat[0:D-1];
   logic [BFP_MANT_W-1:0] sim_g_m_flat   [0:FFN-1];
   logic [BFP_MANT_W-1:0] sim_u_m_flat   [0:FFN-1];
+  // Gate: only dump at the target layer (set via +define+LBFP_DUMP_LAYER,
+  // default 0).  In the autoregress stream-sim 30 layers × 19 tokens
+  // would otherwise overwrite each other; gating to one layer keeps the
+  // last-token's view of that layer's state.  The single-layer selftest
+  // (tb_smollm_layer_bfp) drives layer_idx=0 + kv_pos=3 and runs once,
+  // so the default LBFP_DUMP_LAYER=0 matches.
+`ifndef LBFP_DUMP_LAYER
+  `define LBFP_DUMP_LAYER 0
+`endif
+  wire dump_ok = (layer_idx == `LBFP_DUMP_LAYER);
   always_ff @(posedge clk) begin
     if (rst) prev_state <= S_IDLE;
     else begin
       prev_state <= state;
-      if (prev_state == S_NORM1_WAIT && state == S_QMV_PRIME) begin
+      if (dump_ok && prev_state == S_NORM1_WAIT && state == S_QMV_PRIME) begin
         $writememh("rtl_n1_m.hex", i_n1_m_bram.mem);
         $writememh("rtl_n1_e.hex", n1_e);
       end
-      if (prev_state == S_QMV_REQ && state == S_QMV_NEXT) begin
+      if (dump_ok && prev_state == S_QMV_REQ && state == S_QMV_NEXT) begin
         // q_m now packed in i_q_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_qpre_e.hex", q_e);
       end
-      if (prev_state == S_KMV_REQ && state == S_KMV_NEXT) begin
+      if (dump_ok && prev_state == S_KMV_REQ && state == S_KMV_NEXT) begin
         // k_m now packed in i_k_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_kpre_e.hex", k_e);
       end
-      if (prev_state == S_VMV_REQ && state == S_VMV_NEXT) begin
+      if (dump_ok && prev_state == S_VMV_REQ && state == S_VMV_NEXT) begin
         // v_m packed in i_v_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_v_e.hex", v_e);
       end
       // Post-RoPE requant — both Q and K finished, transitioning to KVWR.
-      if (prev_state == S_ROPEK_RQ_B && state == S_KVWR_M) begin
+      if (dump_ok && prev_state == S_ROPEK_RQ_B && state == S_KVWR_M) begin
         for (int t = 0; t < (D + LANES - 1) / LANES; t++)
           for (int l = 0; l < LANES; l++)
             sim_q_m_flat[t*LANES + l] =
@@ -2661,14 +2674,14 @@ module smollm_layer_bfp #(
         $writememh("rtl_k_e.hex", k_e);
       end
       // After attention (S_AV_NEXT → S_OMV_PRIME)
-      if (prev_state == S_AV_NEXT && state == S_OMV_PRIME) begin
+      if (dump_ok && prev_state == S_AV_NEXT && state == S_OMV_PRIME) begin
         // attn_m is now packed (LANES entries per BRAM word) inside
         // i_attn_m_bram.i_word_ram.mem — dump suppressed pending an
         // unpacking helper.  [[task-4]]
         $writememh("rtl_attn_e.hex", attn_e);
       end
       // After softmax wait (S_SM_WAIT → S_AV_PRIME): scores + probs ready.
-      if (prev_state == S_SM_WAIT && state == S_AV_PRIME) begin
+      if (dump_ok && prev_state == S_SM_WAIT && state == S_AV_PRIME) begin
         $writememh("rtl_scores_m.hex", scores_m);
         $writememh("rtl_qkscore_e.hex", qk_score_e);
         $writememh("rtl_probs_m.hex", probs_m);
@@ -2676,7 +2689,7 @@ module smollm_layer_bfp #(
                  $signed(scores_e_shared), $signed(probs_e_shared));
       end
       // After O matvec (S_OMV_NEXT → S_RES1).
-      if (prev_state == S_OMV_NEXT && state == S_RES1) begin
+      if (dump_ok && prev_state == S_OMV_NEXT && state == S_RES1) begin
         // o_m is packed in i_o_m_bram.i_word_ram.mem (LANES entries per
         // 256-bit word).  Unpack lane-by-lane into a flat shadow for the
         // diff harness.
@@ -2688,32 +2701,32 @@ module smollm_layer_bfp #(
         $writememh("rtl_o_e.hex", o_e);
       end
       // After RES1 (S_RES1_WAIT → S_NORM2).
-      if (prev_state == S_RES1_WAIT && state == S_NORM2) begin
+      if (dump_ok && prev_state == S_RES1_WAIT && state == S_NORM2) begin
         $writememh("rtl_h1_m.hex", i_h1_m_bram.mem);
         $writememh("rtl_h1_e.hex", h1_e);
       end
       // After NORM2 (S_NORM2_WAIT → S_GMV_PRIME).
-      if (prev_state == S_NORM2_WAIT && state == S_GMV_PRIME) begin
+      if (dump_ok && prev_state == S_NORM2_WAIT && state == S_GMV_PRIME) begin
         $writememh("rtl_n2_m.hex", i_n2_m_bram.mem);
         $writememh("rtl_n2_e.hex", n2_e);
       end
       // After GMV (S_GMV_NEXT → S_UMV_PRIME).
-      if (prev_state == S_GMV_NEXT && state == S_UMV_PRIME) begin
+      if (dump_ok && prev_state == S_GMV_NEXT && state == S_UMV_PRIME) begin
         // g_m packed in i_g_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_g_e.hex", g_e);
       end
       // After UMV (S_UMV_NEXT → S_SWG).
-      if (prev_state == S_UMV_NEXT && state == S_SWG) begin
+      if (dump_ok && prev_state == S_UMV_NEXT && state == S_SWG) begin
         // u_m packed in i_u_m_bram.i_word_ram.mem — dump suppressed.
         $writememh("rtl_u_e.hex", u_e);
       end
       // After SWG (S_SWG_WAIT → S_DMV_PRIME).
-      if (prev_state == S_SWG_WAIT && state == S_DMV_PRIME) begin
+      if (dump_ok && prev_state == S_SWG_WAIT && state == S_DMV_PRIME) begin
         $writememh("rtl_mlp_m.hex", i_mlp_m_bram.mem);
         $writememh("rtl_mlp_e.hex", mlp_e);
       end
       // After DMV (S_DMV_NEXT → S_RES2).
-      if (prev_state == S_DMV_NEXT && state == S_RES2) begin
+      if (dump_ok && prev_state == S_DMV_NEXT && state == S_RES2) begin
         // d_m is now packed inside i_d_m_bram.i_word_ram.mem (see attn_m).
         $writememh("rtl_d_e.hex", d_e);
       end

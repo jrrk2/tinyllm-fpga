@@ -362,9 +362,12 @@ attn = fp_quantize_vec(attn)
 if golden_scores is not None:
     s_pad = np.zeros(MAX_CTX); s_pad[:KV_POS+1] = golden_scores
     p_pad = np.zeros(MAX_CTX); p_pad[:KV_POS+1] = golden_probs
-    # scores: pad to TILE for tile_quantize, then take first MAX_CTX
-    s_padT = np.zeros(TILE); s_padT[:MAX_CTX] = s_pad
-    p_padT = np.zeros(TILE); p_padT[:MAX_CTX] = p_pad
+    # scores: pad to next TILE multiple so tile_quantize can reshape;
+    # take first MAX_CTX elements afterwards.  Originally assumed
+    # MAX_CTX ≤ TILE — fails for smollm360's MAX_CTX=32.
+    pad_to = ((MAX_CTX + TILE - 1) // TILE) * TILE
+    s_padT = np.zeros(pad_to); s_padT[:MAX_CTX] = s_pad
+    p_padT = np.zeros(pad_to); p_padT[:MAX_CTX] = p_pad
     sm_, se_ = tile_quantize(s_padT); pm_, pe_ = tile_quantize(p_padT)
     write_hex(os.path.join(OUT, f"{PREFIX}STAGE_SCORES_m.hex"), sm_.flatten()[:MAX_CTX], 4)
     write_hex(os.path.join(OUT, f"{PREFIX}STAGE_SCORES_e.hex"), [int(se_[0])]*MAX_CTX, 2)

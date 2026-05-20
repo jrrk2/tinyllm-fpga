@@ -24,7 +24,12 @@ module weight_streamer_bfp_mt #(
   parameter int IN_DIM_MAX     = 1536,      // largest matvec input dim (FFN)
   parameter int IN_DIM_BITS    = 12,        // bits for in_dim (1536 fits 11)
   parameter int CHUNK_BITS     = 7,         // chunks per output dim (max 96 for FFN)
-  parameter int MAX_AR_LEN     = 256        // AXI burst max-beats (MIG default)
+  parameter int MAX_AR_LEN     = 256,       // AXI burst max-beats (MIG default)
+  // Sim-only selftest shadow sizing.  Default (1<<14) suits the
+  // D=64 layer-selftest; the layer module overrides to cover the
+  // largest matvec (max(out_dim) × max(in_dim) / 16) when running at
+  // real-model dims.  Caller computes max(D*D, D*FFN, FFN*D) / 16.
+  parameter int SIM_M_DEPTH_P  = 1 << 14
 )(
   // ------------------------------------------------------------------
   //  Consumer side (clk_core)
@@ -382,8 +387,12 @@ module weight_streamer_bfp_mt #(
   //  load_req (= ws_base_*=0 selftest config); production reads still
   //  flow through bank_m / bank_e.
   // ------------------------------------------------------------------
-  localparam int SIM_M_DEPTH = 16384;    // chunk × col, large enough for selftest
-  localparam int SIM_E_DEPTH = 1024;     // chunk × tile
+  // Selftest shadow sizing — driven by the SIM_M_DEPTH_P parameter so the
+  // smollm_layer_bfp instantiation can compute max(D*D, D*FFN, FFN*D)/16
+  // and override.  E_DEPTH is shadow_lines / 16 since exponents are tile-
+  // shared.
+  localparam int SIM_M_DEPTH   = SIM_M_DEPTH_P;
+  localparam int SIM_E_DEPTH   = (SIM_M_DEPTH + 15) / 16 + 1;
   // $readmemh needs a single-dim destination; use one array per matvec_id
   // rather than a 2-D shadow[7][...] (this is a Verilator limitation).
   logic [255:0] sim_shadow_m_Q  [0:SIM_M_DEPTH-1];
