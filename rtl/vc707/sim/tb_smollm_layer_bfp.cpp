@@ -41,8 +41,15 @@ int main(int argc, char** argv) {
   for (int i = 0; i < 8; i++) tick();
   d->rst = 0; tick();
   d->go = 1; tick();
-  // Long limit — layer with D=64/FFN=128 + chunked LANES=16 takes ~30K cycles
-  const uint64_t LIM = 2000000;
+  // Long limit — layer with D=64/FFN=128 + chunked LANES=16 takes ~30K cycles.
+  // Env LBFP_MAX_CYCLE truncates the run for focused VCD captures (e.g. just
+  // the Q matvec's first chunk).  Default = uncapped.
+  uint64_t LIM = 2000000;
+  if (const char* p = std::getenv("LBFP_MAX_CYCLE")) {
+    LIM = std::strtoull(p, nullptr, 0);
+    std::fprintf(stderr, "[tb] capping at cycle %llu\n",
+                 (unsigned long long)LIM);
+  }
   while (!d->done && cycle < LIM) tick();
   if (cycle >= LIM) { std::fprintf(stderr, "TIMEOUT @ cycle %llu\n",
                                    (unsigned long long)cycle);

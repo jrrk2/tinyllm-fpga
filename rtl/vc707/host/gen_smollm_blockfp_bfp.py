@@ -329,6 +329,15 @@ n1_m, n1_e = tile_quantize(n1)
 q = matvec_hw_golden(n1_m, n1_e, Wq_m, Wq_e)
 k = matvec_hw_golden(n1_m, n1_e, Wk_m, Wk_e)
 v = matvec_hw_golden(n1_m, n1_e, Wv_m, Wv_e)
+# Snapshot the pre-RoPE matvec output of Q so we can diff RTL's raw
+# matvec engine output against it (the existing STAGE_Q is post-RoPE).
+_qpre_m, _qpre_e = tile_quantize(q)
+with open(os.path.join(OUT, f"{PREFIX}STAGE_QPRE_m.hex"), "w") as fh:
+    for _x in _qpre_m.flatten():
+        fh.write(f"{int(_x) & 0xffff:04x}\n")
+with open(os.path.join(OUT, f"{PREFIX}STAGE_QPRE_e.hex"), "w") as fh:
+    for _x in _qpre_e.flatten():
+        fh.write(f"{int(_x) & 0xff:02x}\n")
 for h_i in range(H_Q):  q[h_i*HD:(h_i+1)*HD] = rope_fp(q[h_i*HD:(h_i+1)*HD], POS)
 for h_i in range(H_KV): k[h_i*HD:(h_i+1)*HD] = rope_fp(k[h_i*HD:(h_i+1)*HD], POS)
 # Write current step into KV cache slot KV_POS
