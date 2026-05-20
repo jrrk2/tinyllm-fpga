@@ -149,15 +149,24 @@ module softmax_bfp #(
             n_r     <= n_elems;
           end
           in_cnt <= in_cnt + 1'b1;
+`ifdef LBFP_STAGE_DUMP
+          $display("[sm] LOAD i=%0d x_m=%0d x_e=%0d", in_cnt, $signed(in_x_mant), $signed(in_x_exp));
+`endif
           if (in_cnt == n_elems - 1) begin
             state   <= S_EXP;
             exp_cnt <= '0;
+`ifdef LBFP_STAGE_DUMP
+            $display("[sm] LOAD done max_r=%0d sum_will_compute_in_EXP", $signed(max_r));
+`endif
           end
         end
         S_EXP: begin
           e_buf[exp_cnt] <= exp_lut[lut_idx];
           sum_e_r        <= sum_e_r + {16'd0, exp_lut[lut_idx]};
           exp_cnt        <= exp_cnt + 1'b1;
+`ifdef LBFP_STAGE_DUMP
+          $display("[sm] EXP i=%0d lut_idx=%0d e=%h sum=%h", exp_cnt, lut_idx, exp_lut[lut_idx], sum_e_r);
+`endif
           if (exp_cnt == n_r - 1) begin
             state  <= S_RECIP;
             nr_cnt <= '0;
@@ -167,6 +176,9 @@ module softmax_bfp #(
           if (nr_cnt == 3'd0) begin
             rcp_y  <= rcp_y0_seed;
             nr_cnt <= 3'd1;
+`ifdef LBFP_STAGE_DUMP
+            $display("[sm] RECIP start sum_e_r=%h rcp_y0_seed=%h rcp_msb=%0d", sum_e_r, rcp_y0_seed, rcp_msb);
+`endif
           end else begin
             rcp_y <= rcp_next[63:32];
             if (nr_cnt == 3'd4) begin
@@ -174,33 +186,43 @@ module softmax_bfp #(
               state     <= S_NORM;
               norm_cnt  <= '0;
               max_norm_lead <= '0;
+`ifdef LBFP_STAGE_DUMP
+              $display("[sm] RECIP done inv_sum=%h", rcp_next[63:32]);
+`endif
             end
             nr_cnt <= nr_cnt + 1'b1;
           end
         end
-        S_NORM: begin
+        S_NORM: begin : norm_body
           // Compute norm_prod = e_buf[k] * inv_sum  (16 × 32 = 48-bit)
-          begin : norm_compute
-            automatic logic [BFP_ACC_W-1:0] prod;
-            automatic logic [5:0]           lp;
-            prod = {16'd0, e_buf[norm_cnt]} * {16'd0, inv_sum_r};
-            norm_prods[norm_cnt] <= prod;
-            lp = lead_bit_48(prod);
-            if (lp > max_norm_lead) max_norm_lead <= lp;
-          end
+          automatic logic [BFP_ACC_W-1:0] prod;
+          automatic logic [5:0]           lp;
+          prod = {16'd0, e_buf[norm_cnt]} * {16'd0, inv_sum_r};
+          norm_prods[norm_cnt] <= prod;
+          lp = lead_bit_48(prod);
+`ifdef LBFP_STAGE_DUMP
+          $display("[sm] NORM i=%0d e_buf=%h inv_sum=%h prod=%h lp=%0d max_norm_lead_was=%0d",
+                   norm_cnt, e_buf[norm_cnt], inv_sum_r, prod, lp, max_norm_lead);
+`endif
+          if (lp > max_norm_lead) max_norm_lead <= lp;
           if (norm_cnt == n_r - 1) begin
-            // Once all norm_prods computed: shift = max_lead - 14 (for int16)
-            // Final out_e = -32 + shift_amt (-32 from 2^-32 in inv_sum * 2^0 in e_buf)
-            // since inv_sum = 2^32 * 1/sum_e (NR output), and e_buf is Q1.15 representing prob mass.
-            // Detailed: y_real = e_buf * inv_sum / 2^32 / 2^15  (e_buf Q1.15, inv_sum has 2^32 factor)
-            //         = norm_prod * 2^-47
-            // For Q1.15 output at exp e_y: y_int / 2^15 * 2^e_y = norm_prod * 2^-47
-            //   y_int = norm_prod * 2^(-47 + 15 - e_y) = norm_prod * 2^(-32 - e_y)
-            //   y_int = norm_prod >> shift  ⇒  shift = 32 + e_y
-            //   e_y = shift - 32
+            // Current cycle's `lp` (for norm_cnt = n_r-1) hasn't been
+            // folded into max_norm_lead yet (non-blocking <=), so
+            // out_shift_r needs to compare against max(max_norm_lead, lp)
+            // — otherwise when the LAST entry holds the leading bit
+            // (e.g. current-step kv_t==kv_pos dominating attention) the
+            // shift is computed from an under-counted max and the
+            // output exponent ends up far too small.  Common case for
+            // multi-head attention where the max prob is at kv_pos.
+            automatic logic [4:0] eff_max =
+                (lp > max_norm_lead) ? lp[4:0] : max_norm_lead;
             state    <= S_OUTPUT;
             out_cnt  <= '0;
-            out_shift_r <= $signed({2'b0, max_norm_lead}) - 8'sd14;
+            out_shift_r <= $signed({2'b0, eff_max}) - 8'sd14;
+`ifdef LBFP_STAGE_DUMP
+            $display("[sm] NORM done max_norm_lead=%0d eff_max=%0d out_shift_r=%0d",
+                     max_norm_lead, eff_max, $signed({2'b0, eff_max}) - 8'sd14);
+`endif
           end else begin
             norm_cnt <= norm_cnt + 1'b1;
           end

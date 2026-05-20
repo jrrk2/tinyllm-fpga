@@ -344,7 +344,12 @@ for h_i in range(H_Q):
     for t in range(KV_POS + 1):
         scores[t] = float(np.dot(q[h_i*HD:(h_i+1)*HD], kv_K[t, kvh])) / math.sqrt(HD)
     sm = softmax_fp(scores)
-    if h_i == 0:
+    # Save the LAST head's scores/probs — the RTL layer's $writememh
+    # of scores_m / probs_m fires once per head (per S_SM_WAIT → S_AV_PRIME
+    # transition) and is overwritten each iteration, so the file holds
+    # whichever head ran last.  Comparing against any other head's golden
+    # would be apples-to-oranges.
+    if h_i == H_Q - 1:
         golden_scores = scores.copy()
         golden_probs  = sm.copy()
     for t in range(KV_POS + 1):
