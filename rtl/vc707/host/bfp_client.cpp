@@ -1834,8 +1834,13 @@ int main(int argc, char** argv) {
             if (int rc = load_roms(u, rom_dir); rc != 0) return rc;
             std::printf("[all] verify-roms %s\n", rom_dir.c_str());
             if (int rc = verify_roms(u, rom_dir); rc != 0) return rc;
+            // `all` is the bulk-bring-up path — use probe-then-commit by
+            // default (target_mbps=0) so we don't crawl at the global 2 MB/s
+            // default.  User can still override with -r.
+            double all_mbps = target_mbps;
+            if (target_mbps == 2.0) all_mbps = 0.0;  // default → adaptive
             upload(u, peer_ip, peer_port, bin, 0, 4,
-                   lead_limit, poll_ms, target_mbps, backlog_limit);
+                   lead_limit, poll_ms, all_mbps, backlog_limit);
             // Settle: the BFP autoregress auto-restarts in a perpetual
             // loop (bfp_start_r self-fires whenever lay_done is low), so
             // it's almost certainly mid-run when upload finishes — its
