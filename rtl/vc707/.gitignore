@@ -45,3 +45,5 @@ sim/synth_factor_ram_*.v
 sim/synth_factor_ram_util.rpt
 sim/synth_factor_ram.dcp
 sim/*.dcp
+sim/cosim/libmv_cosim.so
+sim/cosim/obj_dir/
