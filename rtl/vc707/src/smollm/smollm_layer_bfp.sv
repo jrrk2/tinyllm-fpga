@@ -657,6 +657,13 @@ module smollm_layer_bfp #(
   // ---------------------------------------------------------------------------
   logic [BFP_MANT_W-1:0] rd_G1_m, rd_G2_m;
   logic [BFP_EXP_W -1:0] rd_G1_e, rd_G2_e;
+  // Debug peek — reads the layer's persistent hout_m / hout_e arrays.
+  // After the multilayer wrapper finishes its NL passes, these hold the
+  // LAST layer's hidden_out (= the decode_head's input).  Host can read
+  // via wr_kind=10 (mantissa) / wr_kind=11 (per-tile exponent) to verify
+  // whether the layer chain is collapsing to zero / NaN.
+  logic [BFP_MANT_W-1:0] rd_hout_m;
+  logic [BFP_EXP_W -1:0] rd_hout_e;
   logic [4:0]            wr_kind_q;
 
   always_ff @(posedge clk_wr) begin
@@ -674,6 +681,8 @@ module smollm_layer_bfp #(
     rd_G1_e   <= rom_G1_e[wr_addr[$clog2(NL*NT_D)-1:0]];
     rd_G2_m   <= rom_G2_m[wr_addr[$clog2(NL*D)-1:0]];
     rd_G2_e   <= rom_G2_e[wr_addr[$clog2(NL*NT_D)-1:0]];
+    rd_hout_m <= hout_m[wr_addr[$clog2(D)-1:0]];
+    rd_hout_e <= hout_e[wr_addr[$clog2(NT_D)-1:0]];
     wr_kind_q <= wr_kind;
   end
 
@@ -683,6 +692,8 @@ module smollm_layer_bfp #(
       5'd1: wr_rdata = {{(16-BFP_EXP_W ){rd_G1_e[BFP_EXP_W -1]}}, rd_G1_e};
       5'd2: wr_rdata = {{(16-BFP_MANT_W){rd_G2_m[BFP_MANT_W-1]}}, rd_G2_m};
       5'd3: wr_rdata = {{(16-BFP_EXP_W ){rd_G2_e[BFP_EXP_W -1]}}, rd_G2_e};
+      5'd10: wr_rdata = {{(16-BFP_MANT_W){rd_hout_m[BFP_MANT_W-1]}}, rd_hout_m};
+      5'd11: wr_rdata = {{(16-BFP_EXP_W ){rd_hout_e[BFP_EXP_W -1]}}, rd_hout_e};
       default: wr_rdata = 16'h0000;
     endcase
   end

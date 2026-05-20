@@ -1338,6 +1338,65 @@ static int verify_rom(Udp& u, int kind, const std::vector<uint16_t>& entries,
     return bad.empty() ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------
+// Subcommand: peek-layer
+// ---------------------------------------------------------------------
+// Reads the persistent hout_m / hout_e arrays inside smollm_layer_bfp
+// via debug wr_kind=10/11.  Since the multilayer wrapper iterates a
+// SINGLE layer instance NL times, after the run finishes these hold
+// the LAST layer's hidden_out — i.e. the decode_head's input.  Lets
+// us see whether the layer chain is collapsing to zero / NaN before
+// the head turns it into garbage token IDs.
+//
+// Output format: two columns per tile — mantissas (D entries, signed
+// 16-bit) and shared exponents (NT_D entries, signed 8-bit).
+static int peek_layer(Udp& u, int D) {
+    if (D <= 0 || D % 16 != 0) {
+        std::fprintf(stderr, "peek-layer: D must be a positive multiple of 16 (got %d)\n", D);
+        return 2;
+    }
+    const int NT_D = D / 16;
+    uint8_t seq = 200;
+    std::vector<int16_t> mant(D);
+    std::vector<int8_t>  expn(NT_D);
+    for (int i = 0; i < D; ++i) {
+        uint32_t target = (0u << 31)
+                        | (uint32_t(10 & 0x1f) << 18)
+                        | (uint32_t(i) & 0x3ffff);
+        std::vector<RegW> one = {{REG_BRAM_TARGET, target}};
+        send_reg_write_batch(u, seq++, one);
+        uint16_t got = reg_read(u, REG_BRAM_READ, 1, seq++)[0] & 0xffff;
+        mant[i] = int16_t(got);
+    }
+    for (int i = 0; i < NT_D; ++i) {
+        uint32_t target = (0u << 31)
+                        | (uint32_t(11 & 0x1f) << 18)
+                        | (uint32_t(i) & 0x3ffff);
+        std::vector<RegW> one = {{REG_BRAM_TARGET, target}};
+        send_reg_write_batch(u, seq++, one);
+        uint16_t got = reg_read(u, REG_BRAM_READ, 1, seq++)[0] & 0xffff;
+        expn[i] = int8_t(got & 0xff);
+    }
+    // Print one tile per line so it's easy to spot zero/NaN regions.
+    std::printf("[peek-layer] D=%d NT_D=%d (last layer's hout_m / hout_e)\n", D, NT_D);
+    int zero_tiles = 0;
+    int nonzero_mants = 0;
+    for (int t = 0; t < NT_D; ++t) {
+        int tile_nz = 0;
+        std::printf("tile %02d  e=%4d  m:", t, int(expn[t]));
+        for (int k = 0; k < 16; ++k) {
+            int16_t m = mant[t*16 + k];
+            std::printf(" %6d", int(m));
+            if (m != 0) { tile_nz++; nonzero_mants++; }
+        }
+        std::printf("  (%d nz)\n", tile_nz);
+        if (tile_nz == 0) zero_tiles++;
+    }
+    std::printf("[peek-layer] summary: %d/%d tiles all-zero, %d/%d mantissas non-zero\n",
+                zero_tiles, NT_D, nonzero_mants, D);
+    return 0;
+}
+
 int verify_roms(Udp& u, const std::string& dir) {
     struct Entry { int kind; const char* name; bool optional; };
     const Entry roms[] = {
@@ -1554,6 +1613,9 @@ void usage() {
         "                     read 10 result words from 0x1D0, decode\n"
         "                     through vocab (auto-found), print hash\n"
         "  peek-tokens        read current result_tokens without restart\n"
+        "  peek-layer <D>     read last layer's hout_m/hout_e via debug\n"
+        "                     wr_kind=10/11 (D=hidden dim, e.g. 960 for\n"
+        "                     smollm360, 576 for smollm135)\n"
         "  read-crc           read FPGA rolling hash of weight-bus reads\n"
         "                     since last restart (matches across runs of\n"
         "                     the same DDR3 contents)\n"
@@ -1732,6 +1794,11 @@ int main(int argc, char** argv) {
             print_tokens(u, vocab.get(), n_steps);
             print_crc(u);
             return 0;
+        }
+        if (cmd == "peek-layer") {
+            if (argi >= argc) { usage(); return 2; }
+            int D = std::atoi(argv[argi]);
+            return peek_layer(u, D);
         }
         if (cmd == "read-crc") {
             print_crc(u);

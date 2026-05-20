@@ -129,6 +129,10 @@ module autoregress_bfp_top #(
       5'd0, 5'd1, 5'd2, 5'd3: wr_rdata = lay_wr_rdata;
       5'd4, 5'd5:             wr_rdata = dec_wr_rdata;
       5'd6:                   wr_rdata = rd_prompt;
+      // wr_kind 10/11 — debug peek of the LAST layer's hout_m / hout_e
+      // (i.e. the decode-head input).  See smollm_layer_bfp's wr_rdata
+      // mux for the actual read path.
+      5'd10, 5'd11:           wr_rdata = lay_wr_rdata;
       default:                wr_rdata = 16'h0000;
     endcase
   end
