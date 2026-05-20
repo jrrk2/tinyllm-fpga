@@ -1472,7 +1472,10 @@ module smollm_layer_bfp #(
     .AXI_ID_WIDTH   (AXI_ID_WIDTH),
     .IN_DIM_MAX     (FFN > D ? FFN : D),
     .IN_DIM_BITS    (12),
-    .CHUNK_BITS     (7),
+    // chunks_out = max(D, FFN) / LANES.  For smollm360 FFN=2560/16=160
+    // → needs 8 bits.  7 bits silently wraps chunks 128..159 to 0..31
+    // on G/U/DN matvecs, corrupting the upper third of the mlp output.
+    .CHUNK_BITS     (8),
     // Sim-only selftest shadow size = max matvec line count.  Largest
     // is max(D*D, D*FFN, FFN*D)/16 = D * max(D, FFN) / 16.
     .SIM_M_DEPTH_P  ((D * (D > FFN ? D : FFN)) / 16 + 16)
@@ -2712,12 +2715,24 @@ module smollm_layer_bfp #(
       end
       // After GMV (S_GMV_NEXT → S_UMV_PRIME).
       if (dump_ok && prev_state == S_GMV_NEXT && state == S_UMV_PRIME) begin
-        // g_m packed in i_g_m_bram.i_word_ram.mem — dump suppressed.
+        // Unpack g_m from packed BRAM (LANES per 256-bit word) so the
+        // diff harness can see per-output values.  Needed for chasing
+        // the smollm360 mlp-stage divergence — diff_stages.py was
+        // blind to g_m / u_m until this dump.
+        for (int t = 0; t < (FFN + LANES - 1) / LANES; t++)
+          for (int l = 0; l < LANES; l++)
+            sim_g_m_flat[t*LANES + l] =
+                i_g_m_bram.i_word_ram.mem[t][l*BFP_MANT_W +: BFP_MANT_W];
+        $writememh("rtl_g_m.hex", sim_g_m_flat);
         $writememh("rtl_g_e.hex", g_e);
       end
       // After UMV (S_UMV_NEXT → S_SWG).
       if (dump_ok && prev_state == S_UMV_NEXT && state == S_SWG) begin
-        // u_m packed in i_u_m_bram.i_word_ram.mem — dump suppressed.
+        for (int t = 0; t < (FFN + LANES - 1) / LANES; t++)
+          for (int l = 0; l < LANES; l++)
+            sim_u_m_flat[t*LANES + l] =
+                i_u_m_bram.i_word_ram.mem[t][l*BFP_MANT_W +: BFP_MANT_W];
+        $writememh("rtl_u_m.hex", sim_u_m_flat);
         $writememh("rtl_u_e.hex", u_e);
       end
       // After SWG (S_SWG_WAIT → S_DMV_PRIME).

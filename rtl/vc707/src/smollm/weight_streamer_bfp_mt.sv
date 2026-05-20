@@ -23,7 +23,7 @@ module weight_streamer_bfp_mt #(
   parameter int AXI_ID_WIDTH   = 5,
   parameter int IN_DIM_MAX     = 1536,      // largest matvec input dim (FFN)
   parameter int IN_DIM_BITS    = 12,        // bits for in_dim (1536 fits 11)
-  parameter int CHUNK_BITS     = 7,         // chunks per output dim (max 96 for FFN)
+  parameter int CHUNK_BITS     = 8,         // chunks per output dim (default 8 covers FFN=4096; caller can override)
   parameter int MAX_AR_LEN     = 256,       // AXI burst max-beats (MIG default)
   // Sim-only selftest shadow sizing.  Default (1<<14) suits the
   // D=64 layer-selftest; the layer module overrides to cover the
