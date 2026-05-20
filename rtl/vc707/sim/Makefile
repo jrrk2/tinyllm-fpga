@@ -624,6 +624,7 @@ obj_dir/Vtb_smollm_layer_bfp: tb_smollm_layer_bfp.sv tb_smollm_layer_bfp.cpp \
 	    -j 0 --x-assign 0 --x-initial 0 \
 	    -CFLAGS "-O2 -std=c++17" \
 	    --top-module tb_smollm_layer_bfp \
+	    --trace \
 	    -I../generated -I$(SMOLLM_SRC) \
 	    +define+LBFP_STAGE_DUMP \
 	    +define+LBFP_STREAMER_SELFTEST \

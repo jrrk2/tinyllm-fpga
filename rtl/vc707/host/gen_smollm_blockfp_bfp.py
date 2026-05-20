@@ -385,6 +385,16 @@ u_vec = matvec_hw_golden(n2_m, n2_e, Wu_m, Wu_e)
 mlp = fp_quantize_vec(silu_fp(g_vec) * u_vec)
 mlp_m, mlp_e = tile_quantize(mlp)
 d_vec = matvec_hw_golden(mlp_m, mlp_e, Wd_m, Wd_e)
+# Dump per-output values of the DN matvec for cross-check against RTL's
+# matvec_bfp_engine output (extracted from VCD).  Each line: tab-sep
+# float value (lane 0..15 per chunk).
+_dn_m, _dn_e = tile_quantize(d_vec)
+with open(os.path.join(OUT, f"{PREFIX}STAGE_DN_m.hex"), "w") as fh:
+    for _x in _dn_m.flatten():
+        fh.write(f"{int(_x) & 0xffff:04x}\n")
+with open(os.path.join(OUT, f"{PREFIX}STAGE_DN_e.hex"), "w") as fh:
+    for _x in _dn_e.flatten():
+        fh.write(f"{int(_x) & 0xff:02x}\n")
 h_out = fp_quantize_vec(h1 + d_vec)
 
 # Write golden hidden_out
