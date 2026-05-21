@@ -59,27 +59,24 @@ if {[llength [get_files -quiet *progmem_bram.v]] == 0} {
 # later swaps it in the built .bit via updatemem (needs the .mmi from below).
 set _fw_mem [file normalize src/soc/firmware_shell.mem]
 
-# Integrated ILA is OPT-IN (PICOSOC_ILA=1) — the in-script IP clone wasn't
-# producing a usable .xci in batch.  Default build has NO ILA so it always
-# synthesizes; the (* mark_debug *) nets in the shell are preserved either way,
-# so an ILA can be inserted in Vivado via "Set Up Debug".
-set _ila [expr {[info exists ::env(PICOSOC_ILA)] && [string trim $::env(PICOSOC_ILA)] ne ""}]
+# Integrated ILA (default ON; PICOSOC_ILA=0 disables).  Uses a COMMITTED,
+# renamed copy of the ILA IP (ip/picosoc_ila/.../picosoc_ila.xci) read via
+# read_ip — the reliable pattern; copy_ip/create_ip in batch left a dangling
+# .xci.  Reconfigured to 8 probes below.  NOTE: a project from an earlier
+# (broken) attempt must be wiped (`make wipe-project`) so this read_ip applies.
+set _ila [expr {![info exists ::env(PICOSOC_ILA)] || [string trim $::env(PICOSOC_ILA)] ne "0"}]
 
 set _defs [list "PICORV32_REGS=picosoc_regs" "PROGMEM_HEX=\"$_fw_mem\""]
 if {$_ila} { lappend _defs "PICOSOC_ILA" }
 set_property verilog_define $_defs [current_fileset]
 
 if {$_ila} {
-    # Clone the repo's existing ILA IP and reconfigure to 8 probes.  Widths MUST
-    # match the shell's i_ila ports: 0 trace_valid(1) 1 trace_data(36)
-    # 2 iomem_valid(1) 3 iomem_ready(1) 4 iomem_wstrb(4) 5 iomem_addr(32)
-    # 6 iomem_wdata(32) 7 iomem_rdata(32).
     if {[llength [get_ips -quiet picosoc_ila]] == 0} {
-        if {[llength [get_ips -quiet microgpt_ila_core]] == 0} {
-            read_ip { "ip/microgpt_ila_core/microgpt_ila_core.srcs/sources_1/ip/microgpt_ila_core/microgpt_ila_core.xci" }
-        }
-        copy_ip -name picosoc_ila [get_ips microgpt_ila_core]
+        read_ip { "ip/picosoc_ila.xci" }
     }
+    # Probe count + depth first, then per-probe widths.  MUST match i_ila ports:
+    #   0 trace_valid(1) 1 trace_data(36) 2 iomem_valid(1) 3 iomem_ready(1)
+    #   4 iomem_wstrb(4) 5 iomem_addr(32) 6 iomem_wdata(32) 7 iomem_rdata(32)
     set_property -dict [list CONFIG.C_NUM_OF_PROBES {8} CONFIG.C_DATA_DEPTH {4096}] [get_ips picosoc_ila]
     set_property -dict [list \
         CONFIG.C_PROBE0_WIDTH {1}    CONFIG.C_PROBE1_WIDTH {36} \
@@ -87,13 +84,7 @@ if {$_ila} {
         CONFIG.C_PROBE4_WIDTH {4}    CONFIG.C_PROBE5_WIDTH {32} \
         CONFIG.C_PROBE6_WIDTH {32}   CONFIG.C_PROBE7_WIDTH {32} \
     ] [get_ips picosoc_ila]
-    generate_target {synthesis} [get_ips picosoc_ila]
-} else {
-    # Drop any stale/broken picosoc_ila reference (e.g. a missing .xci from an
-    # earlier attempt) so the default build doesn't choke on it.
-    if {[llength [get_files -quiet *picosoc_ila.xci]] > 0} {
-        remove_files [get_files -quiet *picosoc_ila.xci]
-    }
+    generate_target {synthesis instantiation_template} [get_ips picosoc_ila]
 }
 
 # ===== PicoSoC bring-up shell source set (merged from run_picosoc.tcl) =====
