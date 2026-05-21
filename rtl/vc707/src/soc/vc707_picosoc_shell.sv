@@ -313,11 +313,14 @@ module vc707_picosoc_shell (
 `ifdef PICOSOC_ILA
   picosoc_ila i_ila (
     .clk    (eth_clk),
-    .probe0 (trace_valid),
-    .probe1 (trace_data),
-    .probe2 (iomem_valid),
-    .probe3 (iomem_addr),
-    .probe4 (ddr_done)
+    .probe0 (trace_valid),   // 1
+    .probe1 (trace_data),    // 36 — PicoRV32 execution trace
+    .probe2 (iomem_valid),   // 1
+    .probe3 (iomem_ready),   // 1
+    .probe4 (iomem_wstrb),   // 4  — 0 = read, else write byte-enables
+    .probe5 (iomem_addr),    // 32 — 0x03 LED / 0x10 dummy / 0x20 eth / 0x30 DDR
+    .probe6 (iomem_wdata),   // 32
+    .probe7 (iomem_rdata)    // 32
   );
 `endif
 
