@@ -67,6 +67,7 @@ module autoregress_bfp_top #(
   // via wr_kind 12 (mantissa) / 13 (per-tile exponent).
   input  wire [4:0]                    snap_layer_sel,
   input  wire [10:0]                   snap_step_sel,
+  input  wire [4:0]                    dbg_stage_sel,   // per-stage exp read (wr_kind 16)
   // Freeze the engine at the programmed (snap_layer_sel, snap_step_sel) for
   // ILA / hout inspection — passed straight to the multilayer engine.
   input  wire                          freeze_en,
@@ -299,6 +300,7 @@ module autoregress_bfp_top #(
     .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(wr_data), .wr_en(wr_en),
     .clk_wr(clk_wr), .wr_rdata(lay_wr_rdata),
     .snap_layer_sel(snap_layer_sel), .snap_step_sel(snap_step_sel),
+    .dbg_stage_sel(dbg_stage_sel),
     .freeze_en(freeze_en),
     .trig_cyc_en(trig_cyc_en), .trig_cyc(trig_cyc),
     .dbg_cyc(dbg_cyc), .dbg_cur_layer(dbg_cur_layer), .dbg_frozen(dbg_frozen)

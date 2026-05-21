@@ -223,7 +223,7 @@ lbfp_full_DDR3_stamp := $(GENERATED_DIR)/.lbfp_full_DDR3.stamp
 # you want a deterministic suffix for a specific session.
 BUILD_STAMP ?= $(shell date -u +%Y%m%d-%H%M%S)
 
-VARIANT ?= smollm135
+VARIANT ?= smollm360
 
 ## Per-VARIANT defaults.  MAX_CTX/NPROMPT_MAX/N_GEN use `?=` so a command
 ## line `make MAX_CTX=64 ...` still wins (command-line vars > makefile

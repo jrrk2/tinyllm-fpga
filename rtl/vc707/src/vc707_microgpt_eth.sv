@@ -505,6 +505,16 @@ module vc707_microgpt_eth (
       trig_cyc_en_reg <= jtag_master_writedata[0];
   end
 
+  // Per-stage exponent read-out select (0..13 → n1/q/k/v/attn/o/h1/n2/g/u/mlp/
+  // d/hout/hin).  Host writes 0x070; read the stage's exponents via wr_kind 16.
+  reg [4:0] dbg_stage_sel_reg;
+  always @(posedge eth_clk) begin
+    if (rst_sys)
+      dbg_stage_sel_reg <= 5'd0;
+    else if (jtag_master_write && jtag_word_addr == 10'h070)
+      dbg_stage_sel_reg <= jtag_master_writedata[4:0];
+  end
+
   // Eth-side shadow regs for runtime factor-override CDC.  Reset + write
   // logic both live in the main jtag_master_write always block below; the
   // declaration here keeps the signal visible across the file.
@@ -973,6 +983,18 @@ module vc707_microgpt_eth (
   end
   wire freeze_en_core = freeze_en_core_s[1];
 
+  // CDC: per-stage exponent select eth → core (double-flop; quasi-static).
+  reg [4:0] dbg_stage_sel_core_s0, dbg_stage_sel_core_s1;
+  always @(posedge core_clk or negedge core_resetn) begin
+    if (!core_resetn) begin
+      dbg_stage_sel_core_s0 <= 5'd0;
+      dbg_stage_sel_core_s1 <= 5'd0;
+    end else begin
+      dbg_stage_sel_core_s0 <= dbg_stage_sel_reg;
+      dbg_stage_sel_core_s1 <= dbg_stage_sel_core_s0;
+    end
+  end
+
   // CDC: cycle-trigger config eth → core.  Quasi-static (host programs it
   // before pulsing restart and leaves it stable), so a plain multi-FF bus
   // sync is safe — the value isn't changing when the core samples it.
@@ -1236,6 +1258,7 @@ module vc707_microgpt_eth (
     .wr_rdata     ( bram_rdata_eth     ),
     .snap_layer_sel ( snap_sel_core_s1 ),
     .snap_step_sel  ( step_sel_core_s1 ),
+    .dbg_stage_sel  ( dbg_stage_sel_core_s1 ),
     .freeze_en      ( freeze_en_core   ),
     .trig_cyc_en    ( trig_cyc_en_core ),
     .trig_cyc       ( trig_cyc_core    ),
@@ -1784,6 +1807,7 @@ module vc707_microgpt_eth (
       10'h065: read_data_comb = {31'd0, freeze_en_reg};
       10'h066: read_data_comb = trig_cyc_reg;
       10'h067: read_data_comb = {31'd0, trig_cyc_en_reg};
+      10'h070: read_data_comb = {27'd0, dbg_stage_sel_reg};
       10'h071: read_data_comb = dbg_cyc_eth_s2;                       // cycles @ freeze
       10'h072: read_data_comb = {26'd0, dbg_frozen_eth_s[1], dbg_cur_layer_eth_s2}; // {frozen, layer}
       10'h00B: read_data_comb = {25'd0, factor_rd_sel_eth};

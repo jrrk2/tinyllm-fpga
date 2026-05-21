@@ -119,6 +119,11 @@ module smollm_layer_bfp #(
   // for host read-back via wr_kind 12 (mantissa) / 13 (per-tile exponent).
   input  wire [4:0]                          snap_layer_sel,
   input  wire [10:0]                         snap_step_sel,
+  // Per-stage exponent read-out select (logic analyser).  Read via wr_kind 16:
+  //  0 n1 1 q 2 k 3 v 4 attn 5 o 6 h1 7 n2 8 g 9 u 10 mlp 11 d 12 hout 13 hin.
+  //  Exposes each stage's per-tile BFP exponent so the host can see which
+  //  stage's exponent saturates first within a frozen layer.
+  input  wire [4:0]                          dbg_stage_sel,
   // Debug taps (synthesis-friendly — only used by sim testbench)
   output logic [6:0]                         dbg_state,
   output logic [11:0]                        dbg_cnt,
@@ -672,6 +677,7 @@ module smollm_layer_bfp #(
   logic [BFP_EXP_W -1:0] rd_hout_e;
   logic [BFP_MANT_W-1:0] rd_snap_m;
   logic [BFP_EXP_W -1:0] rd_snap_e;
+  logic [BFP_EXP_W -1:0] rd_stage_e;   // per-stage exponent read-out (wr_kind 16)
   logic [4:0]            wr_kind_q;
 
   always_ff @(posedge clk_wr) begin
@@ -693,6 +699,24 @@ module smollm_layer_bfp #(
     rd_hout_e <= hout_e[wr_addr[$clog2(NT_D)-1:0]];
     rd_snap_m <= snap_m[wr_addr[$clog2(D)-1:0]];
     rd_snap_e <= snap_e[wr_addr[$clog2(NT_D)-1:0]];
+    // Per-stage exponent read-out: select the stage's inline _e array.
+    case (dbg_stage_sel)
+      5'd0:  rd_stage_e <= n1_e  [wr_addr[$clog2(NT_D)-1:0]];
+      5'd1:  rd_stage_e <= q_e   [wr_addr[$clog2(NT_D)-1:0]];
+      5'd2:  rd_stage_e <= k_e   [wr_addr[$clog2(NT_KV)-1:0]];
+      5'd3:  rd_stage_e <= v_e   [wr_addr[$clog2(NT_KV)-1:0]];
+      5'd4:  rd_stage_e <= attn_e[wr_addr[$clog2(NT_D)-1:0]];
+      5'd5:  rd_stage_e <= o_e   [wr_addr[$clog2(NT_D)-1:0]];
+      5'd6:  rd_stage_e <= h1_e  [wr_addr[$clog2(NT_D)-1:0]];
+      5'd7:  rd_stage_e <= n2_e  [wr_addr[$clog2(NT_D)-1:0]];
+      5'd8:  rd_stage_e <= g_e   [wr_addr[$clog2(NT_FFN)-1:0]];
+      5'd9:  rd_stage_e <= u_e   [wr_addr[$clog2(NT_FFN)-1:0]];
+      5'd10: rd_stage_e <= mlp_e [wr_addr[$clog2(NT_FFN)-1:0]];
+      5'd11: rd_stage_e <= d_e   [wr_addr[$clog2(NT_D)-1:0]];
+      5'd12: rd_stage_e <= hout_e[wr_addr[$clog2(NT_D)-1:0]];
+      5'd13: rd_stage_e <= hin_e [wr_addr[$clog2(NT_D)-1:0]];
+      default: rd_stage_e <= '0;
+    endcase
     wr_kind_q <= wr_kind;
   end
 
@@ -706,6 +730,7 @@ module smollm_layer_bfp #(
       5'd11: wr_rdata = {{(16-BFP_EXP_W ){rd_hout_e[BFP_EXP_W -1]}}, rd_hout_e};
       5'd12: wr_rdata = {{(16-BFP_MANT_W){rd_snap_m[BFP_MANT_W-1]}}, rd_snap_m};
       5'd13: wr_rdata = {{(16-BFP_EXP_W ){rd_snap_e[BFP_EXP_W -1]}}, rd_snap_e};
+      5'd16: wr_rdata = {{(16-BFP_EXP_W ){rd_stage_e[BFP_EXP_W -1]}}, rd_stage_e};
       default: wr_rdata = 16'h0000;
     endcase
   end

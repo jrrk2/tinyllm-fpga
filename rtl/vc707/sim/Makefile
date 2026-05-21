@@ -611,6 +611,49 @@ obj_dir/Vtb_bfp_sdpram_compare: tb_bfp_sdpram_compare.sv tb_bfp_sdpram_compare.c
 	    $(SMOLLM_SRC)/bfp_sdpram.sv \
 	    -o Vtb_bfp_sdpram_compare
 
+# ---------------------- bfp-freeze (logic-analyser freeze demo) ----------------------
+# Drives smollm_multilayer_tm_bfp through tb_freeze_bfp and demonstrates the
+# LA freeze: counter-match (snap_layer_sel/step) or absolute-cycle (trig_cyc).
+# Weights come from the sim_shadow $readmemh set (LBFP_STREAMER_SELFTEST); note
+# sim_shadow holds one layer's weights, so this validates the freeze CONTROL
+# (halts at the right layer/cycle, dbg_frozen/dbg_cyc/dbg_cur_layer) — a golden
+# per-layer VALUE compare needs the stream path (tb_autoregress_bfp_stream) and
+# the lbfp_freeze_*.hex goldens (task #8).
+#   BFP_FREEZE_MODE=counter FREEZE_LAYER=3 FREEZE_POS=0 make bfp-freeze
+#   BFP_FREEZE_MODE=cycle   FREEZE_CYC=50000           make bfp-freeze
+bfp-freeze: obj_dir/Vtb_freeze_bfp
+	@echo "=== running tb_freeze_bfp (LA freeze demo) ==="
+	@./obj_dir/Vtb_freeze_bfp
+
+obj_dir/Vtb_freeze_bfp: tb_freeze_bfp.sv tb_freeze_bfp.cpp mock_axi_slave.sv \
+                        $(SMOLLM_SRC)/smollm_multilayer_tm_bfp.sv \
+                        $(SMOLLM_SRC)/smollm_layer_bfp.sv \
+                        $(SMOLLM_SRC)/weight_streamer_bfp_mt.sv \
+                        $(SMOLLM_SRC)/matvec_bfp_engine.sv \
+                        $(SMOLLM_SRC)/rmsnorm_bfp.sv \
+                        $(SMOLLM_SRC)/rope_bfp.sv \
+                        $(SMOLLM_SRC)/swiglu_bfp.sv \
+                        $(SMOLLM_SRC)/softmax_bfp.sv \
+                        $(SMOLLM_SRC)/residual_bfp.sv \
+                        $(SMOLLM_SRC)/cordic_sincos.sv
+	$(VERILATOR) -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-fatal -cc --exe --build \
+	    -j 0 --x-assign 0 --x-initial 0 \
+	    -CFLAGS "-O2 -std=c++17" \
+	    --top-module tb_freeze_bfp \
+	    -I../generated -I$(SMOLLM_SRC) \
+	    tb_freeze_bfp.sv tb_freeze_bfp.cpp mock_axi_slave.sv \
+	    $(SMOLLM_SRC)/smollm_multilayer_tm_bfp.sv \
+	    $(SMOLLM_SRC)/smollm_layer_bfp.sv \
+	    $(SMOLLM_SRC)/weight_streamer_bfp_mt.sv \
+	    $(SMOLLM_SRC)/matvec_bfp_engine.sv \
+	    $(SMOLLM_SRC)/rmsnorm_bfp.sv \
+	    $(SMOLLM_SRC)/rope_bfp.sv \
+	    $(SMOLLM_SRC)/swiglu_bfp.sv \
+	    $(SMOLLM_SRC)/softmax_bfp.sv \
+	    $(SMOLLM_SRC)/residual_bfp.sv \
+	    $(SMOLLM_SRC)/cordic_sincos.sv \
+	    -o Vtb_freeze_bfp
+
 obj_dir/Vtb_smollm_layer_bfp: tb_smollm_layer_bfp.sv tb_smollm_layer_bfp.cpp \
                               $(SMOLLM_SRC)/smollm_layer_bfp.sv \
                               $(SMOLLM_SRC)/matvec_bfp_engine.sv \

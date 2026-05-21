@@ -1226,9 +1226,19 @@ static std::vector<Mismatch> find_mismatches(
         uint32_t target = (0u << 31)
                         | (static_cast<uint32_t>(kind & 0x1f) << 18)
                         | (static_cast<uint32_t>(i) & 0x3ffff);
-        std::vector<RegW> one = {{REG_BRAM_TARGET, target}};
-        send_reg_write_batch(u, seq++, one);
-        uint16_t got  = reg_read(u, REG_BRAM_READ, 1, seq++)[0] & 0xffff;
+        // Retry the target+read on dropped frames so a transient UDP loss
+        // isn't miscounted as a ROM mismatch (which would fail verify-roms).
+        std::vector<uint32_t> rd;
+        for (int attempt = 0; attempt < 4 && rd.empty(); ++attempt) {
+            std::vector<RegW> one = {{REG_BRAM_TARGET, target}};
+            send_reg_write_batch(u, seq++, one);
+            rd = reg_read(u, REG_BRAM_READ, 1, seq++);
+        }
+        if (rd.empty()) {           // genuinely lost after retries — flag, re-patch next round
+            bad.push_back({i, entries[i], 0xFFFF});
+            continue;
+        }
+        uint16_t got  = rd[0] & 0xffff;
         uint16_t want = entries[i];
         uint16_t got_cmp  = is_exp ? (got  & 0xff) : got;
         uint16_t want_cmp = is_exp ? (want & 0xff) : want;

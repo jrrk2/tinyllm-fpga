@@ -146,10 +146,29 @@ def fwd_hw(h, lw, pos, kv, kv_pos, cfg):
 
 
 def main():
-    tok = AutoTokenizer.from_pretrained(S.MODEL)
-    model = AutoModelForCausalLM.from_pretrained(S.MODEL, torch_dtype=torch.float32).eval()
-    cfg = dict(D=576, H_Q=9, H_KV=3, HD=64, FFN=1536, NL=30, MAX_CTX=64)
+    MODEL = os.environ.get('MODEL', S.MODEL)
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float32).eval()
+    # Derive dims from the model so this works for 135M and 360M alike.
+    mc = model.config
+    cfg = dict(D=mc.hidden_size, H_Q=mc.num_attention_heads,
+               H_KV=getattr(mc, 'num_key_value_heads', mc.num_attention_heads),
+               HD=mc.hidden_size // mc.num_attention_heads,
+               FFN=mc.intermediate_size, NL=mc.num_hidden_layers, MAX_CTX=64)
     NL = cfg['NL']
+
+    # Per-layer golden dump for the LA freeze sim (task #8): set DUMP_STEP to
+    # the token-step whose per-layer hidden you want.  Writes BFP m/e hex into
+    # rtl/vc707/generated/ as lbfp_freeze_IN_* (layer-0 input = embedding) and
+    # lbfp_freeze_L<NN>_* (hidden after layer NN) — read by tb_freeze_bfp.
+    DUMP_STEP = int(os.environ.get('DUMP_STEP', '-1'))
+    _gen_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'generated'))
+    def dump_bfp(tag, vec):
+        m, e = tile_quantize_raw(vec)
+        with open(os.path.join(_gen_dir, f"lbfp_freeze_{tag}_m.hex"), "w") as f:
+            for x in np.asarray(m).flatten(): f.write(f"{int(x)}\n")
+        with open(os.path.join(_gen_dir, f"lbfp_freeze_{tag}_e.hex"), "w") as f:
+            for x in np.asarray(e).flatten(): f.write(f"{int(x)}\n")
 
     print("extracting weights and tile-quantizing ...", file=sys.stderr)
     def quantize_weight_matrix(W):
@@ -198,8 +217,13 @@ def main():
     for step in range(len(ids) + N_GEN):
         tid = ids[step] if step < len(ids) else generated[-1]
         h = fp_quantize(embed[tid].astype(np.float64))
+        if step == DUMP_STEP:
+            dump_bfp("IN", h)
+            print(f"\n[dump] step {step}: layer-0 input + per-layer hidden → {_gen_dir}/lbfp_freeze_*", file=sys.stderr)
         for li in range(NL):
             h = fwd_hw(h, layers[li], pos=step, kv=kv[li], kv_pos=step, cfg=cfg)
+            if step == DUMP_STEP:
+                dump_bfp(f"L{li:02d}", h)
         if step >= len(ids) - 1:
             h_normed = (h / np.sqrt(np.mean(h*h) + 1e-5)) * norm_w
             logits = h_normed @ embed.T

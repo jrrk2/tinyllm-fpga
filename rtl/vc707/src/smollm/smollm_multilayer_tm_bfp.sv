@@ -53,6 +53,7 @@ module smollm_multilayer_tm_bfp #(
   // run (host re-runs per layer); FF-backed, no extra BRAM.
   input  wire [4:0]                                 snap_layer_sel,
   input  wire [10:0]                                snap_step_sel,
+  input  wire [4:0]                                 dbg_stage_sel,   // per-stage exp read (wr_kind 16)
   // Freeze: when set, the engine HALTS at layer snap_layer_sel of token-step
   // snap_step_sel instead of running the rest of the stack — so the inner
   // layer's hout (read via wr_kind 10/11) is left holding that layer's output.
@@ -187,6 +188,7 @@ module smollm_multilayer_tm_bfp #(
     .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(wr_data), .wr_en(wr_en),
     .clk_wr(clk_wr), .wr_rdata(wr_rdata),
     .snap_layer_sel(snap_layer_sel), .snap_step_sel(snap_step_sel),
+    .dbg_stage_sel(dbg_stage_sel),
     .ws_base_WQ_m(lay_base_WQ_m),   .ws_base_WQ_e(lay_base_WQ_e),
     .ws_base_WK_m(lay_base_WK_m),   .ws_base_WK_e(lay_base_WK_e),
     .ws_base_WV_m(lay_base_WV_m),   .ws_base_WV_e(lay_base_WV_e),
