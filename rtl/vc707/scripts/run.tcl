@@ -31,6 +31,12 @@ if {$is_fresh} {
 
 if {$_picosoc} {
 
+# picosoc_noflash guards on PICORV32_REGS (and `errors if picorv32.v compiles
+# first).  Set the macro globally on EVERY run (so an already-created project
+# picks it up too, no wipe needed) — the guard is then bypassed regardless of
+# Vivado's compile order, and picorv32 uses the picosoc_regs register file.
+set_property verilog_define {PICORV32_REGS=picosoc_regs} [current_fileset]
+
 # ===== PicoSoC bring-up shell source set (merged from run_picosoc.tcl) =====
 if {$is_fresh} {
     read_ip { \
@@ -51,9 +57,9 @@ if {$is_fresh} {
         eth/sgmii_soc.sv \
     }
     read_verilog { \
+        src/soc/picosoc_noflash.v \
         src/soc/picorv32.v \
         src/soc/simpleuart.v \
-        src/soc/picosoc_noflash.v \
         src/soc/progmem_shell.v \
     }
     read_verilog -sv { \
