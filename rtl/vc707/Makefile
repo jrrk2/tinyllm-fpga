@@ -366,10 +366,13 @@ $(SOC_DIR)/firmware_shell.mem: $(SOC_DIR)/fw_shell.c $(SOC_DIR)/start.s $(SOC_DI
 .PHONY: picosoc picosoc-fw fw-update
 picosoc-fw: $(SOC_DIR)/firmware_shell.mem
 
-# Full shell build (synth/impl).
+# Full shell build (synth/impl).  Integrated ILA is opt-in: `make picosoc
+# PICOSOC_ILA=1` (default off so the build always synthesizes; the shell's
+# mark_debug nets let you insert an ILA via Vivado "Set Up Debug" otherwise).
+PICOSOC_ILA ?=
 picosoc: picosoc-fw
 	mkdir -p $(work-dir)
-	PICOSOC=1 $(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
+	PICOSOC=1 PICOSOC_ILA=$(PICOSOC_ILA) $(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
 	@cp microgpt_eth.runs/impl_1/vc707_picosoc_shell.bit ./$(work-dir)/ 2>/dev/null || true
 	@echo "=== picosoc shell built (top vc707_picosoc_shell) -> $(work-dir)/ ==="
 
