@@ -305,4 +305,20 @@ module vc707_picosoc_shell (
   always_ff @(posedge eth_clk) hb <= hb + 1'b1;
   assign led = {hb[25], led_reg[6:0]};
 
+  // ----------------------------------------------------------------------
+  // On-chip ILA on the PicoRV32 trace bus + iomem/DDR activity (eth_clk).
+  // IP (picosoc_ila) is created by run.tcl; gated by PICOSOC_ILA so the file
+  // still elaborates without it.
+  // ----------------------------------------------------------------------
+`ifdef PICOSOC_ILA
+  picosoc_ila i_ila (
+    .clk    (eth_clk),
+    .probe0 (trace_valid),
+    .probe1 (trace_data),
+    .probe2 (iomem_valid),
+    .probe3 (iomem_addr),
+    .probe4 (ddr_done)
+  );
+`endif
+
 endmodule
