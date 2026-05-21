@@ -228,14 +228,14 @@ module weight_streamer_bfp_mt #(
         WS_IDLE: begin
           ready_axi <= 1'b0;
           if (start_load_axi) begin
-`ifdef VERILATOR
-            // Selftest mode (Verilator only): when matrix_base_m == 0 the
-            // testbench is exercising the layer with AXI tied off — the
-            // burst would never make progress because arready/rvalid stay
-            // low.  Skip the load and jump straight to WS_READY so the
-            // layer FSM can advance through all its states; bank_m/bank_e
-            // stay at their reset zeros (output will be junk but the FSM
-            // path is the artefact we're testing).
+`ifdef LBFP_STREAMER_SELFTEST
+            // Selftest mode (tb_smollm_layer with AXI tied off): the burst
+            // would never make progress because arready/rvalid stay low, so
+            // skip the load and jump straight to WS_READY — the sim_shadow
+            // path (also under LBFP_STREAMER_SELFTEST) serves weight_m_out.
+            // MUST be gated by LBFP_STREAMER_SELFTEST, not bare VERILATOR:
+            // testbenches with a REAL mock AXI (tb_freeze_bfp, tb_full_bfp)
+            // legitimately load WQ at base 0 and must take the AXI path.
             if (axi_mb_m == 0) begin
               ws_state <= WS_READY;
             end else
@@ -313,7 +313,7 @@ module weight_streamer_bfp_mt #(
           if (start_load_axi) begin
             // New load requested — restart.
             ready_axi         <= 1'b0;
-`ifdef VERILATOR
+`ifdef LBFP_STREAMER_SELFTEST
             if (axi_mb_m == 0) begin
               // Selftest: stay in WS_READY so ready_axi pulses 0 for one cycle
               // (next cycle re-asserts).  Layer's WSP_HOLD `if (!ws_ready)`

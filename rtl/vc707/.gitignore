@@ -47,3 +47,13 @@ sim/synth_factor_ram.dcp
 sim/*.dcp
 sim/cosim/libmv_cosim.so
 sim/cosim/obj_dir/
+sim/cosim/*_cosim.so
+sim/cosim/obj_dir_*/
+
+# PicoSoC firmware build artefacts (progmem_*.v is KEPT — it's a build input)
+src/soc/obj_dir/
+src/soc/*.elf
+src/soc/*.bin
+src/soc/*.o
+# Stray Verilator lint/obj dirs
+src/smollm/obj_dir/

@@ -106,7 +106,20 @@ module smollm_multilayer_tm_bfp #(
   input  wire [AXI_ID_WIDTH-1:0]                    m_axi_rid,
   input  wire [511:0]                               m_axi_rdata,
   input  wire [1:0]                                 m_axi_rresp,
-  input  wire                                       m_axi_rlast
+  input  wire                                       m_axi_rlast,
+  // PicoSoC weight-feed debug pass-through (logic gated by LBFP_DBG_WFEED in
+  // the layer; ports always present so the eth top can wire them to the SoC).
+  input  wire                                       dbg_wfeed_en,
+  input  wire                                       dbg_ack,
+  output wire                                       dbg_req,
+  output wire [2:0]                                 dbg_req_matvec_id,
+  output wire [7:0]                                 dbg_req_chunk,
+  input  wire                                       dbg_bank_m_we,
+  input  wire [11:0]                                dbg_bank_col,
+  input  wire signed [255:0]                        dbg_bank_m_wdata,
+  input  wire                                       dbg_bank_e_we,
+  input  wire [11:0]                                dbg_bank_tile,
+  input  wire signed [127:0]                        dbg_bank_e_wdata
 );
 
   localparam int NT_D = D / BFP_TILE;
@@ -189,6 +202,10 @@ module smollm_multilayer_tm_bfp #(
     .clk_wr(clk_wr), .wr_rdata(wr_rdata),
     .snap_layer_sel(snap_layer_sel), .snap_step_sel(snap_step_sel),
     .dbg_stage_sel(dbg_stage_sel),
+    .dbg_wfeed_en(dbg_wfeed_en), .dbg_ack(dbg_ack), .dbg_req(dbg_req),
+    .dbg_req_matvec_id(dbg_req_matvec_id), .dbg_req_chunk(dbg_req_chunk),
+    .dbg_bank_m_we(dbg_bank_m_we), .dbg_bank_col(dbg_bank_col), .dbg_bank_m_wdata(dbg_bank_m_wdata),
+    .dbg_bank_e_we(dbg_bank_e_we), .dbg_bank_tile(dbg_bank_tile), .dbg_bank_e_wdata(dbg_bank_e_wdata),
     .ws_base_WQ_m(lay_base_WQ_m),   .ws_base_WQ_e(lay_base_WQ_e),
     .ws_base_WK_m(lay_base_WK_m),   .ws_base_WK_e(lay_base_WK_e),
     .ws_base_WV_m(lay_base_WV_m),   .ws_base_WV_e(lay_base_WV_e),

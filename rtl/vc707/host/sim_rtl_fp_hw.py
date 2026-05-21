@@ -203,7 +203,14 @@ def main():
     print("\nweights done", file=sys.stderr)
 
     PROMPT = "Once upon a time"
-    ids = tok(PROMPT, return_tensors='pt').input_ids[0].tolist()
+    # PROMPT_IDS env (comma/space-separated token ids, decimal or 0x hex) lets
+    # the golden match the FPGA's baked prompt exactly for a per-layer diff.
+    _pids = os.environ.get('PROMPT_IDS', '').replace(',', ' ').split()
+    if _pids:
+        ids = [int(x, 0) for x in _pids]
+        PROMPT = f"<ids:{ids}>"
+    else:
+        ids = tok(PROMPT, return_tensors='pt').input_ids[0].tolist()
     N_GEN = 15
     T = float(os.environ.get('TEMP', '0.0'))
     TOPK = int(os.environ.get('TOPK', '0'))

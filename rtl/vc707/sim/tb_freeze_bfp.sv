@@ -38,13 +38,36 @@ module tb_freeze_bfp (
   input  wire [10:0]                         snap_step_sel,    // 0x064
   input  wire                                trig_cyc_en,      // 0x067
   input  wire [31:0]                         trig_cyc,         // 0x066
+  // ---- Dummy ethernet read port (mirrors vc707_microgpt_eth's bram peek) ----
+  // clk_wr is a SEPARATE clock from `clk` (core) so this reproduces the real
+  // FPGA's eth_clk↔core_clk crossing on the wr_kind BRAM read (line 1257 of
+  // vc707_microgpt_eth.sv drives .clk_wr(eth_clk)).  The C++ driver sets
+  // wr_kind/wr_addr and samples wr_rdata exactly as host read_bram() does.
+  input  wire                                clk_wr,
+  input  wire [4:0]                          wr_kind,
+  input  wire [17:0]                         wr_addr,
+  input  wire [4:0]                          dbg_stage_sel,
+  output wire [15:0]                         wr_rdata,
   // Status + frozen hidden state for the driver to check:
   output wire                                done,
   output wire                                dbg_frozen,       // 0x072[5]
   output wire [31:0]                         dbg_cyc,          // 0x071
   output wire [4:0]                          dbg_cur_layer,    // 0x072[4:0]
   output wire signed [`LBFP_FULL_D*BFP_MANT_W-1:0]            hidden_out_m,
-  output wire signed [(`LBFP_FULL_D/BFP_TILE)*BFP_EXP_W-1:0]  hidden_out_e
+  output wire signed [(`LBFP_FULL_D/BFP_TILE)*BFP_EXP_W-1:0]  hidden_out_e,
+  output wire [31:0]                                          weight_hash,
+  // PicoSoC weight-feed debug interface (driven by the C++ SoC emulator).
+  input  wire                                dbg_wfeed_en,
+  input  wire                                dbg_ack,
+  output wire                                dbg_req,
+  output wire [2:0]                          dbg_req_matvec_id,
+  output wire [7:0]                          dbg_req_chunk,
+  input  wire                                dbg_bank_m_we,
+  input  wire [11:0]                         dbg_bank_col,
+  input  wire signed [255:0]                 dbg_bank_m_wdata,
+  input  wire                                dbg_bank_e_we,
+  input  wire [11:0]                         dbg_bank_tile,
+  input  wire signed [127:0]                 dbg_bank_e_wdata
 );
 
   localparam int D       = `LBFP_FULL_D;
@@ -98,9 +121,10 @@ module tb_freeze_bfp (
     .hidden_in_m(hidden_in_m), .hidden_in_e(hidden_in_e),
     .hidden_out_m(hidden_out_m), .hidden_out_e(hidden_out_e),
     .done(lay_done),
-    .weight_hash(/*unused*/),
-    .wr_kind(5'd0), .wr_addr(18'd0), .wr_data(16'd0), .wr_en(1'b0),
-    .clk_wr(clk), .wr_rdata(/*unused*/),
+    .weight_hash(weight_hash),
+    .dbg_stage_sel(dbg_stage_sel),
+    .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(16'd0), .wr_en(1'b0),
+    .clk_wr(clk_wr), .wr_rdata(wr_rdata),
     // Freeze / logic-analyser controls under test:
     .snap_layer_sel(snap_layer_sel), .snap_step_sel(snap_step_sel),
     .freeze_en(freeze_en),

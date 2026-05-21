@@ -124,6 +124,24 @@ module smollm_layer_bfp #(
   //  Exposes each stage's per-tile BFP exponent so the host can see which
   //  stage's exponent saturates first within a frozen layer.
   input  wire [4:0]                          dbg_stage_sel,
+  // ---- PicoSoC weight-feed debug interface (logic gated by LBFP_DBG_WFEED) ----
+  // When dbg_wfeed_en, each matvec chunk's weight beats come from a SoC-filled
+  // per-chunk bank instead of the streamer/MIG.  The layer pulses dbg_req
+  // (with matvec_id+chunk) per chunk; the SoC fills the bank then pulses
+  // dbg_ack to release the matvec.  Bypasses the streamer<->MIG fetch entirely
+  // for isolation.  Ports are always present (cheap wires); the bank + mux are
+  // only synthesized under LBFP_DBG_WFEED so production builds pay nothing.
+  input  wire                                dbg_wfeed_en,
+  input  wire                                dbg_ack,
+  output logic                               dbg_req,
+  output logic [2:0]                         dbg_req_matvec_id,
+  output logic [7:0]                         dbg_req_chunk,
+  input  wire                                dbg_bank_m_we,
+  input  wire [11:0]                         dbg_bank_col,
+  input  wire signed [255:0]                 dbg_bank_m_wdata,
+  input  wire                                dbg_bank_e_we,
+  input  wire [11:0]                         dbg_bank_tile,
+  input  wire signed [127:0]                 dbg_bank_e_wdata,
   // Debug taps (synthesis-friendly — only used by sim testbench)
   output logic [6:0]                         dbg_state,
   output logic [11:0]                        dbg_cnt,
@@ -1182,8 +1200,19 @@ module smollm_layer_bfp #(
   logic is_stream_matvec;
   wire signed [LANES*BFP_MANT_W-1:0]         mv_w_m_eff;
   wire signed [LANES*BFP_EXP_W -1:0]         mv_w_e_eff;
-  wire        [255:0]                        ws_weight_m_out;
-  wire        [127:0]                        ws_weight_e_out;
+  wire        [255:0]                        ws_weight_m_out_raw;
+  wire        [127:0]                        ws_weight_e_out_raw;
+`ifdef LBFP_DBG_WFEED
+  // Debug weight-feed mux: in dbg_wfeed_en mode the matvec consumes weights
+  // from the SoC-filled per-chunk bank (dbg_bank_*_rd) instead of the streamer.
+  logic       [255:0]                        dbg_bank_m_rd;
+  logic       [127:0]                        dbg_bank_e_rd;
+  wire        [255:0]                        ws_weight_m_out = dbg_wfeed_en ? dbg_bank_m_rd : ws_weight_m_out_raw;
+  wire        [127:0]                        ws_weight_e_out = dbg_wfeed_en ? dbg_bank_e_rd : ws_weight_e_out_raw;
+`else
+  wire        [255:0]                        ws_weight_m_out = ws_weight_m_out_raw;
+  wire        [127:0]                        ws_weight_e_out = ws_weight_e_out_raw;
+`endif
   assign mv_w_m_eff = is_stream_matvec ? $signed(ws_weight_m_out) : mv_w_m;
   assign mv_w_e_eff = is_stream_matvec ? $signed(ws_weight_e_out) : mv_w_e;
 
@@ -1223,10 +1252,20 @@ module smollm_layer_bfp #(
   // here would leave weight_hash holding only the *last* layer's reads,
   // not the whole run.  rst is driven from ~core_resetn | lay_restart_core
   // at the top, so the host's restart pulse cleanly re-arms it.
+`ifdef LBFP_WBEAT_DUMP
+  int dbg_wbeat = 0;
+`endif
   always_ff @(posedge clk) begin
     if (rst) weight_hash <= 32'hFFFFFFFF;
-    else if (mv_valid && is_stream_matvec)
+    else if (mv_valid && is_stream_matvec) begin
       weight_hash <= {weight_hash[30:0], weight_hash[31]} ^ mv_w_xor;
+`ifdef LBFP_WBEAT_DUMP
+      if (dbg_wbeat < 6) begin
+        $display("[wbeat %0d] m=%h e=%h", dbg_wbeat, mv_w_m_eff, mv_w_e_eff);
+        dbg_wbeat <= dbg_wbeat + 1;
+      end
+`endif
+    end
   end
 
   // mv_x_m_eff mux — for DRIVE states whose activation source has been
@@ -1463,7 +1502,13 @@ module smollm_layer_bfp #(
   // ---------------------------------------------------------------------------
   logic [2:0]                       ws_matvec_id;
   logic                             ws_load_req;
-  wire                              ws_ready, ws_busy_unused;
+  wire                              ws_ready_raw, ws_busy_unused;
+`ifdef LBFP_DBG_WFEED
+  logic                             dbg_ws_ready;
+  wire ws_ready = dbg_wfeed_en ? dbg_ws_ready : ws_ready_raw;
+`else
+  wire ws_ready = ws_ready_raw;
+`endif
   logic [AXI_ADDR_WIDTH-1:0]        ws_base_m_mux, ws_base_e_mux;
   logic [11:0]                      ws_in_dim_mux, ws_in_dim_tiles_mux;
   logic [11:0]                      ws_rd_col, ws_rd_tile;
@@ -1531,12 +1576,12 @@ module smollm_layer_bfp #(
     .in_dim        (ws_in_dim_mux),
     .in_dim_tiles  (ws_in_dim_tiles_mux),
     .load_req      (ws_load_req),
-    .ready         (ws_ready),
+    .ready         (ws_ready_raw),
     .busy          (ws_busy_unused),
     .rd_col        (ws_rd_col),
-    .weight_m_out  (ws_weight_m_out),
+    .weight_m_out  (ws_weight_m_out_raw),
     .rd_tile       (ws_rd_tile),
-    .weight_e_out  (ws_weight_e_out),
+    .weight_e_out  (ws_weight_e_out_raw),
     .clk_axi       (clk_axi),
     .rst_axi       (rst_axi),
     .m_axi_arvalid (m_axi_arvalid),
@@ -1560,6 +1605,44 @@ module smollm_layer_bfp #(
     , .sim_matvec_id (ws_matvec_id)
 `endif
   );
+
+`ifdef LBFP_DBG_WFEED
+  // ---------------------------------------------------------------------------
+  // PicoSoC weight-feed (debug isolation): a per-chunk weight bank filled by the
+  // SoC, read by the layer through the SAME ws_rd_col/ws_rd_tile + 1-cycle
+  // latency the streamer uses (so the matvec FSM is unchanged).  Handshake:
+  //   - the layer's ws_load_req pulse latches dbg_req (with matvec_id+chunk) and
+  //     drops dbg_ws_ready (so WSP_HOLD sees ready fall);
+  //   - the SoC fills dbg_bank_m/e for that chunk, then pulses dbg_ack, which
+  //     raises dbg_ws_ready (WSP_WAIT -> WSP_READY) and clears dbg_req.
+  // This bypasses the streamer<->MIG fetch entirely.
+  // ---------------------------------------------------------------------------
+  localparam int DBG_IN_DIM_MAX = (D > FFN) ? D : FFN;
+  (* ram_style = "block" *) logic [255:0] dbg_bank_m [0:DBG_IN_DIM_MAX-1];
+  (* ram_style = "block" *) logic [127:0] dbg_bank_e [0:NT_FFN-1];
+  always_ff @(posedge clk) begin
+    if (dbg_bank_m_we) dbg_bank_m[dbg_bank_col]  <= dbg_bank_m_wdata;
+    dbg_bank_m_rd <= dbg_bank_m[ws_rd_col[$clog2(DBG_IN_DIM_MAX)-1:0]];
+    if (dbg_bank_e_we) dbg_bank_e[dbg_bank_tile] <= dbg_bank_e_wdata;
+    dbg_bank_e_rd <= dbg_bank_e[ws_rd_tile[$clog2(NT_FFN)-1:0]];
+  end
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      dbg_req <= 1'b0; dbg_ws_ready <= 1'b0;
+      dbg_req_matvec_id <= 3'd0; dbg_req_chunk <= 8'd0;
+    end else if (ws_load_req) begin       // new chunk requested by the layer FSM
+      dbg_req <= 1'b1; dbg_ws_ready <= 1'b0;
+      dbg_req_matvec_id <= ws_matvec_id;
+      dbg_req_chunk <= 8'(chunk);
+    end else if (dbg_ack) begin           // SoC has filled the chunk
+      dbg_req <= 1'b0; dbg_ws_ready <= 1'b1;
+    end
+  end
+`else
+  always_comb begin
+    dbg_req = 1'b0; dbg_req_matvec_id = 3'd0; dbg_req_chunk = 8'd0;
+  end
+`endif
 
   // ---------------------------------------------------------------------------
   // Main FSM — all writes use non-blocking assignment; engine inputs are

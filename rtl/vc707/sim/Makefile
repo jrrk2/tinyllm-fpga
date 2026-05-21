@@ -641,6 +641,7 @@ obj_dir/Vtb_freeze_bfp: tb_freeze_bfp.sv tb_freeze_bfp.cpp mock_axi_slave.sv \
 	    -CFLAGS "-O2 -std=c++17" \
 	    --top-module tb_freeze_bfp \
 	    -I../generated -I$(SMOLLM_SRC) \
+	    +define+LBFP_WBEAT_DUMP \
 	    tb_freeze_bfp.sv tb_freeze_bfp.cpp mock_axi_slave.sv \
 	    $(SMOLLM_SRC)/smollm_multilayer_tm_bfp.sv \
 	    $(SMOLLM_SRC)/smollm_layer_bfp.sv \

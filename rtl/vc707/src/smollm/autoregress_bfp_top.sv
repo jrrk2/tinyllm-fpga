@@ -159,6 +159,9 @@ module autoregress_bfp_top #(
       // wr_kind 12/13 — per-layer hidden snapshot (snap_m/snap_e), captured
       // and read back inside smollm_multilayer_tm_bfp (→ lay_wr_rdata).
       5'd12, 5'd13:           wr_rdata = lay_wr_rdata;
+      // wr_kind 16 — per-stage exponent read-out (dbg_stage_sel selects the
+      // stage inside smollm_layer_bfp → rd_stage_e → lay_wr_rdata).
+      5'd16:                  wr_rdata = lay_wr_rdata;
       default:                wr_rdata = 16'h0000;
     endcase
   end
