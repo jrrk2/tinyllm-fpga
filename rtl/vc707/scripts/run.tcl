@@ -39,6 +39,17 @@ if {[llength [get_files -quiet *picosoc.xdc]] == 0} {
     add_files -fileset constrs_1 -norecurse constraints/picosoc.xdc
 }
 
+# Self-heal the progmem case-ROM -> BRAM swap on an already-created project
+# (read_verilog source-list edits only take effect on a fresh project, so an
+# existing project would still reference the deleted progmem_shell.v).  For
+# other source-set changes, `make wipe-project` is the clean reset.
+if {[llength [get_files -quiet *progmem_shell.v]] > 0} {
+    remove_files [get_files *progmem_shell.v]
+}
+if {[llength [get_files -quiet *progmem_bram.v]] == 0} {
+    read_verilog src/soc/progmem_bram.v
+}
+
 # picosoc_noflash guards on PICORV32_REGS (and `errors if picorv32.v compiles
 # first).  Set the macro globally on EVERY run (so an already-created project
 # picks it up too, no wipe needed) — the guard is then bypassed regardless of
