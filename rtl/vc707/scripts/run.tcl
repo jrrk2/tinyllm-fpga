@@ -31,6 +31,14 @@ if {$is_fresh} {
 
 if {$_picosoc} {
 
+# Shell-only constraints (UART pins) — added idempotently and OUTSIDE is_fresh
+# so an already-created project picks them up without a wipe.  Kept separate
+# from microgpt_eth.xdc because a conditional get_ports guard in the shared XDC
+# proved unreliable (the pins ended up unconstrained -> UCIO-1 DRC failure).
+if {[llength [get_files -quiet *picosoc.xdc]] == 0} {
+    add_files -fileset constrs_1 -norecurse constraints/picosoc.xdc
+}
+
 # picosoc_noflash guards on PICORV32_REGS (and `errors if picorv32.v compiles
 # first).  Set the macro globally on EVERY run (so an already-created project
 # picks it up too, no wipe needed) — the guard is then bypassed regardless of
