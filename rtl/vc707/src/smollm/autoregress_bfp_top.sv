@@ -62,6 +62,20 @@ module autoregress_bfp_top #(
   // wr_kind (registered, 1-cycle latency in clk_wr).  Returns zero for
   // unmapped kinds.
   output logic [15:0]                  wr_rdata,
+  // Per-layer hidden-state snapshot select — passed to the multilayer engine,
+  // which latches the chosen (layer, token-step) hidden_out for host read-back
+  // via wr_kind 12 (mantissa) / 13 (per-tile exponent).
+  input  wire [4:0]                    snap_layer_sel,
+  input  wire [10:0]                   snap_step_sel,
+  // Freeze the engine at the programmed (snap_layer_sel, snap_step_sel) for
+  // ILA / hout inspection — passed straight to the multilayer engine.
+  input  wire                          freeze_en,
+  // Absolute-cycle freeze trigger + frozen-state status (logic-analyser).
+  input  wire                          trig_cyc_en,
+  input  wire [31:0]                   trig_cyc,
+  output wire [31:0]                   dbg_cyc,
+  output wire [4:0]                    dbg_cur_layer,
+  output wire                          dbg_frozen,
   // Layer-0 / region base offsets — caller patches in lbfp_ddr3.svh
   // constants.  Ignored when neither stream is enabled.
   input  wire [AXI_ADDR_WIDTH-1:0]     ws_base_WQ_m,
@@ -141,6 +155,9 @@ module autoregress_bfp_top #(
       // (i.e. the decode-head input).  See smollm_layer_bfp's wr_rdata
       // mux for the actual read path.
       5'd10, 5'd11:           wr_rdata = lay_wr_rdata;
+      // wr_kind 12/13 — per-layer hidden snapshot (snap_m/snap_e), captured
+      // and read back inside smollm_multilayer_tm_bfp (→ lay_wr_rdata).
+      5'd12, 5'd13:           wr_rdata = lay_wr_rdata;
       default:                wr_rdata = 16'h0000;
     endcase
   end
@@ -280,7 +297,11 @@ module autoregress_bfp_top #(
     .m_axi_rresp  (m_axi_rresp),
     .m_axi_rlast  (m_axi_rlast),
     .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(wr_data), .wr_en(wr_en),
-    .clk_wr(clk_wr), .wr_rdata(lay_wr_rdata)
+    .clk_wr(clk_wr), .wr_rdata(lay_wr_rdata),
+    .snap_layer_sel(snap_layer_sel), .snap_step_sel(snap_step_sel),
+    .freeze_en(freeze_en),
+    .trig_cyc_en(trig_cyc_en), .trig_cyc(trig_cyc),
+    .dbg_cyc(dbg_cyc), .dbg_cur_layer(dbg_cur_layer), .dbg_frozen(dbg_frozen)
   );
 
   // ---------------------------------------------------------------------------

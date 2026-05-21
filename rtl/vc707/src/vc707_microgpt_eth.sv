@@ -469,6 +469,42 @@ module vc707_microgpt_eth (
       snapshot_layer_sel_reg <= jtag_master_writedata[4:0];
   end
 
+  // Companion token-step select for the per-layer snapshot.  The snapshot
+  // latches the chosen layer's hidden_out at token position == this value.
+  // Default 0 (first prompt token).  Host writes 0x00B.
+  reg [10:0] snapshot_step_sel_reg;
+  always @(posedge eth_clk) begin
+    if (rst_sys)
+      snapshot_step_sel_reg <= 11'd0;
+    else if (jtag_master_write && jtag_word_addr == 10'h064)
+      snapshot_step_sel_reg <= jtag_master_writedata[10:0];
+  end
+
+  // Freeze-enable: halt the engine at the programmed (snapshot_layer_sel,
+  // snapshot_step_sel) so the inner layer's hout can be inspected (wr_kind
+  // 10/11) or ILA-captured.  Host writes 0x00C bit0; default 0 (off).
+  reg freeze_en_reg;
+  always @(posedge eth_clk) begin
+    if (rst_sys)
+      freeze_en_reg <= 1'b0;
+    else if (jtag_master_write && jtag_word_addr == 10'h065)
+      freeze_en_reg <= jtag_master_writedata[0];
+  end
+
+  // Logic-analyser absolute-cycle freeze trigger.  trig_cyc = clock count
+  // from start; trig_cyc_en arms it.  Host: 0x066 = count, 0x067 bit0 = enable.
+  reg [31:0] trig_cyc_reg;
+  reg        trig_cyc_en_reg;
+  always @(posedge eth_clk) begin
+    if (rst_sys) begin
+      trig_cyc_reg    <= 32'd0;
+      trig_cyc_en_reg <= 1'b0;
+    end else if (jtag_master_write && jtag_word_addr == 10'h066)
+      trig_cyc_reg    <= jtag_master_writedata;
+    else if (jtag_master_write && jtag_word_addr == 10'h067)
+      trig_cyc_en_reg <= jtag_master_writedata[0];
+  end
+
   // Eth-side shadow regs for runtime factor-override CDC.  Reset + write
   // logic both live in the main jtag_master_write always block below; the
   // declaration here keeps the signal visible across the file.
@@ -917,6 +953,55 @@ module vc707_microgpt_eth (
     end
   end
 
+  // CDC: snapshot_step_sel from eth-clk regfile to core_clk (double-flop).
+  reg [10:0] step_sel_core_s0, step_sel_core_s1;
+  always @(posedge core_clk or negedge core_resetn) begin
+    if (!core_resetn) begin
+      step_sel_core_s0 <= 11'd0;
+      step_sel_core_s1 <= 11'd0;
+    end else begin
+      step_sel_core_s0 <= snapshot_step_sel_reg;
+      step_sel_core_s1 <= step_sel_core_s0;
+    end
+  end
+
+  // CDC: freeze-enable eth-clk → core_clk (double-flop).
+  reg [1:0] freeze_en_core_s;
+  always @(posedge core_clk or negedge core_resetn) begin
+    if (!core_resetn) freeze_en_core_s <= 2'b00;
+    else              freeze_en_core_s <= {freeze_en_core_s[0], freeze_en_reg};
+  end
+  wire freeze_en_core = freeze_en_core_s[1];
+
+  // CDC: cycle-trigger config eth → core.  Quasi-static (host programs it
+  // before pulsing restart and leaves it stable), so a plain multi-FF bus
+  // sync is safe — the value isn't changing when the core samples it.
+  (* ASYNC_REG = "TRUE" *) reg [31:0] trig_cyc_core_s1, trig_cyc_core_s2;
+  (* ASYNC_REG = "TRUE" *) reg [1:0]  trig_cyc_en_core_s;
+  always @(posedge core_clk) begin
+    trig_cyc_core_s1   <= trig_cyc_reg;
+    trig_cyc_core_s2   <= trig_cyc_core_s1;
+    trig_cyc_en_core_s <= {trig_cyc_en_core_s[0], trig_cyc_en_reg};
+  end
+  wire [31:0] trig_cyc_core    = trig_cyc_core_s2;
+  wire        trig_cyc_en_core = trig_cyc_en_core_s[1];
+
+  // Status from the multilayer (core_clk) → eth for read-back.  Quasi-static
+  // once frozen=1 (host only reads the count/layer after observing frozen).
+  wire [31:0] dbg_cyc_core;
+  wire [4:0]  dbg_cur_layer_core;
+  wire        dbg_frozen_core;
+  (* ASYNC_REG = "TRUE" *) reg [31:0] dbg_cyc_eth_s1, dbg_cyc_eth_s2;
+  (* ASYNC_REG = "TRUE" *) reg [4:0]  dbg_cur_layer_eth_s1, dbg_cur_layer_eth_s2;
+  (* ASYNC_REG = "TRUE" *) reg [1:0]  dbg_frozen_eth_s;
+  always @(posedge eth_clk) begin
+    dbg_cyc_eth_s1       <= dbg_cyc_core;
+    dbg_cyc_eth_s2       <= dbg_cyc_eth_s1;
+    dbg_cur_layer_eth_s1 <= dbg_cur_layer_core;
+    dbg_cur_layer_eth_s2 <= dbg_cur_layer_eth_s1;
+    dbg_frozen_eth_s     <= {dbg_frozen_eth_s[0], dbg_frozen_core};
+  end
+
   // Runtime factor-override CDC.  Host writes to 0x100..0x12F (per-layer
   // SwiGLU lo+mlp+attn factors) latch into eth-clk shadow regs + a toggle.
   // Core-clk side detects toggle edge, captures data, asserts the one-cycle
@@ -1148,7 +1233,15 @@ module vc707_microgpt_eth (
     .wr_data      ( bram_data_eth      ),
     .wr_en        ( bram_wr_en_eth     ),
     .clk_wr       ( eth_clk            ),
-    .wr_rdata     ( bram_rdata_eth     )
+    .wr_rdata     ( bram_rdata_eth     ),
+    .snap_layer_sel ( snap_sel_core_s1 ),
+    .snap_step_sel  ( step_sel_core_s1 ),
+    .freeze_en      ( freeze_en_core   ),
+    .trig_cyc_en    ( trig_cyc_en_core ),
+    .trig_cyc       ( trig_cyc_core    ),
+    .dbg_cyc        ( dbg_cyc_core     ),
+    .dbg_cur_layer  ( dbg_cur_layer_core ),
+    .dbg_frozen     ( dbg_frozen_core  )
   );
   assign lay_result = {{(9216 - LBFP_NSTEPS*16){1'b0}}, bfp_result_tokens};
 
@@ -1687,6 +1780,12 @@ module vc707_microgpt_eth (
       10'h004: read_data_comb = {temperature_reg, max_gen_reg, 8'd0};
       10'h005: read_data_comb = rng_reg;
       10'h00A: read_data_comb = {27'd0, snapshot_layer_sel_reg};
+      10'h064: read_data_comb = {21'd0, snapshot_step_sel_reg};
+      10'h065: read_data_comb = {31'd0, freeze_en_reg};
+      10'h066: read_data_comb = trig_cyc_reg;
+      10'h067: read_data_comb = {31'd0, trig_cyc_en_reg};
+      10'h071: read_data_comb = dbg_cyc_eth_s2;                       // cycles @ freeze
+      10'h072: read_data_comb = {26'd0, dbg_frozen_eth_s[1], dbg_cur_layer_eth_s2}; // {frozen, layer}
       10'h00B: read_data_comb = {25'd0, factor_rd_sel_eth};
       10'h00F: read_data_comb = factor_rd_data_eth_s1;
       10'h008: read_data_comb = {8'd0, step_token_reg, step_pos_reg, step_clear_reg, direct_mode_reg};

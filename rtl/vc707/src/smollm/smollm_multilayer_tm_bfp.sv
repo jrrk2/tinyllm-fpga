@@ -46,6 +46,30 @@ module smollm_multilayer_tm_bfp #(
   input  wire                                       wr_en,
   input  wire                                       clk_wr,
   output wire [15:0]                                wr_rdata,
+  // Per-layer hidden-state snapshot.  During a run, the hidden_out of the
+  // layer whose index == snap_layer_sel, at token position pos == snap_step_sel,
+  // is latched into snap_m/snap_e.  Host reads it back via wr_kind 12 (mantissa)
+  // / 13 (per-tile exponent) — see host/fpga_per_layer_dump.py.  One layer per
+  // run (host re-runs per layer); FF-backed, no extra BRAM.
+  input  wire [4:0]                                 snap_layer_sel,
+  input  wire [10:0]                                snap_step_sel,
+  // Freeze: when set, the engine HALTS at layer snap_layer_sel of token-step
+  // snap_step_sel instead of running the rest of the stack — so the inner
+  // layer's hout (read via wr_kind 10/11) is left holding that layer's output.
+  // `done` is then held high so the autoregress drains its remaining token
+  // steps without re-running the layer (generated tokens are garbage — that's
+  // expected; this mode is for inspecting one frozen layer, e.g. via ILA).
+  // Cleared by rst (= core reset or restart pulse).
+  input  wire                                       freeze_en,
+  // Absolute clock-count trigger.  cyc counts core_clk cycles from rst (=
+  // restart).  When trig_cyc_en, the engine freezes at the first layer
+  // boundary on/after cyc == trig_cyc — a coarse "stop near cycle N" that's
+  // timing-safe (freeze only acts at the S_NEXT boundary, low fanout).
+  input  wire                                       trig_cyc_en,
+  input  wire [31:0]                                trig_cyc,
+  output wire [31:0]                                dbg_cyc,        // cycles since rst
+  output wire [4:0]                                 dbg_cur_layer,  // lay_idx when frozen
+  output wire                                       dbg_frozen,     // freeze latched
   // DDR3 streamer ports.  Layer-0 base addresses for each weight
   // matrix — this module derives per-layer bases as `base + lay_idx
   // × W?_*_PL` internally.
@@ -162,6 +186,7 @@ module smollm_multilayer_tm_bfp #(
     .done(lay_done),
     .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(wr_data), .wr_en(wr_en),
     .clk_wr(clk_wr), .wr_rdata(wr_rdata),
+    .snap_layer_sel(snap_layer_sel), .snap_step_sel(snap_step_sel),
     .ws_base_WQ_m(lay_base_WQ_m),   .ws_base_WQ_e(lay_base_WQ_e),
     .ws_base_WK_m(lay_base_WK_m),   .ws_base_WK_e(lay_base_WK_e),
     .ws_base_WV_m(lay_base_WV_m),   .ws_base_WV_e(lay_base_WV_e),
@@ -194,10 +219,15 @@ module smollm_multilayer_tm_bfp #(
   // ---------------------------------------------------------------------------
   // FSM — unchanged from the BRAM-only version.
   // ---------------------------------------------------------------------------
-  typedef enum logic [2:0] {
-    S_IDLE, S_LATCH, S_PULSE, S_WAIT, S_CAPTURE, S_NEXT, S_DONE
+  typedef enum logic [3:0] {
+    S_IDLE, S_LATCH, S_PULSE, S_WAIT, S_CAPTURE, S_NEXT, S_DONE, S_FROZEN
   } st_t;
   st_t state;
+  logic frozen;        // latched at the trigger (counter match or cycle count); held until rst
+  logic [31:0] cyc;    // free-running core_clk cycle counter, reset on rst (= restart)
+  assign dbg_cyc       = cyc;
+  assign dbg_cur_layer = lay_idx[4:0];
+  assign dbg_frozen    = frozen;
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -208,10 +238,13 @@ module smollm_multilayer_tm_bfp #(
       h_state_e    <= '0;
       hidden_out_m <= '0;
       hidden_out_e <= '0;
+      frozen       <= 1'b0;
+      cyc          <= 32'd0;
       done         <= 1'b0;
     end else begin
       lay_start <= 1'b0;
       done      <= 1'b0;
+      if (!frozen) cyc <= cyc + 32'd1;   // stop counting once halted
       case (state)
         S_IDLE: if (start) begin
           h_state_m <= hidden_in_m;
@@ -231,7 +264,18 @@ module smollm_multilayer_tm_bfp #(
           state     <= S_NEXT;
         end
         S_NEXT: begin
-          if (lay_idx == NL - 1) begin
+          if ((freeze_en && lay_idx == snap_layer_sel && pos == snap_step_sel) ||
+              (trig_cyc_en && cyc >= trig_cyc)) begin
+            // Freeze at this layer boundary — either the programmed (layer,step)
+            // counter match, or the first boundary on/after the absolute cycle
+            // trigger.  The inner layer's stage RAMs (and hout, wr_kind 10/11)
+            // hold this layer's values.  Hold done in S_FROZEN so the
+            // autoregress drains the rest without re-running the layer.
+            frozen       <= 1'b1;
+            hidden_out_m <= h_state_m;
+            hidden_out_e <= h_state_e;
+            state        <= S_DONE;
+          end else if (lay_idx == NL - 1) begin
             hidden_out_m <= h_state_m;
             hidden_out_e <= h_state_e;
             state        <= S_DONE;
@@ -242,7 +286,11 @@ module smollm_multilayer_tm_bfp #(
         end
         S_DONE: begin
           done  <= 1'b1;
-          state <= S_IDLE;
+          state <= frozen ? S_FROZEN : S_IDLE;
+        end
+        S_FROZEN: begin
+          done  <= 1'b1;   // held high; `start` ignored until rst clears frozen
+          state <= S_FROZEN;
         end
         default: state <= S_IDLE;
       endcase

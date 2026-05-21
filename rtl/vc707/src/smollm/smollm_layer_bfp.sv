@@ -113,6 +113,12 @@ module smollm_layer_bfp #(
   // to 16 b.  Kinds outside this module's range return 0; the upstream
   // mux selects between this output and the decode-head/prompt outputs.
   output logic [15:0]                        wr_rdata,
+  // Per-layer hidden-state snapshot select (driven from the multilayer / eth
+  // top).  When layer_idx==snap_layer_sel AND pos==snap_step_sel, this layer's
+  // hidden_out is mirrored into a snap_m/snap_e TDP BRAM (same pattern as hout)
+  // for host read-back via wr_kind 12 (mantissa) / 13 (per-tile exponent).
+  input  wire [4:0]                          snap_layer_sel,
+  input  wire [10:0]                         snap_step_sel,
   // Debug taps (synthesis-friendly — only used by sim testbench)
   output logic [6:0]                         dbg_state,
   output logic [11:0]                        dbg_cnt,
@@ -664,6 +670,8 @@ module smollm_layer_bfp #(
   // whether the layer chain is collapsing to zero / NaN.
   logic [BFP_MANT_W-1:0] rd_hout_m;
   logic [BFP_EXP_W -1:0] rd_hout_e;
+  logic [BFP_MANT_W-1:0] rd_snap_m;
+  logic [BFP_EXP_W -1:0] rd_snap_e;
   logic [4:0]            wr_kind_q;
 
   always_ff @(posedge clk_wr) begin
@@ -683,6 +691,8 @@ module smollm_layer_bfp #(
     rd_G2_e   <= rom_G2_e[wr_addr[$clog2(NL*NT_D)-1:0]];
     rd_hout_m <= hout_m[wr_addr[$clog2(D)-1:0]];
     rd_hout_e <= hout_e[wr_addr[$clog2(NT_D)-1:0]];
+    rd_snap_m <= snap_m[wr_addr[$clog2(D)-1:0]];
+    rd_snap_e <= snap_e[wr_addr[$clog2(NT_D)-1:0]];
     wr_kind_q <= wr_kind;
   end
 
@@ -694,6 +704,8 @@ module smollm_layer_bfp #(
       5'd3: wr_rdata = {{(16-BFP_EXP_W ){rd_G2_e[BFP_EXP_W -1]}}, rd_G2_e};
       5'd10: wr_rdata = {{(16-BFP_MANT_W){rd_hout_m[BFP_MANT_W-1]}}, rd_hout_m};
       5'd11: wr_rdata = {{(16-BFP_EXP_W ){rd_hout_e[BFP_EXP_W -1]}}, rd_hout_e};
+      5'd12: wr_rdata = {{(16-BFP_MANT_W){rd_snap_m[BFP_MANT_W-1]}}, rd_snap_m};
+      5'd13: wr_rdata = {{(16-BFP_EXP_W ){rd_snap_e[BFP_EXP_W -1]}}, rd_snap_e};
       default: wr_rdata = 16'h0000;
     endcase
   end
@@ -1024,6 +1036,12 @@ module smollm_layer_bfp #(
 
   logic signed [BFP_MANT_W-1:0] hout_m  [0:D-1];
   logic signed [BFP_EXP_W -1:0] hout_e  [0:NT_D-1];
+  // Per-layer hidden snapshot — written in parallel with hout (element-by-
+  // element, so it infers a TDP BRAM, not FFs) only for the host-selected
+  // (layer, token-step); read back via wr_kind 12/13.
+  logic signed [BFP_MANT_W-1:0] snap_m  [0:D-1];
+  logic signed [BFP_EXP_W -1:0] snap_e  [0:NT_D-1];
+  wire snap_capture = (layer_idx == snap_layer_sel) && (pos == snap_step_sel);
 
   // ---------------------------------------------------------------------------
   // FSM
@@ -2587,6 +2605,11 @@ module smollm_layer_bfp #(
             hout_m[out_cnt[CW_D-1:0]] <= rs_y_m;
             if (out_cnt[3:0] == 4'd0)
               hout_e[out_cnt[CW_D-1:0] / BFP_TILE] <= rs_y_e;
+            if (snap_capture) begin
+              snap_m[out_cnt[CW_D-1:0]] <= rs_y_m;
+              if (out_cnt[3:0] == 4'd0)
+                snap_e[out_cnt[CW_D-1:0] / BFP_TILE] <= rs_y_e;
+            end
             out_cnt <= out_cnt + 1'b1;
           end
         end
@@ -2595,6 +2618,11 @@ module smollm_layer_bfp #(
             hout_m[out_cnt[CW_D-1:0]] <= rs_y_m;
             if (out_cnt[3:0] == 4'd0)
               hout_e[out_cnt[CW_D-1:0] / BFP_TILE] <= rs_y_e;
+            if (snap_capture) begin
+              snap_m[out_cnt[CW_D-1:0]] <= rs_y_m;
+              if (out_cnt[3:0] == 4'd0)
+                snap_e[out_cnt[CW_D-1:0] / BFP_TILE] <= rs_y_e;
+            end
             out_cnt <= out_cnt + 1'b1;
           end
           if (rs_done) state <= S_DONE;

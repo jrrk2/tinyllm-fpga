@@ -1,99 +1,107 @@
 #!/usr/bin/env python3
-"""Trigger one FPGA forward pass, then read the per-layer snapshot for
-every layer 0..NL-1 and save each as fpga_layer_NN.txt.  Diff each
-against a Python sim reference to localise the first divergent layer.
+"""Dump the FPGA's per-layer hidden state to localise the first divergent layer.
 
-Workflow:
-  1. trigger forward pass (REG_RESTART)
-  2. wait for done
-  3. for each layer:
-       write snapshot_layer_sel (REG_SNAP_SEL = 0x00A)
-       sleep enough for CDC settle (~1ms is plenty)
-       read 288 words from 0x200..0x31F → 576 Q1.15 lanes
+The on-chip snapshot (smollm_multilayer_tm_bfp) captures ONE layer's hidden_out
+per run: the layer whose index == snapshot_layer_sel (reg 0x00A) at token
+position == snapshot_step_sel (reg 0x00B).  So this tool re-runs the autoregress
+once per layer, then reads the captured hidden back via wr_kind 12 (mantissa) /
+13 (per-tile exponent) through the BRAM peek port (0x060 target / 0x062 read).
 
-Output: fpga_layer_00.txt … fpga_layer_29.txt in CWD.
+This matches the ~1-BRAM-budget design: a single 1-layer snapshot buffer, host
+re-runs per layer.  Slower than a one-pass dump, but it fits and is correct.
+
+Usage:  python3 fpga_per_layer_dump.py [--nl 32] [--d 960] [--step 0]
+        (smollm360 defaults; use --nl 30 --d 576 for smollm135)
+Output: fpga_layer_00.txt … fpga_layer_<NL-1>.txt
+        D signed Q1.15 mantissas (one per line) + NT_D tile exponents in a footer.
 """
-import os, socket, struct, sys, time
+import argparse, socket, struct, sys, time
 
-PEER  = ("192.168.1.42", 19783)
-NL    = 30
+PEER = ("192.168.1.42", 19783)
 
-REG_RESTART  = 0x1F1
-REG_ML_STATE = 0x017
-REG_SNAP_SEL = 0x00A
-REG_RESULT   = 0x200
+REG_SNAP_SEL    = 0x00A   # per-layer snapshot: layer select
+REG_STEP_SEL    = 0x064   # per-layer snapshot: token-step select (0x00B was taken)
+REG_RESTART     = 0x1F1   # pulse [0]=1 to re-run the autoregress
+REG_DONE        = 0x1F0   # {.., lay_done_latched(bit1), lay_done(bit0)}
+REG_BRAM_TARGET = 0x060   # write {inc[31], kind[22:18], addr[17:0]}
+REG_BRAM_READ   = 0x062   # registered port-A read-back
 
+SNAP_KIND_M = 12          # snap_m (mantissa) read kind
+SNAP_KIND_E = 13          # snap_e (per-tile exponent) read kind
 
-_seq_ctr = [0]
-def _next_seq():
-    _seq_ctr[0] = (_seq_ctr[0] + 1) & 0xFF
-    return _seq_ctr[0] or 1
+_seq = [0]
+def nseq():
+    _seq[0] = (_seq[0] + 1) & 0xFF
+    return _seq[0] or 1
 
-def reg_read(s, addr, nwords=1, seq=None, retries=3):
-    for attempt in range(retries):
-        sq = (seq if seq is not None else _next_seq()) & 0xFF
-        body = struct.pack("<BBHBBBB", 0x02, sq, addr & 0xFFFF,
-                           nwords & 0xFF, 0, 0, 0)
-        s.sendto(body, PEER)
+def reg_read(s, addr, retries=4):
+    for _ in range(retries):
+        sq = nseq()
+        s.sendto(struct.pack("<BBHBBBB", 0x02, sq, addr & 0xFFFF, 1, 0, 0, 0), PEER)
         deadline = time.time() + 0.5
         while time.time() < deadline:
-            try: buf, _ = s.recvfrom(2048)
+            try: buf, _a = s.recvfrom(2048)
             except socket.timeout: continue
-            if len(buf) < 8 or buf[0] != 0x03 or buf[1] != sq: continue
-            _, n = struct.unpack_from("<HB", buf, 2)
-            return [struct.unpack_from("<I", buf, 8 + 4*i)[0] for i in range(n)]
-    raise TimeoutError(f"no REG_RSP for 0x{addr:03x} after {retries} attempts")
+            if len(buf) < 12 or buf[0] != 0x03 or buf[1] != sq: continue
+            return struct.unpack_from("<I", buf, 8)[0]
+    raise TimeoutError(f"no REG_RSP for 0x{addr:03x}")
 
+def reg_write(s, addr, value):
+    s.sendto(struct.pack("<BBB", 0x01, nseq(), 1) + b"\x00"*5 +
+             struct.pack("<HIH", addr & 0xFFFF, value & 0xFFFFFFFF, 0), PEER)
 
-def reg_write(s, addr, value, seq=1):
-    # FT_REG_WRITE format (eth_ctrl line 18):
-    #   [0]=op [1]=seq [2]=n [3..7]=pad [8..]=n*{addr16, data32, pad16}
-    pkt = struct.pack("<BBB", 0x01, seq & 0xFF, 1) + b"\x00" * 5 + \
-          struct.pack("<HIH", addr & 0xFFFF, value & 0xFFFFFFFF, 0)
-    s.sendto(pkt, PEER)
+def read_bram(s, kind, addr):
+    target = ((kind & 0x1f) << 18) | (addr & 0x3ffff)   # inc=0
+    reg_write(s, REG_BRAM_TARGET, target)
+    return reg_read(s, REG_BRAM_READ) & 0xFFFF
 
+def s16(v): return v - 0x10000 if v & 0x8000 else v
+def s8(v):  return v - 0x100   if v & 0x80   else v
 
-def read_576_lanes(s, seq_base=None):
-    words = []
-    for i in range(288):
-        words += reg_read(s, REG_RESULT + i)
-    lanes = []
-    for w in words:
-        lo = w & 0xFFFF; hi = (w >> 16) & 0xFFFF
-        if lo & 0x8000: lo -= 0x10000
-        if hi & 0x8000: hi -= 0x10000
-        lanes.append(lo); lanes.append(hi)
-    return lanes
-
+def wait_done(s, timeout=30):
+    # Let the just-issued restart clear the latched-done from the prior run,
+    # then poll until it re-asserts.
+    time.sleep(0.05)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if reg_read(s, REG_DONE) & 0x2:
+            return True
+        time.sleep(0.02)
+    return False
 
 def main():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.0)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--nl",   type=int, default=32, help="number of layers")
+    ap.add_argument("--d",    type=int, default=960, help="hidden dim D")
+    ap.add_argument("--step", type=int, default=0,  help="token-step (pos) to snapshot")
+    args = ap.parse_args()
+    NL, D, STEP = args.nl, args.d, args.step
+    NT_D = D // 16
 
-    print("triggering forward pass …", file=sys.stderr)
-    reg_write(s, REG_RESTART, 1, seq=2)
-    time.sleep(0.05)
-
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        v = reg_read(s, REG_ML_STATE, seq=3)[0]
-        if (v >> 8) & 1: break
-        time.sleep(0.05)
-    else:
-        print("WARNING: FSM never reported done", file=sys.stderr)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(0.5)
+    print(f"per-layer dump: NL={NL} D={D} step={STEP} (re-running per layer)", file=sys.stderr)
 
     for L in range(NL):
-        reg_write(s, REG_SNAP_SEL, L, seq=_next_seq())
-        time.sleep(0.010)  # CDC + refresh settle (~12 µs needed, 10 ms is plenty)
-        lanes = read_576_lanes(s)
+        reg_write(s, REG_SNAP_SEL, L)
+        reg_write(s, REG_STEP_SEL, STEP)
+        time.sleep(0.005)               # CDC settle for the sels before restart
+        reg_write(s, REG_RESTART, 1)    # re-run with this (layer, step) selected
+        if not wait_done(s):
+            print(f"  layer {L}: WARNING run never reported done", file=sys.stderr)
+        mant = [s16(read_bram(s, SNAP_KIND_M, i)) for i in range(D)]
+        expo = [s8(read_bram(s, SNAP_KIND_E, i)) for i in range(NT_D)]
         path = f"fpga_layer_{L:02d}.txt"
         with open(path, "w") as f:
-            f.write(f"# FPGA hidden_state after layer {L}, 576 lanes Q1.15 signed dec\n")
-            for v in lanes:
+            f.write(f"# FPGA hidden after layer {L}, step {STEP}: "
+                    f"{D} Q1.15 mantissas, then {NT_D} tile exponents\n")
+            for v in mant:
                 f.write(f"{v}\n")
-        nz = sum(1 for x in lanes if x != 0)
-        print(f"  layer {L:2d}: {nz}/576 non-zero, range [{min(lanes)}..{max(lanes)}]  → {path}",
+            f.write("# tile exponents\n")
+            for v in expo:
+                f.write(f"# e {v}\n")
+        nz = sum(1 for x in mant if x != 0)
+        print(f"  layer {L:2d}: {nz}/{D} non-zero, range [{min(mant)}..{max(mant)}]  -> {path}",
               file=sys.stderr)
-
 
 if __name__ == "__main__":
     main()

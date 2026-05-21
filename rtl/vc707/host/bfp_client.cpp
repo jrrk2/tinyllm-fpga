@@ -40,6 +40,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <fstream>
 #include <memory>
@@ -1808,6 +1809,26 @@ int main(int argc, char** argv) {
         if (cmd == "version") {
             auto bv = reg_read(u, REG_BUILD_VERSION, 1, 1)[0];
             std::printf("BUILD_VERSION = 0x%08x\n", bv);
+            // Current scheme: BUILD_VERSION is the git HEAD short hash — resolve
+            // it to commit date + subject via the local repo (we lose nothing
+            // vs the old datestamp).  Falls back to the legacy epoch reading if
+            // no such commit exists locally (old bitstream / run outside repo).
+            char gcmd[160];
+            std::snprintf(gcmd, sizeof(gcmd),
+                "git show -s --format='  commit %%h  %%ci  %%s' %08x 2>/dev/null", bv);
+            bool resolved = false;
+            if (FILE* p = popen(gcmd, "r")) {
+                char line[512];
+                if (std::fgets(line, sizeof(line), p)) { std::fputs(line, stdout); resolved = true; }
+                pclose(p);
+            }
+            if (!resolved) {
+                std::time_t t = static_cast<std::time_t>(bv);
+                char buf[64];
+                std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", std::gmtime(&t));
+                std::printf("  (no local commit %08x; legacy datestamp reading = %s)\n",
+                            bv, buf);
+            }
             return 0;
         }
         if (cmd == "load-roms") {
