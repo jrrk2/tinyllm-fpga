@@ -6,6 +6,13 @@
 
 set project microgpt_eth
 
+# Branch-local merge (picosoc branch): PICOSOC=1 builds the PicoSoC bring-up
+# shell (vc707_picosoc_shell) — a slimmed source set (no engine / microgpt core
+# / build_version gate / ILA) that shares this project + the synth/impl tail.
+#   build:  PICOSOC=1 vivado -mode batch -source scripts/prologue.tcl -source scripts/run.tcl
+set _picosoc [info exists ::env(PICOSOC)]
+if {$_picosoc} { puts "INFO: PICOSOC=1 -> building vc707_picosoc_shell (bring-up shell)" }
+
 # Detect existing-project vs fresh-project so `make` can incrementally
 # rebuild without re-adding sources (which Vivado errors on) and
 # without choking on a stale failed run.  Signal: presence of the
@@ -21,6 +28,45 @@ if {$is_fresh} {
 if {$is_fresh} {
     add_files -fileset constrs_1 -norecurse constraints/microgpt_eth.xdc
 }
+
+if {$_picosoc} {
+
+# ===== PicoSoC bring-up shell source set (merged from run_picosoc.tcl) =====
+if {$is_fresh} {
+    read_ip { \
+        "ip/gig_ethernet_pcs_pma_0/gig_ethernet_pcs_pma_0.srcs/sources_1/ip/gig_ethernet_pcs_pma_0/gig_ethernet_pcs_pma_0.xci" \
+    }
+    read_ip { \
+        "ip/xlnx_mig_7_ddr3/xlnx_mig_7_ddr3.srcs/sources_1/ip/xlnx_mig_7_ddr3/xlnx_mig_7_ddr3.xci" \
+    }
+    set_property include_dirs [list "../src/include" "src" "src/soc"] [current_fileset]
+    read_verilog -sv { \
+        eth/axis_gmii_rx.sv \
+        eth/axis_gmii_tx.sv \
+        eth/dualmem_widen8.sv \
+        eth/dualmem_widen.sv \
+        eth/eth_mac_1g.sv \
+        eth/framing_top_sgmii.sv \
+        eth/rgmii_lfsr.sv \
+        eth/sgmii_soc.sv \
+    }
+    read_verilog { \
+        src/soc/picorv32.v \
+        src/soc/simpleuart.v \
+        src/soc/picosoc_noflash.v \
+        src/soc/progmem_shell.v \
+    }
+    read_verilog -sv { \
+        src/soc/soc_ddr_bridge.sv \
+        src/soc/vc707_picosoc_shell.sv \
+    }
+    read_verilog -sv {src/vc707.svh}
+    set _fobj [get_files -of_objects [get_filesets sources_1] [list "*src/vc707.svh"]]
+    set_property -dict {file_type {Verilog Header} is_global_include 1} -objects $_fobj
+    set_property top vc707_picosoc_shell [current_fileset]
+}
+
+} else {
 
 # Absolute path to the weight ROM .hex files. Vivado runs synth from
 # microgpt_eth.runs/synth_1/, where a relative "generated" path can't be
@@ -196,6 +242,8 @@ set_property -dict { file_type {Verilog Header} is_global_include 1} -objects $f
 set_property top vc707_microgpt_eth [current_fileset]
 
 }  ;# end is_fresh (read_verilog block)
+
+}  ;# end if {$_picosoc} ... else (source/IP/top setup)
 
 update_compile_order -fileset sources_1
 
