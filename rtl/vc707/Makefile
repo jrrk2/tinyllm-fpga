@@ -368,7 +368,9 @@ picosoc-fw: $(SOC_DIR)/firmware_shell.mem
 
 # picosoc_ila IP — generated from its committed source tcl (same pattern as the
 # engine ILAs); regenerated only when the tcl changes.
-PICOSOC_ILA ?=
+# Integrated ILA default ON; `make picosoc PICOSOC_ILA=0` for a clean bring-up
+# without it (the shell's mark_debug nets still allow Vivado "Set Up Debug").
+PICOSOC_ILA ?= 1
 picosoc-ila-xci := $(ip-dir)/picosoc_ila/picosoc_ila.srcs/sources_1/ip/picosoc_ila/picosoc_ila.xci
 $(picosoc-ila-xci): $(ip-dir)/picosoc_ila/tcl/run.tcl
 	@echo "=== generating picosoc_ila IP ==="
