@@ -366,10 +366,20 @@ $(SOC_DIR)/firmware_shell.mem: $(SOC_DIR)/fw_shell.c $(SOC_DIR)/start.s $(SOC_DI
 .PHONY: picosoc picosoc-fw fw-update
 picosoc-fw: $(SOC_DIR)/firmware_shell.mem
 
-# Full shell build (synth/impl).  Integrated ILA is opt-in: `make picosoc
-# PICOSOC_ILA=1` (default off so the build always synthesizes; the shell's
-# mark_debug nets let you insert an ILA via Vivado "Set Up Debug" otherwise).
+# picosoc_ila IP — generated from its committed source tcl (same pattern as the
+# engine ILAs); regenerated only when the tcl changes.
 PICOSOC_ILA ?=
+picosoc-ila-xci := $(ip-dir)/picosoc_ila/picosoc_ila.srcs/sources_1/ip/picosoc_ila/picosoc_ila.xci
+$(picosoc-ila-xci): $(ip-dir)/picosoc_ila/tcl/run.tcl
+	@echo "=== generating picosoc_ila IP ==="
+	@cd $(ip-dir)/picosoc_ila && $(MAKE) clean && $(MAKE)
+
+# Full shell build (synth/impl).  Integrated ILA is ON by default; disable with
+# `make picosoc PICOSOC_ILA=0` (the shell's mark_debug nets still allow inserting
+# an ILA via Vivado "Set Up Debug").
+ifneq ($(PICOSOC_ILA),0)
+picosoc: $(picosoc-ila-xci)
+endif
 picosoc: picosoc-fw
 	mkdir -p $(work-dir)
 	PICOSOC=1 PICOSOC_ILA=$(PICOSOC_ILA) $(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
