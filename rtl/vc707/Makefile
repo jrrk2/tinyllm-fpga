@@ -344,6 +344,32 @@ $(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(GENERATED_
 	@ln -sfn $(VARIANT)-$(BUILD_STAMP) archive/latest
 	@echo "=== snapshot in $(archive-dir)/ (and archive/latest) ==="
 
+# ---------------------------------------------------------------------------
+# PicoSoC bring-up shell (branch-local).  `make picosoc` builds the SoC boot
+# ROM from src/soc/fw_shell.c then runs synth/impl with PICOSOC=1, which makes
+# run.tcl select vc707_picosoc_shell (eth + DDR + dummy engine) instead of the
+# inference engine.  NOTE: shares the microgpt_eth project dir — run
+# `make wipe-project` when switching between the engine and the shell build.
+# ---------------------------------------------------------------------------
+RISCV_CROSS ?= riscv64-unknown-elf-
+SOC_DIR     := src/soc
+
+$(SOC_DIR)/progmem_shell.v: $(SOC_DIR)/fw_shell.c $(SOC_DIR)/start.s $(SOC_DIR)/soc.lds $(SOC_DIR)/bin2verilog.py
+	$(RISCV_CROSS)gcc -Os -march=rv32im -mabi=ilp32 -ffreestanding -nostdlib -nostartfiles \
+	    -Wl,-T,$(SOC_DIR)/soc.lds -o $(SOC_DIR)/fw_shell.elf $(SOC_DIR)/start.s $(SOC_DIR)/fw_shell.c -lgcc
+	$(RISCV_CROSS)objcopy -O binary $(SOC_DIR)/fw_shell.elf $(SOC_DIR)/fw_shell.bin
+	python3 $(SOC_DIR)/bin2verilog.py $(SOC_DIR)/fw_shell.bin > $@
+	@echo "=== picosoc firmware: $$(stat -c%s $(SOC_DIR)/fw_shell.bin) bytes -> $@ ==="
+
+.PHONY: picosoc picosoc-fw
+picosoc-fw: $(SOC_DIR)/progmem_shell.v
+
+picosoc: picosoc-fw
+	mkdir -p $(work-dir)
+	PICOSOC=1 $(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
+	@cp microgpt_eth.runs/impl_1/vc707_picosoc_shell.bit ./$(work-dir)/ 2>/dev/null || true
+	@echo "=== picosoc shell built (top vc707_picosoc_shell) -> $(work-dir)/ ==="
+
 # Quick convenience target: bake BFP hex + run the Verilator layer test.
 # Useful for sanity-checking precision after RTL edits before launching a
 # full Vivado synth (≈45 min on VC707).
