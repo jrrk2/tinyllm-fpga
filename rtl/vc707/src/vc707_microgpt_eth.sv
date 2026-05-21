@@ -565,7 +565,14 @@ module vc707_microgpt_eth (
   wire [31:0] ddr_wr_ack_count;
   wire [31:0] ddr_wr_tx_count;
 
+`ifdef PICOSOC_ENGINE
+  // PicoRV32 SoC front-end (drop-in for microgpt_eth_ctrl: same ports).  Drives
+  // the engine regmap via the Avalon master; LSU/ddr_wr tied off in this lean
+  // base-fit build.  Selected by the PICOSOC=ENGINE / make picosoc-engine flow.
+  picosoc_eth_bridge i_eth_ctrl (
+`else
   microgpt_eth_ctrl i_eth_ctrl (
+`endif
     .clk                  ( eth_clk                 ),
     .rst_n                ( eth_rst_n_int           ),
     .core_lsu_addr        ( lsu_addr                ),

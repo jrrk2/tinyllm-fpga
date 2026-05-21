@@ -363,6 +363,23 @@ $(SOC_DIR)/firmware_shell.mem: $(SOC_DIR)/fw_shell.c $(SOC_DIR)/start.s $(SOC_DI
 	python3 $(SOC_DIR)/bin2mem.py $(SOC_DIR)/fw_shell.bin > $@
 	@echo "=== picosoc firmware: $$(stat -c%s $(SOC_DIR)/fw_shell.bin) bytes -> $@ ==="
 
+# Stub firmware for the PicoSoC + real-engine fit build.
+$(SOC_DIR)/firmware_engine.mem: $(SOC_DIR)/fw_engine.c $(SOC_DIR)/start.s $(SOC_DIR)/soc.lds $(SOC_DIR)/bin2mem.py
+	$(RISCV_CROSS)gcc -Os -march=rv32im -mabi=ilp32 -ffreestanding -nostdlib -nostartfiles \
+	    -Wl,-T,$(SOC_DIR)/soc.lds -o $(SOC_DIR)/fw_engine.elf $(SOC_DIR)/start.s $(SOC_DIR)/fw_engine.c -lgcc
+	$(RISCV_CROSS)objcopy -O binary $(SOC_DIR)/fw_engine.elf $(SOC_DIR)/fw_engine.bin
+	python3 $(SOC_DIR)/bin2mem.py $(SOC_DIR)/fw_engine.bin > $@
+	@echo "=== picosoc-engine firmware: $$(stat -c%s $(SOC_DIR)/fw_engine.bin) bytes -> $@ ==="
+
+# Real engine + PicoSoC front-end, LEAN base-fit (no ILA, no LBFP_DBG_WFEED).
+# Builds the stub firmware, then the standard engine bitstream ($(bit)) with
+# PICOSOC_ENGINE exported so run.tcl swaps eth_ctrl -> picosoc_eth_bridge.
+# Source set changes -> wipe first:  make wipe-project picosoc-engine
+.PHONY: picosoc-engine
+picosoc-engine: export PICOSOC_ENGINE := 1
+picosoc-engine: $(SOC_DIR)/firmware_engine.mem $(bit)
+	@echo "=== picosoc-engine built: vc707_microgpt_eth + PicoSoC front-end (lean) ==="
+
 .PHONY: picosoc picosoc-fw fw-update
 picosoc-fw: $(SOC_DIR)/firmware_shell.mem
 

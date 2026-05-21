@@ -12,6 +12,10 @@ set project microgpt_eth
 #   build:  PICOSOC=1 vivado -mode batch -source scripts/prologue.tcl -source scripts/run.tcl
 set _picosoc [info exists ::env(PICOSOC)]
 if {$_picosoc} { puts "INFO: PICOSOC=1 -> building vc707_picosoc_shell (bring-up shell)" }
+# PICOSOC_ENGINE=1 -> the REAL engine top (vc707_microgpt_eth) with the PicoSoC
+# front-end (picosoc_eth_bridge) replacing microgpt_eth_ctrl.  Lean base-fit.
+set _picosoc_engine [info exists ::env(PICOSOC_ENGINE)]
+if {$_picosoc_engine} { puts "INFO: PICOSOC_ENGINE=1 -> engine top + PicoSoC front-end" }
 
 # Detect existing-project vs fresh-project so `make` can incrementally
 # rebuild without re-adding sources (which Vivado errors on) and
@@ -154,6 +158,18 @@ if {$_use_bfp} {
     ] [current_fileset]
 }
 
+# PicoSoC front-end (PICOSOC_ENGINE): append the SoC defines to whatever the
+# engine path set above.  picosoc_noflash needs PICORV32_REGS; the BRAM progmem
+# needs PROGMEM_HEX (firmware_engine.mem); vc707_microgpt_eth swaps eth_ctrl
+# for picosoc_eth_bridge under PICOSOC_ENGINE.
+if {$_picosoc_engine} {
+    set _d [get_property verilog_define [current_fileset]]
+    lappend _d "PICOSOC_ENGINE" "PICORV32_REGS=picosoc_regs" \
+               "PROGMEM_HEX=\"[file normalize src/soc/firmware_engine.mem]\""
+    set_property verilog_define $_d [current_fileset]
+    puts "INFO: PICOSOC_ENGINE — SoC front-end defines appended"
+}
+
 # build_version.svh (BUILD_VERSION = git HEAD short hash) is generated BEFORE
 # synth by the Makefile prereq `host/gen_build_version.py`, which also runs the
 # clean-tree gate (refuses uncommitted Verilog; ALLOW_DIRTY=1 to override).
@@ -197,6 +213,7 @@ set_property include_dirs [list \
     "../src/include" \
     "src" \
     "src/smollm" \
+    "src/soc" \
     $abs_generated \
 ] [current_fileset]
 
@@ -212,6 +229,17 @@ read_verilog -sv { \
     eth/framing_top_sgmii.sv \
     eth/rgmii_lfsr.sv \
     eth/sgmii_soc.sv \
+}
+
+# PicoSoC front-end (PICOSOC_ENGINE): drop-in for microgpt_eth_ctrl.
+if {$_picosoc_engine} {
+    read_verilog { \
+        src/soc/picosoc_noflash.v \
+        src/soc/picorv32.v \
+        src/soc/simpleuart.v \
+        src/soc/progmem_bram.v \
+    }
+    read_verilog -sv { src/soc/picosoc_eth_bridge.sv }
 }
 
 # microgpt BabyGPT core (used by vc707_microgpt_eth's microgpt_exact_core
