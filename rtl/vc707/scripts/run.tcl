@@ -37,18 +37,11 @@ if {$_picosoc} {
 # Vivado's compile order, and picorv32 uses the picosoc_regs register file.
 set_property verilog_define {PICORV32_REGS=picosoc_regs PICOSOC_ILA} [current_fileset]
 
-# ===== PicoSoC bring-up shell source set (merged from run_picosoc.tcl) =====
-if {$is_fresh} {
-    read_ip { \
-        "ip/gig_ethernet_pcs_pma_0/gig_ethernet_pcs_pma_0.srcs/sources_1/ip/gig_ethernet_pcs_pma_0/gig_ethernet_pcs_pma_0.xci" \
-    }
-    read_ip { \
-        "ip/xlnx_mig_7_ddr3/xlnx_mig_7_ddr3.srcs/sources_1/ip/xlnx_mig_7_ddr3/xlnx_mig_7_ddr3.xci" \
-    }
-    # On-chip ILA (eth_clk) on the PicoRV32 trace bus + iomem/DDR activity.
-    # Created in-script (no pre-gen .xci); instantiated in vc707_picosoc_shell
-    # under `ifdef PICOSOC_ILA.  Probes: 0=trace_valid 1=trace_data[35:0]
-    # 2=iomem_valid 3=iomem_addr[31:0] 4=ddr_done.
+# On-chip ILA (eth_clk) on the trace bus + iomem/DDR activity.  Created in-script
+# (no pre-gen .xci), idempotently and OUTSIDE is_fresh so an already-created
+# project gets it without a wipe (the shell instantiates it under PICOSOC_ILA).
+# Probes: 0=trace_valid 1=trace_data[35:0] 2=iomem_valid 3=iomem_addr 4=ddr_done.
+if {[llength [get_ips -quiet picosoc_ila]] == 0} {
     create_ip -name ila -vendor xilinx.com -library ip -module_name picosoc_ila
     set_property -dict [list \
         CONFIG.C_NUM_OF_PROBES {5}   CONFIG.C_DATA_DEPTH {4096} \
@@ -57,6 +50,16 @@ if {$is_fresh} {
         CONFIG.C_PROBE4_WIDTH {1} \
     ] [get_ips picosoc_ila]
     generate_target {synthesis} [get_ips picosoc_ila]
+}
+
+# ===== PicoSoC bring-up shell source set (merged from run_picosoc.tcl) =====
+if {$is_fresh} {
+    read_ip { \
+        "ip/gig_ethernet_pcs_pma_0/gig_ethernet_pcs_pma_0.srcs/sources_1/ip/gig_ethernet_pcs_pma_0/gig_ethernet_pcs_pma_0.xci" \
+    }
+    read_ip { \
+        "ip/xlnx_mig_7_ddr3/xlnx_mig_7_ddr3.srcs/sources_1/ip/xlnx_mig_7_ddr3/xlnx_mig_7_ddr3.xci" \
+    }
     set_property include_dirs [list "../src/include" "src" "src/soc"] [current_fileset]
     read_verilog -sv { \
         eth/axis_gmii_rx.sv \
