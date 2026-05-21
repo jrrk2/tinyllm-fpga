@@ -303,7 +303,19 @@ endif
 # A symlink `archive/latest` always points at the newest snapshot.
 archive-dir := archive/$(VARIANT)-$(BUILD_STAMP)
 
-$(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(GENERATED_DIR)/exp_lut.hex $(lbfp_stamp) $(BFP_BUILD_DEPS)
+# build_version.svh = git HEAD short hash baked into BUILD_VERSION (reg 0x10F)
+# so the host can map the running bitstream to an exact commit.  Driven by
+# FORCE so the clean-tree gate in host/gen_build_version.py runs on EVERY
+# make (refusing to build with uncommitted Verilog; ALLOW_DIRTY=1 to override).
+# The script is content-stable — it rewrites the file ONLY when the hash
+# changes — so depending on it does not force a needless full re-synth.
+.PHONY: FORCE
+FORCE:
+
+$(GENERATED_DIR)/build_version.svh: FORCE
+	@python3 host/gen_build_version.py
+
+$(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(GENERATED_DIR)/exp_lut.hex $(lbfp_stamp) $(GENERATED_DIR)/build_version.svh scripts/run.tcl $(BFP_BUILD_DEPS)
 	@# No auto-wipe of microgpt_eth.* here — prologue.tcl reopens the
 	@# existing .xpr so synth_1/impl_1 reuse what they can (incremental
 	@# synth/impl saves 30-70% on small RTL edits).  When switching
