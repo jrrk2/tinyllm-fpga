@@ -7,6 +7,14 @@
 ## Buttons
 set_property -dict {PACKAGE_PIN AV40 IOSTANDARD LVCMOS18} [get_ports cpu_reset]
 
+## USB-UART (CP2103) debug console — only present in the PicoSoC shell build
+## (vc707_picosoc_shell).  Guarded so it is a no-op for tops without the ports
+## (e.g. vc707_microgpt_eth).  tx = FPGA->host, rx = host->FPGA.
+if {[llength [get_ports -quiet usb_uart_tx]]} {
+  set_property -dict {PACKAGE_PIN AU36 IOSTANDARD LVCMOS18} [get_ports usb_uart_tx]
+  set_property -dict {PACKAGE_PIN AU33 IOSTANDARD LVCMOS18} [get_ports usb_uart_rx]
+}
+
 ## LEDs
 set_property -dict {PACKAGE_PIN AM39 IOSTANDARD LVCMOS18} [get_ports {led[0]}]
 set_property -dict {PACKAGE_PIN AN39 IOSTANDARD LVCMOS18} [get_ports {led[1]}]

@@ -12,7 +12,6 @@ set is_fresh [expr {[llength [get_files -quiet *microgpt_eth.xdc]] == 0}]
 
 if {$is_fresh} {
     add_files -fileset constrs_1 -norecurse constraints/microgpt_eth.xdc
-    add_files -fileset constrs_1 -norecurse constraints/picosoc_uart.xdc
 
     # IPs: SGMII PCS/PMA (needed by framing) + MIG DDR3.  No ILA IP — trace is
     # exposed via (* mark_debug *) nets; insert an ILA with Vivado "Set Up Debug"
