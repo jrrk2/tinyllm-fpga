@@ -147,8 +147,7 @@ def main():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2.0)
 
     bv = reg_read(s, 0x10F, 1)[0]
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(bv))
-    print(f"FPGA BUILD_VERSION = 0x{bv:08x}  ({ts})")
+    print(f"FPGA BUILD_VERSION = 0x{bv:08x}  (git short hash — `git show {bv:08x}`)")
 
     ops = list(OPS.keys()) if args.op == "all" else [args.op]
     all_ok = True

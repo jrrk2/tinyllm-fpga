@@ -317,7 +317,7 @@ struct UploadStats {
 UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
                    const std::string& path,
                    uint32_t base = 0, int max_passes = 4,
-                   int lead_limit = 1024, int poll_ms = 20,
+                   int lead_limit = 4096, int poll_ms = 5,
                    double target_mbps = 2.0,
                    int backlog_limit = 32) {
     (void)max_passes;
@@ -1591,8 +1591,8 @@ void usage() {
         "      0 = auto-probe: ramp 2/4/6/8/10 MB/s, pick min projected total)\n"
         "      Mirrors Python's structurally-slow loop — burst sends seem\n"
         "       to race the FPGA's eth_ctrl→MIG handshake even at safe averages.\n"
-        "  -L  chunks the sender may run ahead of FPGA done_count    (default 1024)\n"
-        "  -P  ms between done_count polls                           (default 20)\n"
+        "  -L  chunks the sender may run ahead of FPGA done_count    (default 4096)\n"
+        "  -P  ms between done_count polls                           (default 5)\n"
         "  -B  parser→MIG backlog ceiling = rx_count - done_count    (default 32)\n"
         "      Sender pauses if backlog grows past this — catches MIG read/write\n"
         "       contention with autoregress that average-rate pacing misses.\n"
@@ -1637,8 +1637,8 @@ int main(int argc, char** argv) {
     bool        peer_explicit = false;
     std::string vocab_path;
     std::string fpga_mac   = FPGA_MAC;
-    int         lead_limit = 1024;     // backstop only — primary pace is -r
-    int         poll_ms    = 20;
+    int         lead_limit = 4096;     // backstop only — primary pace is -r
+    int         poll_ms    = 5;
     double      target_mbps = 2.0;     // matches Python's measured 1.96 MB/s
     int         backlog_limit = 32;    // pause sender when parser→MIG backlog > this
     int         n_steps    = N_STEPS_DEFAULT;
@@ -1803,6 +1803,11 @@ int main(int argc, char** argv) {
         }
         if (cmd == "read-crc") {
             print_crc(u);
+            return 0;
+        }
+        if (cmd == "version") {
+            auto bv = reg_read(u, REG_BUILD_VERSION, 1, 1)[0];
+            std::printf("BUILD_VERSION = 0x%08x\n", bv);
             return 0;
         }
         if (cmd == "load-roms") {
