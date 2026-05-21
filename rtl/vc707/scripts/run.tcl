@@ -168,6 +168,13 @@ if {$_picosoc_engine} {
                "PROGMEM_HEX=\"[file normalize src/soc/firmware_engine.mem]\""
     set_property verilog_define $_d [current_fileset]
     puts "INFO: PICOSOC_ENGINE — SoC front-end defines appended"
+
+    # UART pins (usb_uart_tx/rx) for the SoC console.  Same picosoc.xdc the shell
+    # uses — the engine top exposes the same port names under PICOSOC_ENGINE.
+    # Added idempotently and OUTSIDE is_fresh so an existing project picks it up.
+    if {[llength [get_files -quiet *picosoc.xdc]] == 0} {
+        add_files -fileset constrs_1 -norecurse constraints/picosoc.xdc
+    }
 }
 
 # build_version.svh (BUILD_VERSION = git HEAD short hash) is generated BEFORE

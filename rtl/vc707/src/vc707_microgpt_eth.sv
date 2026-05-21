@@ -51,6 +51,12 @@ module vc707_microgpt_eth (
   output wire [0:0]   ddr3_cs_n,
   output wire [7:0]   ddr3_dm,
   output wire [0:0]   ddr3_odt
+`ifdef PICOSOC_ENGINE
+  // USB-UART console for the PicoSoC front-end (proof-of-life + regmap readback).
+  // Only present in the PICOSOC_ENGINE build; pins constrained in picosoc.xdc.
+  , output wire        usb_uart_tx
+  , input  wire        usb_uart_rx
+`endif
 );
 
   localparam [7:0]  BOS_TOKEN     = 8'd26;
@@ -609,6 +615,10 @@ module vc707_microgpt_eth (
     .ddr_wr_done_count    ( ddr_wr_done_count        ),
     .ddr_wr_ack_count     ( ddr_wr_ack_count         ),
     .ddr_wr_tx_count      ( ddr_wr_tx_count          )
+`ifdef PICOSOC_ENGINE
+    , .ser_tx             ( usb_uart_tx              )
+    , .ser_rx             ( usb_uart_rx              )
+`endif
   );
 
   wire [31:0] eth_ctrl_fpga_ip;

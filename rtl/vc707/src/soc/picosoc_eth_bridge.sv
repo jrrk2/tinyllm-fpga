@@ -54,7 +54,12 @@ module picosoc_eth_bridge (
   output logic [31:0]   ddr_wr_rx_count,
   output logic [31:0]   ddr_wr_done_count,
   output logic [31:0]   ddr_wr_ack_count,
-  output logic [31:0]   ddr_wr_tx_count
+  output logic [31:0]   ddr_wr_tx_count,
+  // UART console — the engine top routes these to the usb_uart pins.  This is
+  // the ONLY SoC-visible channel in this top (LEDs belong to the engine), so it
+  // carries the CPU boot banner + heartbeat.
+  output wire           ser_tx,
+  input  wire           ser_rx
 );
 
   // ---- tie-offs (lean build: no eth/upload yet) ----
@@ -74,7 +79,6 @@ module picosoc_eth_bridge (
   wire [31:0] iomem_addr;
   wire [31:0] iomem_wdata;
   reg  [31:0] iomem_rdata;
-  wire        ser_tx_unused;
   wire        trace_valid_unused;
   wire [35:0] trace_data_unused;
 
@@ -84,7 +88,7 @@ module picosoc_eth_bridge (
     .iomem_wstrb(iomem_wstrb), .iomem_addr(iomem_addr),
     .iomem_wdata(iomem_wdata), .iomem_rdata(iomem_rdata),
     .irq_5(1'b0), .irq_6(1'b0), .irq_7(1'b0),
-    .ser_tx(ser_tx_unused), .ser_rx(1'b1),
+    .ser_tx(ser_tx), .ser_rx(ser_rx),
     .trace_valid(trace_valid_unused), .trace_data(trace_data_unused)
   );
 
@@ -109,6 +113,14 @@ module picosoc_eth_bridge (
       if (iomem_valid && !iomem_ready && sel_hb) begin
         iomem_ready <= 1'b1;
         iomem_rdata <= {hb_done_flags, hb_out_len, hb_last_token, hb_state};
+      end
+
+      // catch-all: any iomem address NOT mapped here (LED 0x03, eth 0x20, DDR
+      // 0x30 — none wired in this lean build) is acked immediately with 0 so a
+      // stray firmware access can never stall the PicoRV32 forever.
+      if (iomem_valid && !iomem_ready && !sel_reg && !sel_hb) begin
+        iomem_ready <= 1'b1;
+        iomem_rdata <= 32'h0;
       end
 
       // Avalon-MM bridge to the engine regmap (waitrequest=0; reads pulse
