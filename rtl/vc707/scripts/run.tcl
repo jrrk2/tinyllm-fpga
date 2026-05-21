@@ -35,7 +35,11 @@ if {$_picosoc} {
 # first).  Set the macro globally on EVERY run (so an already-created project
 # picks it up too, no wipe needed) — the guard is then bypassed regardless of
 # Vivado's compile order, and picorv32 uses the picosoc_regs register file.
-set_property verilog_define {PICORV32_REGS=picosoc_regs PICOSOC_ILA} [current_fileset]
+# PROGMEM_HEX points the BRAM progmem at the firmware .mem (absolute path; synth
+# runs from a subdir).  The BRAM init is the default firmware; `make fw-update`
+# later swaps it in the built .bit via updatemem (needs the .mmi from below).
+set _fw_mem [file normalize src/soc/firmware_shell.mem]
+set_property verilog_define [list "PICORV32_REGS=picosoc_regs" "PICOSOC_ILA" "PROGMEM_HEX=\"$_fw_mem\""] [current_fileset]
 
 # On-chip ILA (eth_clk) on the trace bus + iomem/DDR activity.  Created in-script
 # (no pre-gen .xci), idempotently and OUTSIDE is_fresh so an already-created
@@ -75,7 +79,7 @@ if {$is_fresh} {
         src/soc/picosoc_noflash.v \
         src/soc/picorv32.v \
         src/soc/simpleuart.v \
-        src/soc/progmem_shell.v \
+        src/soc/progmem_bram.v \
     }
     read_verilog -sv { \
         src/soc/soc_ddr_bridge.sv \
@@ -309,6 +313,13 @@ wait_on_run impl_1
 launch_runs impl_1 -to_step write_bitstream
 wait_on_run impl_1
 open_run impl_1
+
+if {$_picosoc} {
+    # BRAM memory-map for firmware swaps via updatemem (make fw-update): lets us
+    # patch the progmem in the built .bit without re-synthesis.
+    write_mem_info -force picosoc_shell.mmi
+    puts "INFO: wrote picosoc_shell.mmi (progmem BRAM map for updatemem)"
+}
 
 exec mkdir -p reports/
 exec rm -rf reports/*

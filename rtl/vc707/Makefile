@@ -354,21 +354,41 @@ $(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(GENERATED_
 RISCV_CROSS ?= riscv64-unknown-elf-
 SOC_DIR     := src/soc
 
-$(SOC_DIR)/progmem_shell.v: $(SOC_DIR)/fw_shell.c $(SOC_DIR)/start.s $(SOC_DIR)/soc.lds $(SOC_DIR)/bin2verilog.py
+# Firmware build: C + asm -> .bin -> .mem.  The .mem both inits the progmem BRAM
+# at synth (PROGMEM_HEX) and is the `updatemem -data` payload for fw-update.
+$(SOC_DIR)/firmware_shell.mem: $(SOC_DIR)/fw_shell.c $(SOC_DIR)/start.s $(SOC_DIR)/soc.lds $(SOC_DIR)/bin2mem.py
 	$(RISCV_CROSS)gcc -Os -march=rv32im -mabi=ilp32 -ffreestanding -nostdlib -nostartfiles \
 	    -Wl,-T,$(SOC_DIR)/soc.lds -o $(SOC_DIR)/fw_shell.elf $(SOC_DIR)/start.s $(SOC_DIR)/fw_shell.c -lgcc
 	$(RISCV_CROSS)objcopy -O binary $(SOC_DIR)/fw_shell.elf $(SOC_DIR)/fw_shell.bin
-	python3 $(SOC_DIR)/bin2verilog.py $(SOC_DIR)/fw_shell.bin > $@
+	python3 $(SOC_DIR)/bin2mem.py $(SOC_DIR)/fw_shell.bin > $@
 	@echo "=== picosoc firmware: $$(stat -c%s $(SOC_DIR)/fw_shell.bin) bytes -> $@ ==="
 
-.PHONY: picosoc picosoc-fw
-picosoc-fw: $(SOC_DIR)/progmem_shell.v
+.PHONY: picosoc picosoc-fw fw-update
+picosoc-fw: $(SOC_DIR)/firmware_shell.mem
 
+# Full shell build (synth/impl).
 picosoc: picosoc-fw
 	mkdir -p $(work-dir)
 	PICOSOC=1 $(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
 	@cp microgpt_eth.runs/impl_1/vc707_picosoc_shell.bit ./$(work-dir)/ 2>/dev/null || true
 	@echo "=== picosoc shell built (top vc707_picosoc_shell) -> $(work-dir)/ ==="
+
+# Firmware-only iteration: recompile C and patch the progmem BRAM in the EXISTING
+# bitstream via updatemem (seconds, no synth).  Needs a prior `make picosoc`
+# (emits picosoc_shell.mmi + the .bit).  Reflash FW_BIT_OUT afterwards.
+# If updatemem can't resolve the BRAM, set FW_PROC from the .mmi instance path.
+FW_BIT_IN  ?= microgpt_eth.runs/impl_1/vc707_picosoc_shell.bit
+FW_BIT_OUT ?= $(work-dir)/vc707_picosoc_shell_fw.bit
+FW_MMI     ?= picosoc_shell.mmi
+FW_PROC    ?=
+fw-update: $(SOC_DIR)/firmware_shell.mem
+	@test -f $(FW_MMI)    || { echo "ERROR: $(FW_MMI) missing — run 'make picosoc' first"; exit 1; }
+	@test -f $(FW_BIT_IN) || { echo "ERROR: $(FW_BIT_IN) missing — run 'make picosoc' first"; exit 1; }
+	@mkdir -p $(work-dir)
+	FW_MMI=$(FW_MMI) FW_MEM=$(abspath $(SOC_DIR)/firmware_shell.mem) \
+	  FW_BIT_IN=$(FW_BIT_IN) FW_BIT_OUT=$(FW_BIT_OUT) FW_PROC="$(FW_PROC)" \
+	  $(VIVADO) -nojournal -mode batch -source scripts/updatemem.tcl
+	@echo "=== firmware patched -> $(FW_BIT_OUT) (reflash this) ==="
 
 # Quick convenience target: bake BFP hex + run the Verilator layer test.
 # Useful for sanity-checking precision after RTL edits before launching a
