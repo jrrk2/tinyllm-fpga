@@ -19,16 +19,21 @@ void main(void)
 
     *uart_clkdiv = 1085;                 /* 125 MHz eth_clk / 115200 */
 
+    *uart_data = '\r';
     *uart_data = '\n';
     *uart_data = 'H';
     *uart_data = 'e';
     *uart_data = 'l';
     *uart_data = 'l';
     *uart_data = 'o';
+    *uart_data = '\r';
     *uart_data = '\n';
 
     for (;;) {                           /* echo UART input forever */
         int32_t c = (int32_t)*uart_data; /* -1 when no byte waiting */
-        if (c != -1) *uart_data = (uint32_t)(c & 0xFF);
+        if (c != -1) {
+            if (c == '\r') *uart_data = '\r';   /* Enter -> CR+LF */
+            *uart_data = (c == '\r') ? '\n' : (uint32_t)(c & 0xFF);
+        }
     }
 }
