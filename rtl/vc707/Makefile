@@ -551,13 +551,15 @@ $(ips): %.xci :
 # Search order: live Vivado runs/ first (just-finished build), then work/
 # copy, then archive/latest (most recent successful build, surviving
 # `make clean`), then arbitrary archive dirs.
+# work/ first: every build (now in a date-stamped project) copies its bit there,
+# so work/ is always the freshest.  microgpt_eth.runs is a legacy fallback.
 EXISTING_BIT := $(firstword $(wildcard \
-    microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit \
     $(work-dir)/vc707_microgpt_eth.bit \
+    microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit \
     archive/latest/vc707_microgpt_eth.bit))
 EXISTING_MCS := $(firstword $(wildcard \
-    microgpt_eth.runs/impl_1/vc707_microgpt_eth.mcs \
     $(work-dir)/vc707_microgpt_eth.mcs \
+    microgpt_eth.runs/impl_1/vc707_microgpt_eth.mcs \
     archive/latest/vc707_microgpt_eth.mcs))
 
 # Re-bake the BPI image from the current bit.  Falls back to a full
