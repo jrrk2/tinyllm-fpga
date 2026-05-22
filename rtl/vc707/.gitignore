@@ -59,3 +59,5 @@ src/soc/*.o
 src/soc/progmem_init*.svh
 # Stray Verilator lint/obj dirs
 src/smollm/obj_dir/
+# generated updatemem memory map
+*.mmi

@@ -421,7 +421,7 @@ picosoc-engine: $(SOC_DIR)/$(ENGINE_FW).mem $(bit)
 picosoc-engine-smoke:
 	$(MAKE) wipe-project picosoc-engine ENGINE_FW=firmware_smoke
 
-.PHONY: picosoc picosoc-fw fw-swap
+.PHONY: picosoc picosoc-fw fw-update fw-swap
 picosoc-fw: $(SOC_DIR)/firmware_shell.mem
 
 # Full shell build (synth/impl).  Integrated ILA is ON by default; disable with
@@ -436,15 +436,38 @@ picosoc: picosoc-fw
 	@cp microgpt_eth.runs/impl_1/vc707_picosoc_shell.bit ./$(work-dir)/ 2>/dev/null || true
 	@echo "=== picosoc shell built (top vc707_picosoc_shell, progmem=RAMB16) -> $(work-dir)/ ==="
 
-# Software update WITHOUT re-synthesis: rewrite the directly-instantiated progmem
-# RAMB INIT in the routed checkpoint from a new firmware, then re-emit the
-# bitstream (write_bitstream only, ~2-3 min).  No place/route, no .mmi.
-# (updatemem's .mmi needs write_mem_info provenance the PicoRV32 can't give;
-# data2mem is retired — this checkpoint-INIT path is the working replacement.)
-# Verified: re-writing the SAME firmware reproduces the original frames (only the
-# build-timestamp bytes differ).  Needs a prior `make picosoc` (-> routed dcp).
-#   make fw-swap SWAP_FW=firmware_smoke   # Hello/echo
-#   make fw-swap SWAP_FW=firmware_shell   # bring-up banner + eth + DDR
+# Software update WITHOUT re-synthesis.  Two paths, both verified (re-writing the
+# SAME firmware reproduces the original frames bar the build-timestamp bytes):
+#
+# fw-update (PRIMARY, ~14 s) — the standard updatemem flow.  Needs a hand-built
+#   .mmi (scripts/gen_mmi.tcl, generated once per build from the routed dcp; ~1.5
+#   min) listing the progmem RAMB tile, and a data file with a leading "@0".
+#   write_mem_info can't auto-make the .mmi (no PicoRV32 address space), and
+#   data2mem is retired — but a correct hand .mmi (Val= attrs, no Versal-era
+#   AddressSpaceRange) drives updatemem fine.
+#     make fw-update UM_FW=firmware_smoke   # Hello/echo
+#     make fw-update UM_FW=firmware_shell   # bring-up banner + eth + DDR
+#
+# fw-swap (FALLBACK, ~2-3 min) — no .mmi: rewrite the RAMB INIT in the routed
+#   checkpoint and write_bitstream.  Use if updatemem ever balks.
+UM_DCP  ?= microgpt_eth.runs/impl_1/vc707_picosoc_shell_routed.dcp
+UM_BIT  ?= microgpt_eth.runs/impl_1/vc707_picosoc_shell.bit
+UM_MMI  ?= picosoc_shell.mmi
+UM_FW   ?= firmware_smoke
+UM_OUT  ?= $(work-dir)/vc707_picosoc_shell_$(UM_FW:firmware_%=%).bit
+UPDATEMEM := $(dir $(VIVADO))updatemem
+fw-update: $(SOC_DIR)/$(UM_FW).mem
+	@test -f $(UM_BIT) || { echo "ERROR: $(UM_BIT) missing — run 'make picosoc' first"; exit 1; }
+	@mkdir -p $(work-dir)
+	@if [ ! -f $(UM_MMI) ]; then \
+	   echo "=== $(UM_MMI) missing — generating from $(UM_DCP) ==="; \
+	   DCP_IN=$(UM_DCP) MMI_OUT=$(UM_MMI) $(VIVADO) -nojournal -mode batch -source scripts/gen_mmi.tcl; \
+	 fi
+	@{ echo "@0"; cat $(SOC_DIR)/$(UM_FW).mem; } > $(work-dir)/$(UM_FW).um.mem
+	$(UPDATEMEM) -force -meminfo $(UM_MMI) -data $(work-dir)/$(UM_FW).um.mem \
+	  -bit $(UM_BIT) -proc $$(grep -oP 'InstPath="\K[^"]+' $(UM_MMI) | head -1) -out $(UM_OUT)
+	@echo "=== firmware updated ($(UM_FW)) -> $(UM_OUT) (reflash this) ==="
+
 SWAP_DCP     ?= microgpt_eth.runs/impl_1/vc707_picosoc_shell_routed.dcp
 SWAP_FW      ?= firmware_smoke
 SWAP_BIT_OUT ?= $(work-dir)/vc707_picosoc_shell_$(SWAP_FW:firmware_%=%).bit
