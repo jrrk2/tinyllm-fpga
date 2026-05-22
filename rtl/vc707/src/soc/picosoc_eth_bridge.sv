@@ -95,6 +95,14 @@ module picosoc_eth_bridge (
   // ---- iomem decode: 0x10 -> Avalon regmap, 0x40 -> engine status ----
   wire sel_reg = (iomem_addr[31:24] == 8'h10);   // engine regmap (Avalon master)
   wire sel_hb  = (iomem_addr[31:24] == 8'h40);   // engine status snapshot
+  // picosoc_noflash routes EVERYTHING with addr[31:24] > 0x01 to the iomem bus,
+  // INCLUDING its own spimemio/UART at 0x0200_xxxx (addr[31:24]==0x02).  Those are
+  // handled internally and gated by the UART's reg_dat_wait back-pressure.  The
+  // catch-all below must NOT ack 0x02, or it satisfies mem_ready early and the CPU
+  // never stalls on the busy UART -> every byte after the first is dropped (the
+  // "echo + '>' only" symptom).  The shell never had this because its decode only
+  // acks 0x03/0x10/0x20/0x30/0x31, never 0x02.
+  wire sel_internal = (iomem_addr[31:24] == 8'h02);   // spimemio/UART — leave to internal back-pressure
 
   typedef enum logic [1:0] { B_IDLE, B_WR, B_RD, B_RD_WAIT } bst_t;
   bst_t bst;
@@ -117,8 +125,10 @@ module picosoc_eth_bridge (
 
       // catch-all: any iomem address NOT mapped here (LED 0x03, eth 0x20, DDR
       // 0x30 — none wired in this lean build) is acked immediately with 0 so a
-      // stray firmware access can never stall the PicoRV32 forever.
-      if (iomem_valid && !iomem_ready && !sel_reg && !sel_hb) begin
+      // stray firmware access can never stall the PicoRV32 forever.  EXCLUDE
+      // sel_internal (0x02 spimemio/UART) — that region is governed by the SoC's
+      // internal UART back-pressure, and acking it here defeats it.
+      if (iomem_valid && !iomem_ready && !sel_reg && !sel_hb && !sel_internal) begin
         iomem_ready <= 1'b1;
         iomem_rdata <= 32'h0;
       end
