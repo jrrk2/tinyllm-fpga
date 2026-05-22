@@ -496,8 +496,8 @@ fw-swap: $(SOC_DIR)/$(SWAP_FW).mem
 #     xc7vx485t IDCODE.  Set OFL=, or `sudo make install` in its build dir.
 #   * 15 MHz is the safe rate; 30 MHz garbles the JTAG IDCODE on this board
 #     ("Unknown device 0x67d0e027"), so OLOAD_FREQ is fixed low here.
-#   * Only works on MATCH_CYCLE-NoWait bitstreams (picosoc.xdc) — otherwise the
-#     design stalls on DCI match and never starts.
+#   * Only works on MATCH_CYCLE-NoWait bitstreams (microgpt_eth.xdc) — otherwise
+#     the design stalls on DCI match and never starts.
 OFL        ?= $(HOME)/openFPGALoader/build/openFPGALoader
 OLOAD_FREQ ?= 15000000
 OLOAD_BIT  ?= work/vc707_picosoc_shell_jtag.bit

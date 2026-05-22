@@ -7,8 +7,8 @@
 ## Buttons
 set_property -dict {PACKAGE_PIN AV40 IOSTANDARD LVCMOS18} [get_ports cpu_reset]
 
-## (USB-UART pins for the PicoSoC shell live in constraints/picosoc.xdc, added
-##  only by the PICOSOC=1 build — a conditional guard here proved unreliable.)
+## (USB-UART console pins are at the bottom of this file — one shared XDC for
+##  every build, no separate conditional picosoc.xdc.)
 
 ## LEDs
 set_property -dict {PACKAGE_PIN AM39 IOSTANDARD LVCMOS18} [get_ports {led[0]}]
@@ -84,3 +84,11 @@ set_property CONFIG_VOLTAGE 1.8 [current_design]
 ## NoWait lets DONE assert immediately; DCI still calibrates and the MIG's
 ## init_calib_complete still guards the DDR3 path.  Applies to ALL builds.
 set_property BITSTREAM.STARTUP.MATCH_CYCLE NoWait [current_design]
+
+## USB-UART (CP2103) debug console — tx = FPGA->host, rx = host->FPGA.  Only the
+## PicoSoC tops expose these ports; on the plain engine they don't exist, so the
+## -quiet get_ports just returns empty and these lines no-op (one shared XDC for
+## every build, instead of a conditionally-added picosoc.xdc).  No UCIO-1: that
+## only fires for ports that exist but are unconstrained.
+set_property -dict {PACKAGE_PIN AU36 IOSTANDARD LVCMOS18} [get_ports -quiet usb_uart_tx]
+set_property -dict {PACKAGE_PIN AU33 IOSTANDARD LVCMOS18} [get_ports -quiet usb_uart_rx]

@@ -47,16 +47,8 @@ static void hex_(uint32_t v, int nyb) {
 }
 
 static void menu(void) {
-    print_("\nfw_engine built " __DATE__ " " __TIME__ "\n");
-    print_("commands:\n");
-    print_("  v  build version\n");
-    print_("  c  weight CRC + has_run\n");
-    print_("  s  engine status (FSM / token / flags)\n");
-    print_("  m  matvec selftest  (compute proof-of-life)\n");
-    print_("  w  write test pattern to DDR3 (upload path)\n");
-    print_("  k  idle scan-CRC of DDR3 + self-check\n");
-    print_("  r  restart engine\n");
-    print_("  ?  this menu\n");
+    print_("\nfw_engine " __DATE__ " " __TIME__ "\n");
+    print_("v ver  c crc  s status  w ddrwr  k scancrc  r restart  ? menu\n");
 }
 
 static void cmd_version(void) {
@@ -81,19 +73,6 @@ static void cmd_status(void) {
     print_(" calib=");     hex_(REG(R_DBG_CALIB) & 1, 1);
     print_(" layer_done=");hex_(REG(R_LAYER_DONE) & 3, 1);
     putc_('\n');
-}
-
-static void cmd_matvec(void) {
-    print_("matvec selftest ... ");
-    REG(R_MVST_TRIG) = 1;
-    uint32_t to = 4000000u;
-    while (!(REG(R_MVST_DONE) & 1) && --to) { }
-    if (!to) { print_("TIMEOUT (engine not responding)\n"); return; }
-    print_("done:\n");
-    for (int i = 0; i < 8; i++) {
-        print_("  "); hex_(REG(R_MVST_R0 + i), 8);
-        if ((i & 3) == 3) putc_('\n');
-    }
 }
 
 static void cmd_restart(void) {
@@ -142,7 +121,7 @@ static void cmd_scan(void) {
 void main(void)
 {
     reg_uart_clkdiv = UART_DIV;
-    print_("\n=== PicoSoC + engine console (lean) built " __DATE__ " " __TIME__ " ===\n");
+    print_("\n=== PicoSoC engine console ===\n");
     cmd_version();
     menu();
     print_("> ");
@@ -156,7 +135,6 @@ void main(void)
             case 'v': cmd_version(); break;
             case 'c': cmd_crc();     break;
             case 's': cmd_status();  break;
-            case 'm': cmd_matvec();  break;
             case 'w': cmd_ddrwrite();break;
             case 'k': cmd_scan();    break;
             case 'r': cmd_restart(); break;

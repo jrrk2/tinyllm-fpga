@@ -35,13 +35,8 @@ if {$is_fresh} {
 
 if {$_picosoc} {
 
-# Shell-only constraints (UART pins) — added idempotently and OUTSIDE is_fresh
-# so an already-created project picks them up without a wipe.  Kept separate
-# from microgpt_eth.xdc because a conditional get_ports guard in the shared XDC
-# proved unreliable (the pins ended up unconstrained -> UCIO-1 DRC failure).
-if {[llength [get_files -quiet *picosoc.xdc]] == 0} {
-    add_files -fileset constrs_1 -norecurse constraints/picosoc.xdc
-}
+# UART console pins now live in the single shared microgpt_eth.xdc (added in
+# is_fresh) with -quiet get_ports, so no separate per-target constraints file.
 
 # Self-heal the progmem case-ROM -> BRAM swap on an already-created project
 # (read_verilog source-list edits only take effect on a fresh project, so an
@@ -197,12 +192,9 @@ if {$_picosoc_engine} {
         read_ip { "ip/picosoc_ila/picosoc_ila.srcs/sources_1/ip/picosoc_ila/picosoc_ila.xci" }
     }
 
-    # UART pins (usb_uart_tx/rx) for the SoC console.  Same picosoc.xdc the shell
-    # uses — the engine top exposes the same port names under PICOSOC_ENGINE.
-    # Added idempotently and OUTSIDE is_fresh so an existing project picks it up.
-    if {[llength [get_files -quiet *picosoc.xdc]] == 0} {
-        add_files -fileset constrs_1 -norecurse constraints/picosoc.xdc
-    }
+    # UART console pins (usb_uart_tx/rx) come from the single shared
+    # microgpt_eth.xdc (added in is_fresh), which constrains them with -quiet
+    # get_ports — no separate per-target constraints file.
 }
 
 # build_version.svh (BUILD_VERSION = git HEAD short hash) is generated BEFORE
