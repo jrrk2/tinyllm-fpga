@@ -392,41 +392,29 @@ $(SOC_DIR)/firmware_smoke.mem: $(SOC_DIR)/fw_smoke.c $(SOC_DIR)/start.s $(SOC_DI
 # Real engine + PicoSoC front-end.  Builds the firmware, then the engine
 # bitstream ($(bit)) with PICOSOC_ENGINE exported so run.tcl swaps eth_ctrl ->
 # picosoc_eth_bridge.  ILA on the SoC trace/iomem bus is ON by default
-# (PICOSOC_ILA=0 to disable).  Source set changes -> wipe first:
-#   make wipe-project picosoc-engine
+# (PICOSOC_ILA=0 to disable).  Baked firmware is selectable via ENGINE_FW
+# (default the menu firmware; firmware_smoke = the Hello/echo smoke test).
+# Source set / firmware changes -> wipe first:
+#   make wipe-project picosoc-engine                      (menu firmware)
+#   make wipe-project picosoc-engine ENGINE_FW=firmware_smoke   (Hello/echo)
+ENGINE_FW ?= firmware_engine
 .PHONY: picosoc-engine
 picosoc-engine: export PICOSOC_ENGINE := 1
 picosoc-engine: export PICOSOC_ILA := $(PICOSOC_ILA)
+picosoc-engine: export ENGINE_FW_MEM := $(abspath $(SOC_DIR)/$(ENGINE_FW).mem)
 ifneq ($(PICOSOC_ILA),0)
 picosoc-engine: $(picosoc-ila-xci)
 endif
-picosoc-engine: $(SOC_DIR)/firmware_engine.mem $(bit)
-	@echo "=== picosoc-engine built: vc707_microgpt_eth + PicoSoC front-end (ILA=$(PICOSOC_ILA)) ==="
+picosoc-engine: $(SOC_DIR)/$(ENGINE_FW).mem $(bit)
+	@echo "=== picosoc-engine built: $(ENGINE_FW), ILA=$(PICOSOC_ILA) ==="
 
-# Incremental firmware swap for the engine build: splice a firmware .mem into the
-# EXISTING bitstream via updatemem (seconds, no synth).  Defaults to the smoke
-# firmware.  Needs the .mmi: emitted by a fresh picosoc-engine build, OR
-# extracted here from the routed checkpoint via engine_mmi.tcl.  Reflash
-# ENG_BIT_OUT afterwards.  Override ENG_FW=src/soc/firmware_engine.mem to splice
-# the full menu firmware instead.
-ENG_DCP     ?= microgpt_eth.runs/impl_1/vc707_microgpt_eth_routed.dcp
-ENG_BIT_IN  ?= microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit
-ENG_BIT_OUT ?= $(work-dir)/vc707_microgpt_eth_smoke.bit
-ENG_MMI     ?= picosoc_engine.mmi
-ENG_FW      ?= $(SOC_DIR)/firmware_smoke.mem
-ENG_PROC    ?=
+# Smoke build: wipe + rebuild with the minimal Hello/echo firmware AND the ILA,
+# so we get a clean proof-of-life and on-chip visibility in one bitstream.
+# (updatemem can't patch the existing .bit — the progmem ROM is partly LUTROM,
+# not BRAM — so a rebuild is the only way to change firmware.)
 .PHONY: picosoc-engine-smoke
-picosoc-engine-smoke: $(ENG_FW)
-	@test -f $(ENG_BIT_IN) || { echo "ERROR: $(ENG_BIT_IN) missing — run 'make picosoc-engine' first"; exit 1; }
-	@mkdir -p $(work-dir)
-	@if [ ! -f $(ENG_MMI) ]; then \
-	   echo "=== $(ENG_MMI) missing — extracting from $(ENG_DCP) ==="; \
-	   DCP_IN=$(ENG_DCP) MMI_OUT=$(ENG_MMI) $(VIVADO) -nojournal -mode batch -source scripts/engine_mmi.tcl; \
-	 fi
-	FW_MMI=$(ENG_MMI) FW_MEM=$(abspath $(ENG_FW)) \
-	  FW_BIT_IN=$(ENG_BIT_IN) FW_BIT_OUT=$(ENG_BIT_OUT) FW_PROC="$(ENG_PROC)" \
-	  $(VIVADO) -nojournal -mode batch -source scripts/updatemem.tcl
-	@echo "=== smoke firmware spliced -> $(ENG_BIT_OUT) (reflash this) ==="
+picosoc-engine-smoke:
+	$(MAKE) wipe-project picosoc-engine ENGINE_FW=firmware_smoke
 
 .PHONY: picosoc picosoc-fw fw-update
 picosoc-fw: $(SOC_DIR)/firmware_shell.mem

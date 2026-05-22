@@ -168,12 +168,15 @@ if {$_picosoc_engine} {
     # PICOSOC_ILA define.
     set _eila [expr {![info exists ::env(PICOSOC_ILA)] || [string trim $::env(PICOSOC_ILA)] ne "0"}]
 
+    # Baked progmem firmware is selectable via ENGINE_FW_MEM (set by the Makefile
+    # ENGINE_FW var) so we can rebuild with the smoke firmware or the menu without
+    # touching sources.  Default = the menu firmware.
+    set _fwmem [expr {[info exists ::env(ENGINE_FW_MEM)] ? $::env(ENGINE_FW_MEM) : [file normalize src/soc/firmware_engine.mem]}]
     set _d [get_property verilog_define [current_fileset]]
-    lappend _d "PICOSOC_ENGINE" "PICORV32_REGS=picosoc_regs" \
-               "PROGMEM_HEX=\"[file normalize src/soc/firmware_engine.mem]\""
+    lappend _d "PICOSOC_ENGINE" "PICORV32_REGS=picosoc_regs" "PROGMEM_HEX=\"$_fwmem\""
     if {$_eila} { lappend _d "PICOSOC_ILA" }
     set_property verilog_define $_d [current_fileset]
-    puts "INFO: PICOSOC_ENGINE — SoC front-end defines appended (ILA=$_eila)"
+    puts "INFO: PICOSOC_ENGINE — SoC front-end (ILA=$_eila, firmware=$_fwmem)"
 
     if {$_eila && [llength [get_ips -quiet picosoc_ila]] == 0} {
         read_ip { "ip/picosoc_ila/picosoc_ila.srcs/sources_1/ip/picosoc_ila/picosoc_ila.xci" }
@@ -377,17 +380,18 @@ launch_runs impl_1 -to_step write_bitstream
 wait_on_run impl_1
 open_run impl_1
 
-if {$_picosoc} {
-    # BRAM memory-map for firmware swaps via updatemem (make fw-update): lets us
-    # patch the progmem in the built .bit without re-synthesis.
-    write_mem_info -force picosoc_shell.mmi
-    puts "INFO: wrote picosoc_shell.mmi (progmem BRAM map for updatemem)"
-}
-if {$_picosoc_engine} {
-    # Same, for the engine build — enables `make picosoc-engine-smoke` /
-    # `fw-update` to splice firmware into the .bit without re-synthesis.
-    write_mem_info -force picosoc_engine.mmi
-    puts "INFO: wrote picosoc_engine.mmi (progmem BRAM map for updatemem)"
+# NOTE: updatemem firmware-swap is NOT usable for the PicoSoC progmem.  Vivado
+# optimises the read-only, mostly-zero ROM to ~18 bits in one RAMB18 tile + the
+# rest as LUTROM, so write_mem_info finds no patchable memory and updatemem can't
+# rewrite LUT bits.  Firmware is changed by rebuilding (ENGINE_FW=...).  The
+# attempt is kept (wrapped, never fatal) only so it is visible in the log.
+if {$_picosoc || $_picosoc_engine} {
+    set _mmi [expr {$_picosoc ? "picosoc_shell.mmi" : "picosoc_engine.mmi"}]
+    if {[catch {write_mem_info -force $_mmi} _e]} {
+        puts "INFO: write_mem_info ($_mmi) unavailable — progmem is not a pure BRAM; change firmware via rebuild"
+    } else {
+        puts "INFO: wrote $_mmi"
+    }
 }
 
 exec mkdir -p reports/
