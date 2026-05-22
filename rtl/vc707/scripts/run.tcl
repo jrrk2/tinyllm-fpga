@@ -59,8 +59,8 @@ if {[llength [get_files -quiet *progmem_bram.v]] == 0} {
 # picks it up too, no wipe needed) — the guard is then bypassed regardless of
 # Vivado's compile order, and picorv32 uses the picosoc_regs register file.
 # PROGMEM_HEX points the BRAM progmem at the firmware .mem (absolute path; synth
-# runs from a subdir).  The BRAM init is the default firmware; `make fw-update`
-# later swaps it in the built .bit via updatemem (needs the .mmi from below).
+# runs from a subdir).  The BRAM init is the default firmware; `make fw-swap`
+# later rewrites it in the built .bit via the routed checkpoint (no re-synth).
 set _fw_mem [file normalize src/soc/firmware_shell.mem]
 
 # progmem is a DIRECTLY instantiated RAMB16_S36_S36 (forced BRAM, updatemem-
@@ -395,19 +395,11 @@ launch_runs impl_1 -to_step write_bitstream
 wait_on_run impl_1
 open_run impl_1
 
-# NOTE: updatemem firmware-swap is NOT usable for the PicoSoC progmem.  Vivado
-# optimises the read-only, mostly-zero ROM to ~18 bits in one RAMB18 tile + the
-# rest as LUTROM, so write_mem_info finds no patchable memory and updatemem can't
-# rewrite LUT bits.  Firmware is changed by rebuilding (ENGINE_FW=...).  The
-# attempt is kept (wrapped, never fatal) only so it is visible in the log.
-if {$_picosoc || $_picosoc_engine} {
-    set _mmi [expr {$_picosoc ? "picosoc_shell.mmi" : "picosoc_engine.mmi"}]
-    if {[catch {write_mem_info -force $_mmi} _e]} {
-        puts "INFO: write_mem_info ($_mmi) unavailable — progmem is not a pure BRAM; change firmware via rebuild"
-    } else {
-        puts "INFO: wrote $_mmi"
-    }
-}
+# Firmware can be swapped in this built .bit WITHOUT re-synthesis via
+# `make fw-swap SWAP_FW=...` (scripts/swap_fw.tcl): it rewrites the directly-
+# instantiated progmem RAMB INIT in the routed checkpoint and re-emits the
+# bitstream.  No write_mem_info / .mmi needed (those require a processor address
+# space the PicoRV32 lacks; data2mem is retired).
 
 exec mkdir -p reports/
 exec rm -rf reports/*

@@ -421,7 +421,7 @@ picosoc-engine: $(SOC_DIR)/$(ENGINE_FW).mem $(bit)
 picosoc-engine-smoke:
 	$(MAKE) wipe-project picosoc-engine ENGINE_FW=firmware_smoke
 
-.PHONY: picosoc picosoc-fw fw-update
+.PHONY: picosoc picosoc-fw fw-swap
 picosoc-fw: $(SOC_DIR)/firmware_shell.mem
 
 # Full shell build (synth/impl).  Integrated ILA is ON by default; disable with
@@ -436,22 +436,25 @@ picosoc: picosoc-fw
 	@cp microgpt_eth.runs/impl_1/vc707_picosoc_shell.bit ./$(work-dir)/ 2>/dev/null || true
 	@echo "=== picosoc shell built (top vc707_picosoc_shell, progmem=RAMB16) -> $(work-dir)/ ==="
 
-# Firmware-only iteration: recompile C and patch the progmem BRAM in the EXISTING
-# bitstream via updatemem (seconds, no synth).  Needs a prior `make picosoc`
-# (emits picosoc_shell.mmi + the .bit).  Reflash FW_BIT_OUT afterwards.
-# If updatemem can't resolve the BRAM, set FW_PROC from the .mmi instance path.
-FW_BIT_IN  ?= microgpt_eth.runs/impl_1/vc707_picosoc_shell.bit
-FW_BIT_OUT ?= $(work-dir)/vc707_picosoc_shell_fw.bit
-FW_MMI     ?= picosoc_shell.mmi
-FW_PROC    ?=
-fw-update: $(SOC_DIR)/firmware_shell.mem
-	@test -f $(FW_MMI)    || { echo "ERROR: $(FW_MMI) missing — run 'make picosoc' first"; exit 1; }
-	@test -f $(FW_BIT_IN) || { echo "ERROR: $(FW_BIT_IN) missing — run 'make picosoc' first"; exit 1; }
+# Software update WITHOUT re-synthesis: rewrite the directly-instantiated progmem
+# RAMB INIT in the routed checkpoint from a new firmware, then re-emit the
+# bitstream (write_bitstream only, ~2-3 min).  No place/route, no .mmi.
+# (updatemem's .mmi needs write_mem_info provenance the PicoRV32 can't give;
+# data2mem is retired — this checkpoint-INIT path is the working replacement.)
+# Verified: re-writing the SAME firmware reproduces the original frames (only the
+# build-timestamp bytes differ).  Needs a prior `make picosoc` (-> routed dcp).
+#   make fw-swap SWAP_FW=firmware_smoke   # Hello/echo
+#   make fw-swap SWAP_FW=firmware_shell   # bring-up banner + eth + DDR
+SWAP_DCP     ?= microgpt_eth.runs/impl_1/vc707_picosoc_shell_routed.dcp
+SWAP_FW      ?= firmware_smoke
+SWAP_BIT_OUT ?= $(work-dir)/vc707_picosoc_shell_$(SWAP_FW:firmware_%=%).bit
+fw-swap: $(SOC_DIR)/$(SWAP_FW).mem
+	@test -f $(SWAP_DCP) || { echo "ERROR: $(SWAP_DCP) missing — run 'make picosoc' first"; exit 1; }
 	@mkdir -p $(work-dir)
-	FW_MMI=$(FW_MMI) FW_MEM=$(abspath $(SOC_DIR)/firmware_shell.mem) \
-	  FW_BIT_IN=$(FW_BIT_IN) FW_BIT_OUT=$(FW_BIT_OUT) FW_PROC="$(FW_PROC)" \
-	  $(VIVADO) -nojournal -mode batch -source scripts/updatemem.tcl
-	@echo "=== firmware patched -> $(FW_BIT_OUT) (reflash this) ==="
+	DCP_IN=$(SWAP_DCP) FW_BIN=$(SOC_DIR)/$(SWAP_FW:firmware_%=fw_%).bin \
+	  BIT_OUT=$(abspath $(SWAP_BIT_OUT)) \
+	  $(VIVADO) -nojournal -mode batch -source scripts/swap_fw.tcl
+	@echo "=== firmware swapped ($(SWAP_FW)) -> $(SWAP_BIT_OUT) (reflash this) ==="
 
 # Quick convenience target: bake BFP hex + run the Verilator layer test.
 # Useful for sanity-checking precision after RTL edits before launching a
