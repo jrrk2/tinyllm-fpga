@@ -55,5 +55,7 @@ src/soc/obj_dir/
 src/soc/*.elf
 src/soc/*.bin
 src/soc/*.o
+# generated progmem BRAM INIT (baked from firmware by bin2init.py)
+src/soc/progmem_init_*.svh
 # Stray Verilator lint/obj dirs
 src/smollm/obj_dir/

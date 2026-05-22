@@ -397,16 +397,26 @@ $(SOC_DIR)/firmware_smoke.mem: $(SOC_DIR)/fw_smoke.c $(SOC_DIR)/start.s $(SOC_DI
 # Source set / firmware changes -> wipe first:
 #   make wipe-project picosoc-engine                      (menu firmware)
 #   make wipe-project picosoc-engine ENGINE_FW=firmware_smoke   (Hello/echo)
-ENGINE_FW ?= firmware_engine
+ENGINE_FW      ?= firmware_engine
+ENGINE_FW_BASE := $(ENGINE_FW:firmware_%=%)
+
+# Bake a firmware into the progmem RAMB16_S36_S36 INIT params (one .svh per
+# firmware: progmem_init_{shell,engine,smoke}.svh).  The .bin is a side-effect of
+# the .mem rule; bin2init.py packs it.  Used by both `picosoc` and `picosoc-engine`.
+$(SOC_DIR)/progmem_init_%.svh: $(SOC_DIR)/firmware_%.mem $(SOC_DIR)/bin2init.py
+	python3 $(SOC_DIR)/bin2init.py $(SOC_DIR)/fw_$*.bin > $@
+	@echo "=== progmem INIT baked from fw_$*.bin -> $@ ==="
+
 .PHONY: picosoc-engine
 picosoc-engine: export PICOSOC_ENGINE := 1
 picosoc-engine: export PICOSOC_ILA := $(PICOSOC_ILA)
 picosoc-engine: export ENGINE_FW_MEM := $(abspath $(SOC_DIR)/$(ENGINE_FW).mem)
+picosoc-engine: export PROGMEM_INIT_FILE := $(abspath $(SOC_DIR)/progmem_init_$(ENGINE_FW_BASE).svh)
 ifneq ($(PICOSOC_ILA),0)
 picosoc-engine: $(picosoc-ila-xci)
 endif
-picosoc-engine: $(SOC_DIR)/$(ENGINE_FW).mem $(bit)
-	@echo "=== picosoc-engine built: $(ENGINE_FW), ILA=$(PICOSOC_ILA) ==="
+picosoc-engine: $(SOC_DIR)/$(ENGINE_FW).mem $(SOC_DIR)/progmem_init_$(ENGINE_FW_BASE).svh $(bit)
+	@echo "=== picosoc-engine built: $(ENGINE_FW), ILA=$(PICOSOC_ILA), progmem=RAMB16 ==="
 
 # Smoke build: wipe + rebuild with the minimal Hello/echo firmware AND the ILA,
 # so we get a clean proof-of-life and on-chip visibility in one bitstream.
@@ -425,11 +435,13 @@ picosoc-fw: $(SOC_DIR)/firmware_shell.mem
 ifneq ($(PICOSOC_ILA),0)
 picosoc: $(picosoc-ila-xci)
 endif
-picosoc: picosoc-fw
+picosoc: picosoc-fw $(SOC_DIR)/progmem_init_shell.svh
 	mkdir -p $(work-dir)
-	PICOSOC=1 PICOSOC_ILA=$(PICOSOC_ILA) $(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
+	PICOSOC=1 PICOSOC_ILA=$(PICOSOC_ILA) \
+	  PROGMEM_INIT_FILE=$(abspath $(SOC_DIR)/progmem_init_shell.svh) \
+	  $(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
 	@cp microgpt_eth.runs/impl_1/vc707_picosoc_shell.bit ./$(work-dir)/ 2>/dev/null || true
-	@echo "=== picosoc shell built (top vc707_picosoc_shell) -> $(work-dir)/ ==="
+	@echo "=== picosoc shell built (top vc707_picosoc_shell, progmem=RAMB16) -> $(work-dir)/ ==="
 
 # Firmware-only iteration: recompile C and patch the progmem BRAM in the EXISTING
 # bitstream via updatemem (seconds, no synth).  Needs a prior `make picosoc`
