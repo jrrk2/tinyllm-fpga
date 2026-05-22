@@ -25,7 +25,10 @@
 #define DDR_DATA (*(volatile uint32_t *)0x30000000u)
 #define DDR_ADDR (*(volatile uint32_t *)0x31000000u)
 #define DDR_TEST_BEATS 16u                /* test pattern size (16*64 = 1 KiB) */
-#define DDR_TEST_SEED  0xC0DE0000u
+/* word(i) = i * MUL with an ODD multiplier, so the 16 words of a 64-byte beat
+ * don't XOR-cancel (16 *consecutive* ints fold to 0 — a useless test).  This
+ * makes each beat's fold non-zero so the rolling scan-CRC actually moves. */
+#define DDR_TEST_MUL   0x9E3779B1u
 
 /* UART_TXDELAY (compile-time, default OFF): busy-wait one+ byte-time after every
  * UART byte so multi-char output survives even if the CPU isn't stalled by the
@@ -82,24 +85,24 @@ static void cmd_restart(void) {
 
 /* Roll the same hash the idle scanner computes in HW (idle_scan_crc.sv):
  * crc=0xFFFFFFFF; per 64-byte beat fold = XOR of its 16 words; crc=rotl(crc,1)^fold. */
-static uint32_t scan_ref(uint32_t nbeats, uint32_t seed) {
-    uint32_t crc = 0xFFFFFFFFu, val = seed;
+static uint32_t scan_ref(uint32_t nbeats) {
+    uint32_t crc = 0xFFFFFFFFu, gi = 0;
     for (uint32_t b = 0; b < nbeats; b++) {
         uint32_t fold = 0;
-        for (uint32_t w = 0; w < 16; w++) { fold ^= val; val++; }
+        for (uint32_t w = 0; w < 16; w++) { fold ^= gi * DDR_TEST_MUL; gi++; }
         crc = (crc << 1) | (crc >> 31);
         crc ^= fold;
     }
     return crc;
 }
 
-/* 'w': stream a known counter pattern into DDR3 via the bridge write window. */
+/* 'w': stream a known word(i)=i*MUL pattern into DDR3 via the bridge window. */
 static void cmd_ddrwrite(void) {
     print_("ddr write "); hex_(DDR_TEST_BEATS, 2); print_(" beats @0...");
-    uint32_t val = DDR_TEST_SEED;
+    uint32_t gi = 0;
     DDR_ADDR = 0;                                  /* start byte addr (auto-advances) */
     for (uint32_t b = 0; b < DDR_TEST_BEATS; b++)
-        for (uint32_t w = 0; w < 16; w++) DDR_DATA = val++;
+        for (uint32_t w = 0; w < 16; w++) DDR_DATA = gi++ * DDR_TEST_MUL;
     print_("done\n");
 }
 
@@ -113,7 +116,7 @@ static void cmd_scan(void) {
     while (!(REG(R_SCAN_STAT) & 2) && --to) { }    /* bit1 = done */
     if (!to) { print_("TIMEOUT (scanner not responding)\n"); return; }
     uint32_t hw  = REG(R_SCAN_CRC);
-    uint32_t ref = scan_ref(DDR_TEST_BEATS, DDR_TEST_SEED);
+    uint32_t ref = scan_ref(DDR_TEST_BEATS);
     print_("hw="); hex_(hw, 8); print_(" ref="); hex_(ref, 8);
     print_(hw == ref ? "  PASS\n" : "  FAIL\n");
 }
