@@ -71,7 +71,7 @@ static void eth_tx_heartbeat(uint8_t tbuf) {
 void main(void) {
     reg_uart_clkdiv = UART_DIV;
     reg_leds = 0x01;
-    print_("\n=== PicoSoC shell (Build B: ethernet) on VC707 ===\n");
+    print_("\n=== PicoSoC shell (Build B: ethernet) built " __DATE__ " " __TIME__ " ===\n");
     eth_init();
     print_("MAC 02:00:00:4D:47:32, RX enabled. Heartbeat TX every ~1s.\n");
 

@@ -32,7 +32,8 @@ static void hex_(uint32_t v, int nyb) {
 }
 
 static void menu(void) {
-    print_("\ncommands:\n");
+    print_("\nfw_engine built " __DATE__ " " __TIME__ "\n");
+    print_("commands:\n");
     print_("  v  build version\n");
     print_("  c  weight CRC + has_run\n");
     print_("  s  engine status (FSM / token / flags)\n");
@@ -86,7 +87,7 @@ static void cmd_restart(void) {
 void main(void)
 {
     reg_uart_clkdiv = UART_DIV;
-    print_("\n=== PicoSoC + engine console (lean) on VC707 ===\n");
+    print_("\n=== PicoSoC + engine console (lean) built " __DATE__ " " __TIME__ " ===\n");
     cmd_version();
     menu();
     print_("> ");

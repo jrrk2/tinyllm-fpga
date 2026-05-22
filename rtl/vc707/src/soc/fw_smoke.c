@@ -1,39 +1,33 @@
-/* fw_smoke.c — the simplest possible PicoSoC smoke test.
- * No dependencies, no regmap, no helper functions, no string/.data section
- * (chars are immediates).  It sets the UART baud divisor, prints "\nHello\n"
- * once, then sits in a loop echoing UART input back out.  This isolates the
- * bare path  eth_clk -> PicoRV32 fetch/execute -> simpleuart -> AU36/AU33 pins,
- * and exercises BOTH directions (Hello = TX, echo = RX->TX).
- *
- * Splice into the EXISTING bitstream with `make picosoc-engine-smoke`
- * (updatemem, no re-synth).  If "Hello" appears and typed keys echo, SoC + UART
- * + both pins are alive and the fault is in the menu firmware / regmap path.
- * If it is silent, the fault is upstream (eth_clk not toggling / SoC held in
- * reset) -> the ILA build is next. */
+/* fw_smoke.c — PicoSoC liveness + UART diagnostic (engine/shell smoke test).
+ * Loops a banner continuously so it can't be missed (the menu's one-shot banner
+ * was), and echoes input.  Two output paths per line to localise faults:
+ *   - "PicoSoC alive #"  via print_()  -> tests multi-char strings from .rodata
+ *   - the counter        via direct putc_ of hex digits -> multi-char, no .rodata
+ * If the full line repeats: UART + print_ + .rodata all good (the menu commands
+ * work too; you just missed the boot text / discounted the regmap values).
+ * If only the first char of each burst shows: UART TX overrun.
+ * If the text is missing but the counter shows: .rodata/string-read fault. */
 #include <stdint.h>
+
+#define reg_uart_clkdiv (*(volatile uint32_t *)0x02000004)
+#define reg_uart_data   (*(volatile uint32_t *)0x02000008)
+#define UART_DIV 1085                 /* 125 MHz eth_clk / 115200 */
+
+static void putc_(char c) { if (c == '\n') reg_uart_data = '\r'; reg_uart_data = c; }
+static void print_(const char *s) { while (*s) putc_(*s++); }
 
 void main(void)
 {
-    volatile uint32_t *uart_clkdiv = (volatile uint32_t *)0x02000004;
-    volatile uint32_t *uart_data   = (volatile uint32_t *)0x02000008;
-
-    *uart_clkdiv = 1085;                 /* 125 MHz eth_clk / 115200 */
-
-    *uart_data = '\r';
-    *uart_data = '\n';
-    *uart_data = 'H';
-    *uart_data = 'e';
-    *uart_data = 'l';
-    *uart_data = 'l';
-    *uart_data = 'o';
-    *uart_data = '\r';
-    *uart_data = '\n';
-
-    for (;;) {                           /* echo UART input forever */
-        int32_t c = (int32_t)*uart_data; /* -1 when no byte waiting */
-        if (c != -1) {
-            if (c == '\r') *uart_data = '\r';   /* Enter -> CR+LF */
-            *uart_data = (c == '\r') ? '\n' : (uint32_t)(c & 0xFF);
+    reg_uart_clkdiv = UART_DIV;
+    uint32_t n = 0;
+    for (;;) {
+        print_("smoke " __DATE__ " " __TIME__ " #");
+        for (int i = 7; i >= 0; i--) putc_("0123456789abcdef"[(n >> (4 * i)) & 15]);
+        putc_('\r'); putc_('\n');
+        n++;
+        for (volatile uint32_t d = 0; d < 1000000u; d++) {   /* ~pause + echo */
+            int32_t c = (int32_t)reg_uart_data;
+            if (c != -1) putc_((char)(c & 0xFF));
         }
     }
 }
