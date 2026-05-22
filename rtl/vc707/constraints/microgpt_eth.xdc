@@ -76,3 +76,11 @@ set_clock_groups -asynchronous \
 ## Configuration bank voltage
 set_property CFGBVS GND [current_design]
 set_property CONFIG_VOLTAGE 1.8 [current_design]
+
+## Don't gate DONE on DCI match at startup.  The DDR3 banks use DCI and the
+## default startup waits for DCI match before EOS/DONE — Vivado's programmer
+## satisfies that, but a generic JTAG loader (openFPGALoader, used by `make
+## program` / `make oload`) does not, so the design never starts (silent UART).
+## NoWait lets DONE assert immediately; DCI still calibrates and the MIG's
+## init_calib_complete still guards the DDR3 path.  Applies to ALL builds.
+set_property BITSTREAM.STARTUP.MATCH_CYCLE NoWait [current_design]

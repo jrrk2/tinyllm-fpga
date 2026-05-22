@@ -471,7 +471,7 @@ fw-swap: $(SOC_DIR)/$(SWAP_FW).mem
 #     ("Unknown device 0x67d0e027"), so OLOAD_FREQ is fixed low here.
 #   * Only works on MATCH_CYCLE-NoWait bitstreams (picosoc.xdc) — otherwise the
 #     design stalls on DCI match and never starts.
-OFL        ?= /tmp/openFPGALoader/build/openFPGALoader
+OFL        ?= $(HOME)/openFPGALoader/build/openFPGALoader
 OLOAD_FREQ ?= 15000000
 OLOAD_BIT  ?= work/vc707_picosoc_shell_jtag.bit
 .PHONY: oload
@@ -562,18 +562,30 @@ mcs:
 	        -tclargs $(mcs) $(bit); \
 	fi
 
-# JTAG-load from the freshest bit.  Aborts (not rebuilds) if absent.
+# JTAG-load (volatile SRAM) the freshest bit via openFPGALoader — seconds, no
+# Vivado hw_server.  Needs the openFPGALoader SOURCE build (OFL; packaged 0.12.0
+# lacks xc7vx485t) and a MATCH_CYCLE-NoWait bit (now default via microgpt_eth.xdc;
+# rebuild any pre-NoWait bit or it'll stall on DCI match).  15 MHz — 30 MHz garbles
+# the IDCODE.  Falls back: `make program-vivado` for the old hw_server path.
 program:
 	@if [ -z "$(EXISTING_BIT)" ]; then \
 	    echo "ERROR: no bitstream found in microgpt_eth.runs/ or $(work-dir)/"; \
 	    echo "       Run 'make all' first, or 'make program-release' for release/."; \
 	    exit 1; \
 	fi
-	@echo "[program] from $(EXISTING_BIT)"
+	@echo "[program] $(EXISTING_BIT) via openFPGALoader @ $(OLOAD_FREQ)"
+	$(OFL) -c digilent --freq $(OLOAD_FREQ) $(EXISTING_BIT)
+
+# Old Vivado hw_server path — fallback (e.g. a pre-NoWait bit, or openFPGALoader
+# trouble).  Slower (Vivado startup) but handles the DCI-match startup itself.
+program-vivado:
+	@if [ -z "$(EXISTING_BIT)" ]; then \
+	    echo "ERROR: no bitstream found in microgpt_eth.runs/ or $(work-dir)/"; \
+	    exit 1; \
+	fi
+	@echo "[program-vivado] from $(EXISTING_BIT)"
 	BITFILE=$(EXISTING_BIT) $(VIVADO) $(VIVADOFLAGS) -source scripts/program.tcl
-	@# program.tcl cleanly closes the hw_manager, but Vivado's
-	@# cs_server (ChipScope) and hw_server (JTAG) sometimes survive
-	@# as background processes and idle-poll at high CPU.  Reap them.
+	@# Vivado's cs_server/hw_server sometimes survive and idle-poll; reap them.
 	@pkill -f 'cs_server|hw_server' 2>/dev/null || true
 
 # Write BPI flash from the freshest mcs.  Bakes mcs on the fly from
