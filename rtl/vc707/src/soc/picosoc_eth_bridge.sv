@@ -62,9 +62,8 @@ module picosoc_eth_bridge (
   input  wire           ser_rx
 );
 
-  // ---- tie-offs (lean build: no eth/upload yet) ----
-  assign core_lsu_addr = '0;  assign core_lsu_wdata = '0;  assign core_lsu_be = '0;
-  assign ce_d = 1'b0;  assign we_d = 1'b0;  assign framing_sel = 1'b0;
+  // ---- tie-offs ----
+  // core_lsu_*, ce_d, we_d, framing_sel are now driven by the SoC eth window below.
   assign rx_activity = 1'b0;
   // ddr_wr_req/addr/data are now driven by the SoC DDR3 write window (below).
   assign dbg_state = '0;  assign dbg_frame_type = '0;  assign dbg_wcnt = '0;
@@ -119,6 +118,17 @@ module picosoc_eth_bridge (
   reg        dw_wait;                              // beat issued, awaiting ack
   reg        ddr_ack_s0, ddr_ack_s1;              // 2FF sync of ui-clk ddr_wr_ack
 
+  // ---- SoC <-> ethernet MAC (framing_top_sgmii) over the LSU frame bus -------
+  // Stage 2: the SoC parses eth frames in FIRMWARE (bfp_client protocol) instead
+  // of the old microgpt_eth_ctrl HW FSM.  iomem 0x20 + lsu_byte_addr maps each
+  // 32-bit access to a 64-bit LSU access (which 32-bit half via addr[2]) — the
+  // same window the bring-up shell proved (vc707_picosoc_shell.sv).  A read takes
+  // 2 cycles (the frame BRAM has 1-cycle latency); a write is 1 cycle.
+  wire sel_eth = (iomem_addr[31:24] == 8'h20);
+  typedef enum logic [1:0] { E_IDLE, E_WAIT, E_DONE, E_WR } eph_t;
+  eph_t eph;
+  reg   eth_half;
+
   typedef enum logic [1:0] { B_IDLE, B_WR, B_RD, B_RD_WAIT } bst_t;
   bst_t bst;
 
@@ -131,9 +141,13 @@ module picosoc_eth_bridge (
       ddr_wr_req <= 1'b0; ddr_wr_addr <= 30'h0; ddr_wr_data <= 512'h0;
       dw_idx <= 4'h0; dw_wait <= 1'b0; ddr_ack_s0 <= 1'b0; ddr_ack_s1 <= 1'b0;
       ddr_wr_done_count <= 32'h0; ddr_wr_ack_count <= 32'h0;
+      eph <= E_IDLE; eth_half <= 1'b0;
+      core_lsu_addr <= 17'h0; core_lsu_wdata <= 64'h0; core_lsu_be <= 8'hFF;
+      ce_d <= 1'b0; we_d <= 1'b0; framing_sel <= 1'b1;
     end else begin
       iomem_ready <= 1'b0;
       master_read <= 1'b0; master_write <= 1'b0;
+      framing_sel <= 1'b1;            // LSU select held high (matches the shell)
       // 2FF sync of the ui-clk write-ack toggle into eth_clk.
       ddr_ack_s0 <= ddr_wr_ack;
       ddr_ack_s1 <= ddr_ack_s0;
@@ -144,13 +158,13 @@ module picosoc_eth_bridge (
         iomem_rdata <= {hb_done_flags, hb_out_len, hb_last_token, hb_state};
       end
 
-      // catch-all: any iomem address NOT mapped here (LED 0x03, eth 0x20 — not
-      // wired in this lean build) is acked immediately with 0 so a stray
-      // firmware access can never stall the PicoRV32 forever.  EXCLUDE
-      // sel_internal (0x02 spimemio/UART — governed by the UART's own
-      // back-pressure) and the DDR write window (0x30/0x31 — handled below).
+      // catch-all: any iomem address NOT mapped here (LED 0x03 — not wired) is
+      // acked immediately with 0 so a stray firmware access can never stall the
+      // PicoRV32 forever.  EXCLUDE sel_internal (0x02 spimemio/UART — governed by
+      // the UART's own back-pressure), the DDR write window (0x30/0x31), and the
+      // eth window (0x20) — all handled by their own FSMs below.
       if (iomem_valid && !iomem_ready && !sel_reg && !sel_hb && !sel_internal
-          && !sel_ddrd && !sel_ddra) begin
+          && !sel_ddrd && !sel_ddra && !sel_eth) begin
         iomem_ready <= 1'b1;
         iomem_rdata <= 32'h0;
       end
@@ -196,6 +210,38 @@ module picosoc_eth_bridge (
           end
         end
       end
+
+      // ---- SoC <-> eth MAC: 32-bit iomem (0x20) <-> 64-bit LSU access ----
+      case (eph)
+        E_IDLE:
+          if (iomem_valid && !iomem_ready && sel_eth) begin
+            core_lsu_addr <= {iomem_addr[16:3], 3'b000};
+            ce_d          <= 1'b1;
+            eth_half      <= iomem_addr[2];
+            if (|iomem_wstrb) begin
+              we_d           <= 1'b1;
+              core_lsu_wdata <= {iomem_wdata, iomem_wdata};
+              core_lsu_be    <= iomem_addr[2] ? 8'hF0 : 8'h0F;
+              eph            <= E_WR;
+            end else begin
+              we_d <= 1'b0;
+              eph  <= E_WAIT;
+            end
+          end
+        E_WAIT: eph <= E_DONE;                  // ce held; framing_rdata next cycle
+        E_DONE: begin
+          ce_d        <= 1'b0;
+          iomem_rdata <= eth_half ? framing_rdata[63:32] : framing_rdata[31:0];
+          iomem_ready <= 1'b1;
+          eph         <= E_IDLE;
+        end
+        E_WR: begin
+          ce_d <= 1'b0; we_d <= 1'b0;
+          iomem_ready <= 1'b1;
+          eph         <= E_IDLE;
+        end
+        default: eph <= E_IDLE;
+      endcase
 
       // Avalon-MM bridge to the engine regmap (waitrequest=0; reads pulse
       // readdatavalid).  reg N at iomem 0x1000_0000 + N*4 -> master_address.
