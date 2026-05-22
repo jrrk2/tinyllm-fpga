@@ -324,19 +324,20 @@ $(GENERATED_DIR)/build_version.svh: FORCE
 	@python3 host/gen_build_version.py
 
 $(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(GENERATED_DIR)/exp_lut.hex $(lbfp_stamp) $(GENERATED_DIR)/build_version.svh scripts/run.tcl $(BFP_BUILD_DEPS)
-	@# Project = $${VPROJECT:-microgpt_eth} (picosoc-engine exports a stamped
-	@# name; plain engine keeps the legacy one).  prologue.tcl creates/reopens it.
-	@# Stamped builds are always fresh; the legacy project reuses runs incrementally.
+	@# Per-build project name (semper idem): VPROJECT if a parent set it
+	@# (picosoc-engine), else <VARIANT>-<stamp>.  prologue.tcl creates it.  Each
+	@# build is its own project — no clobber, no wipe.  For incremental reuse on
+	@# repeated edits, pin it: `make BUILD_STAMP=dev` (reuses smollm360-dev).
 	mkdir -p $(work-dir)
-	$(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
-	@P=$${VPROJECT:-microgpt_eth}; \
+	VPROJECT=$${VPROJECT:-$(VARIANT)-$(BUILD_STAMP)} $(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
+	@P=$${VPROJECT:-$(VARIANT)-$(BUILD_STAMP)}; \
 	 cp $$P.runs/impl_1/vc707_microgpt_eth.bit ./$(work-dir)/ 2>/dev/null || \
 	 cp $$P.runs/impl_1/vc707_microgpt_eth*.bit ./$(work-dir)/ 2>/dev/null || true; \
 	 cp $$P.runs/impl_1/vc707_microgpt_eth_routed.dcp ./$(work-dir)/ 2>/dev/null || true
 	@# Snapshot bit + reports + cfg into a dated archive so this build
 	@# survives the next `make`.  Cheap: a few MB of copies, ~1 s.
 	@mkdir -p $(archive-dir)/reports
-	@P=$${VPROJECT:-microgpt_eth}; \
+	@P=$${VPROJECT:-$(VARIANT)-$(BUILD_STAMP)}; \
 	 cp $$P.runs/impl_1/vc707_microgpt_eth.bit       $(archive-dir)/ 2>/dev/null || true; \
 	 cp $$P.runs/impl_1/*timing_summary_routed.rpt   $(archive-dir)/reports/ 2>/dev/null || true; \
 	 cp $$P.runs/impl_1/*utilization*.rpt            $(archive-dir)/reports/ 2>/dev/null || true; \

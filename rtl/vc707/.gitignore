@@ -7,9 +7,9 @@ microgpt_eth.gen/
 microgpt_eth.sim/
 microgpt_eth.srcs/
 .Xil/
-# Per-build date-stamped projects (picosoc_shell-<stamp>.*, picosoc_engine-<stamp>.*)
-picosoc_shell-*
-picosoc_engine-*
+# Per-build date-stamped Vivado projects: <target|variant>-<YYYYMMDD-HHMMSS>.{xpr,runs,...}
+# Leading / anchors to this dir so archive/ and release/ stamped dirs aren't matched.
+/*-20[0-9][0-9][0-9][0-9][0-9][0-9]-*
 *.log
 *.jou
 *.pb
