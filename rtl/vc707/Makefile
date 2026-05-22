@@ -411,7 +411,10 @@ ifneq ($(PICOSOC_ILA),0)
 picosoc-engine: $(picosoc-ila-xci)
 endif
 picosoc-engine: $(SOC_DIR)/$(ENGINE_FW).mem $(bit)
-	@echo "=== picosoc-engine built: $(ENGINE_FW), ILA=$(PICOSOC_ILA), progmem=RAMB16 ==="
+	@mkdir -p $(work-dir)
+	@cp microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit ./$(work-dir)/ 2>/dev/null || true
+	@cp microgpt_eth.runs/impl_1/vc707_microgpt_eth_routed.dcp ./$(work-dir)/ 2>/dev/null || true
+	@echo "=== picosoc-engine built: $(ENGINE_FW), ILA=$(PICOSOC_ILA), progmem=RAMB16 -> $(work-dir)/ ==="
 
 # Smoke build: wipe + rebuild with the minimal Hello/echo firmware AND the ILA,
 # so we get a clean proof-of-life and on-chip visibility in one bitstream.
@@ -421,7 +424,7 @@ picosoc-engine: $(SOC_DIR)/$(ENGINE_FW).mem $(bit)
 picosoc-engine-smoke:
 	$(MAKE) wipe-project picosoc-engine ENGINE_FW=firmware_smoke
 
-.PHONY: picosoc picosoc-fw fw-update fw-swap
+.PHONY: picosoc picosoc-fw fw-swap
 picosoc-fw: $(SOC_DIR)/firmware_shell.mem
 
 # Full shell build (synth/impl).  Integrated ILA is ON by default; disable with
@@ -434,50 +437,32 @@ picosoc: picosoc-fw
 	mkdir -p $(work-dir)
 	PICOSOC=1 PICOSOC_ILA=$(PICOSOC_ILA) $(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
 	@cp microgpt_eth.runs/impl_1/vc707_picosoc_shell.bit ./$(work-dir)/ 2>/dev/null || true
+	@cp microgpt_eth.runs/impl_1/vc707_picosoc_shell_routed.dcp ./$(work-dir)/ 2>/dev/null || true
 	@echo "=== picosoc shell built (top vc707_picosoc_shell, progmem=RAMB16) -> $(work-dir)/ ==="
 
-# Software update WITHOUT re-synthesis.  Two paths, both verified (re-writing the
-# SAME firmware reproduces the original frames bar the build-timestamp bytes):
+# Firmware update WITHOUT re-synthesis — the ONLY reliable method.  Rewrites the
+# directly-instantiated progmem RAMB INIT in the routed checkpoint and re-emits
+# the bitstream (write_bitstream only, ~2-3 min, no place/route).
+# DO NOT use updatemem here: with a hand-built .mmi it is a SILENT NO-OP (reports
+# success, patches nothing — the .bit differs by ~4 header bytes and the FPGA runs
+# the OLD firmware).  write_mem_info can't make a real .mmi (no PicoRV32 address
+# space) and data2mem is retired.
 #
-# fw-update (PRIMARY, ~14 s) — the standard updatemem flow.  Needs a hand-built
-#   .mmi (scripts/gen_mmi.tcl, generated once per build from the routed dcp; ~1.5
-#   min) listing the progmem RAMB tile, and a data file with a leading "@0".
-#   write_mem_info can't auto-make the .mmi (no PicoRV32 address space), and
-#   data2mem is retired — but a correct hand .mmi (Val= attrs, no Versal-era
-#   AddressSpaceRange) drives updatemem fine.
-#     make fw-update UM_FW=firmware_smoke   # Hello/echo
-#     make fw-update UM_FW=firmware_shell   # bring-up banner + eth + DDR
-#
-# fw-swap (FALLBACK, ~2-3 min) — no .mmi: rewrite the RAMB INIT in the routed
-#   checkpoint and write_bitstream.  Use if updatemem ever balks.
-UM_DCP  ?= microgpt_eth.runs/impl_1/vc707_picosoc_shell_routed.dcp
-UM_BIT  ?= microgpt_eth.runs/impl_1/vc707_picosoc_shell.bit
-UM_MMI  ?= picosoc_shell.mmi
-UM_FW   ?= firmware_smoke
-UM_OUT  ?= $(work-dir)/vc707_picosoc_shell_$(UM_FW:firmware_%=%).bit
-UPDATEMEM := $(dir $(VIVADO))updatemem
-fw-update: $(SOC_DIR)/$(UM_FW).mem
-	@test -f $(UM_BIT) || { echo "ERROR: $(UM_BIT) missing — run 'make picosoc' first"; exit 1; }
-	@mkdir -p $(work-dir)
-	@if [ ! -f $(UM_MMI) ]; then \
-	   echo "=== $(UM_MMI) missing — generating from $(UM_DCP) ==="; \
-	   DCP_IN=$(UM_DCP) MMI_OUT=$(UM_MMI) $(VIVADO) -nojournal -mode batch -source scripts/gen_mmi.tcl; \
-	 fi
-	@{ echo "@0"; cat $(SOC_DIR)/$(UM_FW).mem; } > $(work-dir)/$(UM_FW).um.mem
-	$(UPDATEMEM) -force -meminfo $(UM_MMI) -data $(work-dir)/$(UM_FW).um.mem \
-	  -bit $(UM_BIT) -proc $$(grep -oP 'InstPath="\K[^"]+' $(UM_MMI) | head -1) -out $(UM_OUT)
-	@echo "=== firmware updated ($(UM_FW)) -> $(UM_OUT) (reflash this) ==="
-
-SWAP_DCP     ?= microgpt_eth.runs/impl_1/vc707_picosoc_shell_routed.dcp
+# Needs the routed .dcp.  Builds archive it to work/ (shell & engine share
+# impl_1/, so building one overwrites the other's dcp there).  Pick the top:
+#   make fw-swap SWAP_FW=firmware_smoke                                 # shell
+#   make fw-swap SWAP_TOP=vc707_microgpt_eth SWAP_FW=firmware_engine    # engine
+SWAP_TOP     ?= vc707_picosoc_shell
 SWAP_FW      ?= firmware_smoke
-SWAP_BIT_OUT ?= $(work-dir)/vc707_picosoc_shell_$(SWAP_FW:firmware_%=%).bit
+SWAP_DCP     ?= $(firstword $(wildcard $(work-dir)/$(SWAP_TOP)_routed.dcp microgpt_eth.runs/impl_1/$(SWAP_TOP)_routed.dcp))
+SWAP_BIT_OUT ?= $(work-dir)/$(SWAP_TOP)_$(SWAP_FW:firmware_%=%).bit
 fw-swap: $(SOC_DIR)/$(SWAP_FW).mem
-	@test -f $(SWAP_DCP) || { echo "ERROR: $(SWAP_DCP) missing — run 'make picosoc' first"; exit 1; }
+	@test -n "$(SWAP_DCP)" && test -f "$(SWAP_DCP)" || { echo "ERROR: routed .dcp for $(SWAP_TOP) not found — (re)build it first"; exit 1; }
 	@mkdir -p $(work-dir)
 	DCP_IN=$(SWAP_DCP) FW_BIN=$(SOC_DIR)/$(SWAP_FW:firmware_%=fw_%).bin \
 	  BIT_OUT=$(abspath $(SWAP_BIT_OUT)) \
 	  $(VIVADO) -nojournal -mode batch -source scripts/swap_fw.tcl
-	@echo "=== firmware swapped ($(SWAP_FW)) -> $(SWAP_BIT_OUT) (reflash this) ==="
+	@echo "=== firmware swapped ($(SWAP_TOP) <- $(SWAP_FW)) -> $(SWAP_BIT_OUT) (reflash) ==="
 
 # Quick convenience target: bake BFP hex + run the Verilator layer test.
 # Useful for sanity-checking precision after RTL edits before launching a
