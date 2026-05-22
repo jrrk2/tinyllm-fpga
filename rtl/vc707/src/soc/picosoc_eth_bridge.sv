@@ -79,8 +79,8 @@ module picosoc_eth_bridge (
   wire [31:0] iomem_addr;
   wire [31:0] iomem_wdata;
   reg  [31:0] iomem_rdata;
-  wire        trace_valid_unused;
-  wire [35:0] trace_data_unused;
+  (* mark_debug = "true" *) wire        trace_valid;
+  (* mark_debug = "true" *) wire [35:0] trace_data;
 
   picosoc_noflash soc (
     .clk(clk), .resetn(rst_n),
@@ -89,7 +89,7 @@ module picosoc_eth_bridge (
     .iomem_wdata(iomem_wdata), .iomem_rdata(iomem_rdata),
     .irq_5(1'b0), .irq_6(1'b0), .irq_7(1'b0),
     .ser_tx(ser_tx), .ser_rx(ser_rx),
-    .trace_valid(trace_valid_unused), .trace_data(trace_data_unused)
+    .trace_valid(trace_valid), .trace_data(trace_data)
   );
 
   // ---- iomem decode: 0x10 -> Avalon regmap, 0x40 -> engine status ----
@@ -154,6 +154,27 @@ module picosoc_eth_bridge (
       endcase
     end
   end
+
+  // ----------------------------------------------------------------------
+  // On-chip ILA on the PicoRV32 trace bus + iomem activity (eth_clk domain).
+  // IP picosoc_ila is read by run.tcl; gated by PICOSOC_ILA so the bridge
+  // still elaborates without it.  This is how we see whether the CPU is
+  // fetching/executing and whether it ever reaches the UART when nothing
+  // appears on the wire.
+  // ----------------------------------------------------------------------
+`ifdef PICOSOC_ILA
+  picosoc_ila i_ila (
+    .clk    (clk),
+    .probe0 (trace_valid),   // 1  — CPU retired-instruction trace strobe
+    .probe1 (trace_data),    // 36 — trace payload (PC / writeback)
+    .probe2 (iomem_valid),   // 1
+    .probe3 (iomem_ready),   // 1
+    .probe4 (iomem_wstrb),   // 4  — 0 = read, else write byte-enables
+    .probe5 (iomem_addr),    // 32 — 0x02 uart(internal) / 0x10 regmap / 0x40 hb
+    .probe6 (iomem_wdata),   // 32
+    .probe7 (iomem_rdata)    // 32
+  );
+`endif
 
 endmodule
 

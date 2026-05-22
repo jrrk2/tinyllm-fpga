@@ -163,11 +163,21 @@ if {$_use_bfp} {
 # needs PROGMEM_HEX (firmware_engine.mem); vc707_microgpt_eth swaps eth_ctrl
 # for picosoc_eth_bridge under PICOSOC_ENGINE.
 if {$_picosoc_engine} {
+    # ILA on the SoC trace/iomem bus (default ON; PICOSOC_ILA=0 disables) — same
+    # picosoc_ila the shell uses, instantiated in picosoc_eth_bridge under the
+    # PICOSOC_ILA define.
+    set _eila [expr {![info exists ::env(PICOSOC_ILA)] || [string trim $::env(PICOSOC_ILA)] ne "0"}]
+
     set _d [get_property verilog_define [current_fileset]]
     lappend _d "PICOSOC_ENGINE" "PICORV32_REGS=picosoc_regs" \
                "PROGMEM_HEX=\"[file normalize src/soc/firmware_engine.mem]\""
+    if {$_eila} { lappend _d "PICOSOC_ILA" }
     set_property verilog_define $_d [current_fileset]
-    puts "INFO: PICOSOC_ENGINE — SoC front-end defines appended"
+    puts "INFO: PICOSOC_ENGINE — SoC front-end defines appended (ILA=$_eila)"
+
+    if {$_eila && [llength [get_ips -quiet picosoc_ila]] == 0} {
+        read_ip { "ip/picosoc_ila/picosoc_ila.srcs/sources_1/ip/picosoc_ila/picosoc_ila.xci" }
+    }
 
     # UART pins (usb_uart_tx/rx) for the SoC console.  Same picosoc.xdc the shell
     # uses — the engine top exposes the same port names under PICOSOC_ENGINE.
@@ -372,6 +382,12 @@ if {$_picosoc} {
     # patch the progmem in the built .bit without re-synthesis.
     write_mem_info -force picosoc_shell.mmi
     puts "INFO: wrote picosoc_shell.mmi (progmem BRAM map for updatemem)"
+}
+if {$_picosoc_engine} {
+    # Same, for the engine build — enables `make picosoc-engine-smoke` /
+    # `fw-update` to splice firmware into the .bit without re-synthesis.
+    write_mem_info -force picosoc_engine.mmi
+    puts "INFO: wrote picosoc_engine.mmi (progmem BRAM map for updatemem)"
 }
 
 exec mkdir -p reports/

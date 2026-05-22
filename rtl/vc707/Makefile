@@ -371,27 +371,65 @@ $(SOC_DIR)/firmware_engine.mem: $(SOC_DIR)/fw_engine.c $(SOC_DIR)/start.s $(SOC_
 	python3 $(SOC_DIR)/bin2mem.py $(SOC_DIR)/fw_engine.bin > $@
 	@echo "=== picosoc-engine firmware: $$(stat -c%s $(SOC_DIR)/fw_engine.bin) bytes -> $@ ==="
 
-# Real engine + PicoSoC front-end, LEAN base-fit (no ILA, no LBFP_DBG_WFEED).
-# Builds the stub firmware, then the standard engine bitstream ($(bit)) with
-# PICOSOC_ENGINE exported so run.tcl swaps eth_ctrl -> picosoc_eth_bridge.
-# Source set changes -> wipe first:  make wipe-project picosoc-engine
-.PHONY: picosoc-engine
-picosoc-engine: export PICOSOC_ENGINE := 1
-picosoc-engine: $(SOC_DIR)/firmware_engine.mem $(bit)
-	@echo "=== picosoc-engine built: vc707_microgpt_eth + PicoSoC front-end (lean) ==="
-
-.PHONY: picosoc picosoc-fw fw-update
-picosoc-fw: $(SOC_DIR)/firmware_shell.mem
-
 # picosoc_ila IP — generated from its committed source tcl (same pattern as the
-# engine ILAs); regenerated only when the tcl changes.
-# Integrated ILA default ON; `make picosoc PICOSOC_ILA=0` for a clean bring-up
-# without it (the shell's mark_debug nets still allow Vivado "Set Up Debug").
+# engine ILAs); regenerated only when the tcl changes.  Defined here (before the
+# picosoc-engine / picosoc targets that use it) so Make expands it at parse time.
+# Integrated ILA default ON; PICOSOC_ILA=0 for a clean bring-up without it.
 PICOSOC_ILA ?= 1
 picosoc-ila-xci := $(ip-dir)/picosoc_ila/picosoc_ila.srcs/sources_1/ip/picosoc_ila/picosoc_ila.xci
 $(picosoc-ila-xci): $(ip-dir)/picosoc_ila/tcl/run.tcl
 	@echo "=== generating picosoc_ila IP ==="
 	@cd $(ip-dir)/picosoc_ila && $(MAKE) clean && $(MAKE)
+
+# Smoke firmware: minimal UART-only test, used by picosoc-engine-smoke below.
+$(SOC_DIR)/firmware_smoke.mem: $(SOC_DIR)/fw_smoke.c $(SOC_DIR)/start.s $(SOC_DIR)/soc.lds $(SOC_DIR)/bin2mem.py
+	$(RISCV_CROSS)gcc -Os -march=rv32im -mabi=ilp32 -ffreestanding -nostdlib -nostartfiles \
+	    -Wl,-T,$(SOC_DIR)/soc.lds -o $(SOC_DIR)/fw_smoke.elf $(SOC_DIR)/start.s $(SOC_DIR)/fw_smoke.c -lgcc
+	$(RISCV_CROSS)objcopy -O binary $(SOC_DIR)/fw_smoke.elf $(SOC_DIR)/fw_smoke.bin
+	python3 $(SOC_DIR)/bin2mem.py $(SOC_DIR)/fw_smoke.bin > $@
+	@echo "=== picosoc-engine smoke firmware: $$(stat -c%s $(SOC_DIR)/fw_smoke.bin) bytes -> $@ ==="
+
+# Real engine + PicoSoC front-end.  Builds the firmware, then the engine
+# bitstream ($(bit)) with PICOSOC_ENGINE exported so run.tcl swaps eth_ctrl ->
+# picosoc_eth_bridge.  ILA on the SoC trace/iomem bus is ON by default
+# (PICOSOC_ILA=0 to disable).  Source set changes -> wipe first:
+#   make wipe-project picosoc-engine
+.PHONY: picosoc-engine
+picosoc-engine: export PICOSOC_ENGINE := 1
+picosoc-engine: export PICOSOC_ILA := $(PICOSOC_ILA)
+ifneq ($(PICOSOC_ILA),0)
+picosoc-engine: $(picosoc-ila-xci)
+endif
+picosoc-engine: $(SOC_DIR)/firmware_engine.mem $(bit)
+	@echo "=== picosoc-engine built: vc707_microgpt_eth + PicoSoC front-end (ILA=$(PICOSOC_ILA)) ==="
+
+# Incremental firmware swap for the engine build: splice a firmware .mem into the
+# EXISTING bitstream via updatemem (seconds, no synth).  Defaults to the smoke
+# firmware.  Needs the .mmi: emitted by a fresh picosoc-engine build, OR
+# extracted here from the routed checkpoint via engine_mmi.tcl.  Reflash
+# ENG_BIT_OUT afterwards.  Override ENG_FW=src/soc/firmware_engine.mem to splice
+# the full menu firmware instead.
+ENG_DCP     ?= microgpt_eth.runs/impl_1/vc707_microgpt_eth_routed.dcp
+ENG_BIT_IN  ?= microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit
+ENG_BIT_OUT ?= $(work-dir)/vc707_microgpt_eth_smoke.bit
+ENG_MMI     ?= picosoc_engine.mmi
+ENG_FW      ?= $(SOC_DIR)/firmware_smoke.mem
+ENG_PROC    ?=
+.PHONY: picosoc-engine-smoke
+picosoc-engine-smoke: $(ENG_FW)
+	@test -f $(ENG_BIT_IN) || { echo "ERROR: $(ENG_BIT_IN) missing — run 'make picosoc-engine' first"; exit 1; }
+	@mkdir -p $(work-dir)
+	@if [ ! -f $(ENG_MMI) ]; then \
+	   echo "=== $(ENG_MMI) missing — extracting from $(ENG_DCP) ==="; \
+	   DCP_IN=$(ENG_DCP) MMI_OUT=$(ENG_MMI) $(VIVADO) -nojournal -mode batch -source scripts/engine_mmi.tcl; \
+	 fi
+	FW_MMI=$(ENG_MMI) FW_MEM=$(abspath $(ENG_FW)) \
+	  FW_BIT_IN=$(ENG_BIT_IN) FW_BIT_OUT=$(ENG_BIT_OUT) FW_PROC="$(ENG_PROC)" \
+	  $(VIVADO) -nojournal -mode batch -source scripts/updatemem.tcl
+	@echo "=== smoke firmware spliced -> $(ENG_BIT_OUT) (reflash this) ==="
+
+.PHONY: picosoc picosoc-fw fw-update
+picosoc-fw: $(SOC_DIR)/firmware_shell.mem
 
 # Full shell build (synth/impl).  Integrated ILA is ON by default; disable with
 # `make picosoc PICOSOC_ILA=0` (the shell's mark_debug nets still allow inserting
