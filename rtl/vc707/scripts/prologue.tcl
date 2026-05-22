@@ -1,4 +1,8 @@
-set project microgpt_eth
+# Project name is per-build (target + date stamp) so different tops never share
+# runs (no cross-top "synth_1 needs reset") and old results survive — you never
+# need to wipe.  Set by the Makefile via VPROJECT; falls back to the legacy fixed
+# name when unset (e.g. plain `make program`, which only reads work/).
+set project [expr {[info exists ::env(VPROJECT)] ? $::env(VPROJECT) : "microgpt_eth"}]
 
 # Open existing project if present (preserves runs/cache/etc.), else
 # create a fresh one.  -force was deleting microgpt_eth.runs/ on every

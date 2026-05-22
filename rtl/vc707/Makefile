@@ -51,6 +51,14 @@ bit := $(work-dir)/vc707_microgpt_eth.bit
 mcs := $(work-dir)/vc707_microgpt_eth.mcs
 ip-dir := ip
 
+# Per-build Vivado project (target + date stamp).  Each build runs in its own
+# <VPROJECT>.runs so different tops (engine / shell / variant) never share a
+# project — no cross-top "synth_1 needs reset", and old projects/results survive
+# (you never need `make wipe-project`).  Build targets set a target-specific
+# VPROJECT (export, below); everything else keeps the legacy name.  Consumer
+# targets (program/oload/fw-swap) read the stable work/ copies, not the project.
+VPROJECT ?= microgpt_eth
+
 ips := gig_ethernet_pcs_pma_0.xci xlnx_mig_7_ddr3.xci microgpt_ila_core.xci microgpt_ila_axi.xci
 ips := $(addprefix $(work-dir)/, $(ips))
 
@@ -316,22 +324,23 @@ $(GENERATED_DIR)/build_version.svh: FORCE
 	@python3 host/gen_build_version.py
 
 $(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(GENERATED_DIR)/exp_lut.hex $(lbfp_stamp) $(GENERATED_DIR)/build_version.svh scripts/run.tcl $(BFP_BUILD_DEPS)
-	@# No auto-wipe of microgpt_eth.* here — prologue.tcl reopens the
-	@# existing .xpr so synth_1/impl_1 reuse what they can (incremental
-	@# synth/impl saves 30-70% on small RTL edits).  When switching
-	@# VARIANT or after Vivado gets confused, run `make wipe-project`
-	@# (or `make wipe-project all`) for a from-scratch rebuild.
+	@# Project = $${VPROJECT:-microgpt_eth} (picosoc-engine exports a stamped
+	@# name; plain engine keeps the legacy one).  prologue.tcl creates/reopens it.
+	@# Stamped builds are always fresh; the legacy project reuses runs incrementally.
 	mkdir -p $(work-dir)
 	$(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
-	cp microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit ./$(work-dir)/ 2>/dev/null || \
-	cp microgpt_eth.runs/impl_1/vc707_microgpt_eth*.bit ./$(work-dir)/ 2>/dev/null || true
+	@P=$${VPROJECT:-microgpt_eth}; \
+	 cp $$P.runs/impl_1/vc707_microgpt_eth.bit ./$(work-dir)/ 2>/dev/null || \
+	 cp $$P.runs/impl_1/vc707_microgpt_eth*.bit ./$(work-dir)/ 2>/dev/null || true; \
+	 cp $$P.runs/impl_1/vc707_microgpt_eth_routed.dcp ./$(work-dir)/ 2>/dev/null || true
 	@# Snapshot bit + reports + cfg into a dated archive so this build
 	@# survives the next `make`.  Cheap: a few MB of copies, ~1 s.
 	@mkdir -p $(archive-dir)/reports
-	@cp microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit       $(archive-dir)/ 2>/dev/null || true
-	@cp microgpt_eth.runs/impl_1/*timing_summary_routed.rpt   $(archive-dir)/reports/ 2>/dev/null || true
-	@cp microgpt_eth.runs/impl_1/*utilization*.rpt            $(archive-dir)/reports/ 2>/dev/null || true
-	@cp microgpt_eth.runs/synth_1/*utilization_synth.rpt      $(archive-dir)/reports/ 2>/dev/null || true
+	@P=$${VPROJECT:-microgpt_eth}; \
+	 cp $$P.runs/impl_1/vc707_microgpt_eth.bit       $(archive-dir)/ 2>/dev/null || true; \
+	 cp $$P.runs/impl_1/*timing_summary_routed.rpt   $(archive-dir)/reports/ 2>/dev/null || true; \
+	 cp $$P.runs/impl_1/*utilization*.rpt            $(archive-dir)/reports/ 2>/dev/null || true; \
+	 cp $$P.runs/synth_1/*utilization_synth.rpt      $(archive-dir)/reports/ 2>/dev/null || true
 	@cp $(GENERATED_DIR)/lbfp_full_cfg.svh                    $(archive-dir)/ 2>/dev/null || true
 	@cp $(GENERATED_DIR)/build_version.svh                    $(archive-dir)/ 2>/dev/null || true
 	@{ \
@@ -407,14 +416,15 @@ ENGINE_FW ?= firmware_engine
 picosoc-engine: export PICOSOC_ENGINE := 1
 picosoc-engine: export PICOSOC_ILA := $(PICOSOC_ILA)
 picosoc-engine: export ENGINE_FW_MEM := $(abspath $(SOC_DIR)/$(ENGINE_FW).mem)
+picosoc-engine: export VPROJECT := picosoc_engine-$(BUILD_STAMP)
 ifneq ($(PICOSOC_ILA),0)
 picosoc-engine: $(picosoc-ila-xci)
 endif
 picosoc-engine: $(SOC_DIR)/$(ENGINE_FW).mem $(bit)
 	@mkdir -p $(work-dir)
-	@cp microgpt_eth.runs/impl_1/vc707_microgpt_eth.bit ./$(work-dir)/ 2>/dev/null || true
-	@cp microgpt_eth.runs/impl_1/vc707_microgpt_eth_routed.dcp ./$(work-dir)/ 2>/dev/null || true
-	@echo "=== picosoc-engine built: $(ENGINE_FW), ILA=$(PICOSOC_ILA), progmem=RAMB16 -> $(work-dir)/ ==="
+	@cp $(VPROJECT).runs/impl_1/vc707_microgpt_eth.bit ./$(work-dir)/ 2>/dev/null || true
+	@cp $(VPROJECT).runs/impl_1/vc707_microgpt_eth_routed.dcp ./$(work-dir)/ 2>/dev/null || true
+	@echo "=== picosoc-engine built: $(ENGINE_FW), ILA=$(PICOSOC_ILA), progmem=RAMB16, proj=$(VPROJECT) -> $(work-dir)/ ==="
 
 # Smoke build: wipe + rebuild with the minimal Hello/echo firmware AND the ILA,
 # so we get a clean proof-of-life and on-chip visibility in one bitstream.
@@ -422,7 +432,7 @@ picosoc-engine: $(SOC_DIR)/$(ENGINE_FW).mem $(bit)
 # not BRAM — so a rebuild is the only way to change firmware.)
 .PHONY: picosoc-engine-smoke
 picosoc-engine-smoke:
-	$(MAKE) wipe-project picosoc-engine ENGINE_FW=firmware_smoke
+	$(MAKE) picosoc-engine ENGINE_FW=firmware_smoke
 
 .PHONY: picosoc picosoc-fw fw-swap
 picosoc-fw: $(SOC_DIR)/firmware_shell.mem
@@ -430,15 +440,16 @@ picosoc-fw: $(SOC_DIR)/firmware_shell.mem
 # Full shell build (synth/impl).  Integrated ILA is ON by default; disable with
 # `make picosoc PICOSOC_ILA=0` (the shell's mark_debug nets still allow inserting
 # an ILA via Vivado "Set Up Debug").
+picosoc: export VPROJECT := picosoc_shell-$(BUILD_STAMP)
 ifneq ($(PICOSOC_ILA),0)
 picosoc: $(picosoc-ila-xci)
 endif
 picosoc: picosoc-fw
 	mkdir -p $(work-dir)
 	PICOSOC=1 PICOSOC_ILA=$(PICOSOC_ILA) $(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
-	@cp microgpt_eth.runs/impl_1/vc707_picosoc_shell.bit ./$(work-dir)/ 2>/dev/null || true
-	@cp microgpt_eth.runs/impl_1/vc707_picosoc_shell_routed.dcp ./$(work-dir)/ 2>/dev/null || true
-	@echo "=== picosoc shell built (top vc707_picosoc_shell, progmem=RAMB16) -> $(work-dir)/ ==="
+	@cp $(VPROJECT).runs/impl_1/vc707_picosoc_shell.bit ./$(work-dir)/ 2>/dev/null || true
+	@cp $(VPROJECT).runs/impl_1/vc707_picosoc_shell_routed.dcp ./$(work-dir)/ 2>/dev/null || true
+	@echo "=== picosoc shell built (top vc707_picosoc_shell, progmem=RAMB16, proj=$(VPROJECT)) -> $(work-dir)/ ==="
 
 # Firmware update WITHOUT re-synthesis — the ONLY reliable method.  Rewrites the
 # directly-instantiated progmem RAMB INIT in the routed checkpoint and re-emits

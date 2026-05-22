@@ -4,7 +4,7 @@
 # Ethernet stack (framing_top_sgmii + sgmii_soc + eth_mac_1g + dualmem) from
 # the kaspad accelerator and the gig_ethernet_pcs_pma_0 IP project.
 
-set project microgpt_eth
+set project [expr {[info exists ::env(VPROJECT)] ? $::env(VPROJECT) : "microgpt_eth"}]
 
 # Branch-local merge (picosoc branch): PICOSOC=1 builds the PicoSoC bring-up
 # shell (vc707_picosoc_shell) — a slimmed source set (no engine / microgpt core
@@ -353,14 +353,15 @@ set_property top vc707_microgpt_eth [current_fileset]
 
 update_compile_order -fileset sources_1
 
-# Reset any non-success synth_1 / impl_1 so launch_runs can proceed
-# (Vivado refuses to relaunch a run in Error / Aborted state and the
-# old `make` flow used to nuke the project to sidestep this).
+# Reset any already-started synth_1 / impl_1 so launch_runs can proceed.
+# A *Complete* run from a DIFFERENT top (shell vs engine sharing this project)
+# can't be relaunched without a reset either — Vivado errors "needs to be reset
+# before launching" — so reset anything that isn't fresh, not just Error/Aborted.
+# (IP OOC synth is cached separately, so this doesn't re-run the IPs.)
 foreach run_name {synth_1 impl_1} {
     if {[llength [get_runs -quiet $run_name]] > 0} {
         set st [get_property STATUS [get_runs $run_name]]
-        if {!([string match -nocase "*Complete*" $st]
-              && ![string match -nocase "*Error*" $st])} {
+        if {![string match -nocase "*Not started*" $st]} {
             puts "INFO: resetting $run_name (was: $st)"
             reset_run $run_name
         }

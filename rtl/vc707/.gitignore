@@ -7,6 +7,9 @@ microgpt_eth.gen/
 microgpt_eth.sim/
 microgpt_eth.srcs/
 .Xil/
+# Per-build date-stamped projects (picosoc_shell-<stamp>.*, picosoc_engine-<stamp>.*)
+picosoc_shell-*
+picosoc_engine-*
 *.log
 *.jou
 *.pb
