@@ -1,9 +1,10 @@
 /* Linker script for the tinyllm PicoSoC firmware.
- *   FLASH = progmem ROM, mapped at PROGADDR_RESET (0x0010_0000), 16 KB used.
+ *   FLASH = progmem ROM, mapped at PROGADDR_RESET (0x0010_0000), 4 KB = the
+ *           RAMB36E1 progmem (1024 x 32).  Linker errors if firmware exceeds it.
  *   RAM   = picosoc_mem data RAM at 0x0, 16 KB (STACKADDR = 0x4000). */
 MEMORY
 {
-    FLASH (rx) : ORIGIN = 0x00100000, LENGTH = 0x00004000
+    FLASH (rx) : ORIGIN = 0x00100000, LENGTH = 0x00001000
     RAM (xrw)  : ORIGIN = 0x00000000, LENGTH = 0x00004000
 }
 

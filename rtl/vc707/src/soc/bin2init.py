@@ -1,34 +1,35 @@
 #!/usr/bin/env python3
-"""bin2init.py — pack a firmware .bin into RAMB16_S36_S36 INIT_xx parameters.
+"""bin2init.py — pack a firmware .bin into RAMB36E1 INIT_xx parameters.
 
 Emits a Verilog parameter-override fragment (.svh) to be `included inside the
-RAMB16_S36_S36 #( ... ) instantiation in progmem_bram.v.  Directly instantiating
-the primitive forces the firmware ROM into a real block RAM (inference collapses
-a read-only ROM to LUTROM, which updatemem cannot patch); baking the INIT here
+RAMB36E1 #( ... ) instantiation in progmem_bram.v.  Directly instantiating the
+primitive forces the firmware ROM into a real block RAM (inference collapses a
+read-only ROM to LUTROM, which updatemem cannot patch); baking the INIT here
 means the raw bitstream still boots.
 
-RAMB16_S36_S36 = 512 x 36.  We use the 32 data bits (parity unused).  The 32-bit
-data init lives in INIT_00..INIT_3F (64 x 256-bit).  Each INIT_xx covers 8
-consecutive word addresses; word (xx*8 + k) occupies bits [k*32 +: 32], and the
-256'h string is written MSB-first (word7..word0).
+RAMB36E1 = 1024 x 36 (one 36 Kb tile).  We use the 32 data bits (parity unused).
+The 32-bit data init lives in INIT_00..INIT_7F (128 x 256-bit).  Each INIT_xx
+covers 8 consecutive word addresses; word (xx*8 + k) occupies bits [k*32 +: 32],
+and the 256'h string is written MSB-first (word7..word0).  INITP (parity) is
+left at default 0.
 
 Usage:  python3 bin2init.py firmware.bin > progmem_init.svh
 """
 import struct, sys
 
-DEPTH = 512
+DEPTH = 1024
 
 data = open(sys.argv[1], "rb").read()
 data += b"\x00" * ((-len(data)) % 4)            # pad to 32-bit boundary
 words = [struct.unpack("<I", data[i:i+4])[0] for i in range(0, len(data), 4)]
 
 if len(words) > DEPTH:
-    sys.exit("bin2init.py: firmware %d words > %d (RAMB16_S36_S36 depth) — "
-             "cascade BRAMs or shrink firmware" % (len(words), DEPTH))
+    sys.exit("bin2init.py: firmware %d words > %d (RAMB36E1 depth) — "
+             "shrink firmware" % (len(words), DEPTH))
 words += [0] * (DEPTH - len(words))             # zero-fill the rest
 
 lines = []
-for xx in range(64):                            # INIT_00 .. INIT_3F
+for xx in range(128):                           # INIT_00 .. INIT_7F
     val = 0
     for k in range(8):                          # 8 words packed per 256-bit INIT
         val |= words[xx * 8 + k] << (k * 32)
