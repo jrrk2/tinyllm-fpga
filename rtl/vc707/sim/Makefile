@@ -11,7 +11,7 @@ VFLAGS    := -Wall -Wno-fatal -cc --exe --build -j 0 \
 
 SMOLLM_SRC := ../src/smollm
 
-.PHONY: all matvec rmsnorm rope swiglu swiglu_selftest softmax persist softmax_selftest weight_streamer smollm_layer_ddr3 multilayer_tm bfp-layer bfp-full bfp-autoregress bfp-autoregress-stream clean
+.PHONY: all matvec rmsnorm rope swiglu swiglu_selftest softmax persist softmax_selftest weight_streamer idle_scan_crc smollm_layer_ddr3 multilayer_tm bfp-layer bfp-full bfp-autoregress bfp-autoregress-stream clean
 
 all: matvec rmsnorm rope swiglu softmax persist softmax_selftest
 
@@ -381,10 +381,25 @@ obj_dir/Vsoftmax_selftest: $(SMOLLM_SRC)/softmax_selftest.sv \
 $(SOFTMAX_SELFTEST_DEPS): ../host/gen_softmax_selftest.py
 	python3 ../host/gen_softmax_selftest.py
 
-# ---------------------- weight_streamer (FPGA-side, mock AXI slave) ----------
+# ---------------------- weight_streamer idle_scan_crc (FPGA-side, mock AXI slave) ----------
 weight_streamer: obj_dir/Vtb_weight_streamer_dut
-	@echo "=== running weight_streamer sim ==="
+	@echo "=== running weight_streamer idle_scan_crc sim ==="
 	@./obj_dir/Vtb_weight_streamer_dut
+
+idle_scan_crc: obj_dir/Vtb_idle_scan_crc_dut
+	@echo "=== running idle_scan_crc sim ==="
+	@./obj_dir/Vtb_idle_scan_crc_dut
+
+obj_dir/Vtb_idle_scan_crc_dut: tb_idle_scan_crc_dut.sv \
+                               mock_axi_slave.sv \
+                               ../src/idle_scan_crc.sv \
+                               tb_idle_scan_crc.cpp
+	$(VERILATOR) $(VFLAGS) --top-module tb_idle_scan_crc_dut \
+	    tb_idle_scan_crc_dut.sv \
+	    mock_axi_slave.sv \
+	    ../src/idle_scan_crc.sv \
+	    tb_idle_scan_crc.cpp \
+	    -o Vtb_idle_scan_crc_dut
 
 obj_dir/Vtb_weight_streamer_dut: tb_weight_streamer_dut.sv \
                                  mock_axi_slave.sv \

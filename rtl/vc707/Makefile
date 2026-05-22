@@ -76,6 +76,11 @@ ips := $(addprefix $(work-dir)/, $(ips))
 #   make NLAYERS=3 LAYER_CONFIG=small
 # ----------------------------------------------------------------------
 GENERATED_DIR := ../generated
+# Shared engine-regmap (host/gen_regmap.py) — defined here so the $(bit) prereq
+# at the top of the build rules can reference REGMAP_SVH (Make expands prereqs
+# at parse time).  The generating rule lives down by the firmware section.
+REGMAP_H   := src/soc/regmap_gen.h
+REGMAP_SVH := $(GENERATED_DIR)/regmap_gen.svh
 NLAYERS       ?= 30
 LAYER_CONFIG  ?= smollm
 
@@ -323,7 +328,7 @@ FORCE:
 $(GENERATED_DIR)/build_version.svh: FORCE
 	@python3 host/gen_build_version.py
 
-$(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(GENERATED_DIR)/exp_lut.hex $(lbfp_stamp) $(GENERATED_DIR)/build_version.svh scripts/run.tcl $(BFP_BUILD_DEPS)
+$(bit): $(ips) $(tm_stamp) $(BROM_SV) $(GENERATED_DIR)/silu_lut.hex $(GENERATED_DIR)/exp_lut.hex $(lbfp_stamp) $(GENERATED_DIR)/build_version.svh $(REGMAP_SVH) scripts/run.tcl $(BFP_BUILD_DEPS)
 	@# Per-build project name (semper idem): VPROJECT if a parent set it
 	@# (picosoc-engine), else <VARIANT>-<stamp>.  prologue.tcl creates it.  Each
 	@# build is its own project — no clobber, no wipe.  For incremental reuse on
@@ -374,8 +379,18 @@ $(SOC_DIR)/firmware_shell.mem: $(SOC_DIR)/fw_shell.c $(SOC_DIR)/start.s $(SOC_DI
 	@echo "=== picosoc firmware: $$(stat -c%s $(SOC_DIR)/fw_shell.bin) bytes -> $@ ==="
 
 # Stub firmware for the PicoSoC + real-engine fit build.
-$(SOC_DIR)/firmware_engine.mem: $(SOC_DIR)/fw_engine.c $(SOC_DIR)/start.s $(SOC_DIR)/soc.lds $(SOC_DIR)/bin2mem.py
-	$(RISCV_CROSS)gcc -Os -march=rv32im -mabi=ilp32 -ffreestanding -nostdlib -nostartfiles \
+# Shared engine-regmap constants: ONE source (host/gen_regmap.py) emits the RTL
+# include (regmap_gen.svh) and the firmware header (regmap_gen.h), asserting the
+# addresses are unique.  Prereq of both the firmware (.mem) and the bitstream so
+# the two sides can never disagree.  Grouped target (&:) -> one invocation.
+# (REGMAP_H/REGMAP_SVH are defined up by GENERATED_DIR so the $(bit) prereq sees them.)
+.PHONY: regmap
+regmap: $(REGMAP_H)
+$(REGMAP_H) $(REGMAP_SVH) &: host/gen_regmap.py
+	python3 host/gen_regmap.py
+
+$(SOC_DIR)/firmware_engine.mem: $(SOC_DIR)/fw_engine.c $(REGMAP_H) $(SOC_DIR)/start.s $(SOC_DIR)/soc.lds $(SOC_DIR)/bin2mem.py
+	$(RISCV_CROSS)gcc -Os -march=rv32im -mabi=ilp32 -ffreestanding -nostdlib -nostartfiles $(EXTRA_CFLAGS) \
 	    -Wl,-T,$(SOC_DIR)/soc.lds -o $(SOC_DIR)/fw_engine.elf $(SOC_DIR)/start.s $(SOC_DIR)/fw_engine.c -lgcc
 	$(RISCV_CROSS)objcopy -O binary $(SOC_DIR)/fw_engine.elf $(SOC_DIR)/fw_engine.bin
 	python3 $(SOC_DIR)/bin2mem.py $(SOC_DIR)/fw_engine.bin > $@

@@ -66,11 +66,11 @@ module picosoc_eth_bridge (
   assign core_lsu_addr = '0;  assign core_lsu_wdata = '0;  assign core_lsu_be = '0;
   assign ce_d = 1'b0;  assign we_d = 1'b0;  assign framing_sel = 1'b0;
   assign rx_activity = 1'b0;
-  assign ddr_wr_req = 1'b0;  assign ddr_wr_addr = '0;  assign ddr_wr_data = '0;
+  // ddr_wr_req/addr/data are now driven by the SoC DDR3 write window (below).
   assign dbg_state = '0;  assign dbg_frame_type = '0;  assign dbg_wcnt = '0;
   assign dbg_cur_buf = '0;  assign dbg_n_remaining = '0;  assign dbg_fpga_ip = '0;
-  assign ddr_wr_rx_count = '0;  assign ddr_wr_done_count = '0;
-  assign ddr_wr_ack_count = '0;  assign ddr_wr_tx_count = '0;
+  assign ddr_wr_rx_count = '0;  assign ddr_wr_tx_count = '0;
+  // ddr_wr_done_count (beats issued) / ddr_wr_ack_count (beats completed) driven below.
 
   // ---- PicoSoC ----
   wire        iomem_valid;
@@ -104,6 +104,21 @@ module picosoc_eth_bridge (
   // acks 0x03/0x10/0x20/0x30/0x31, never 0x02.
   wire sel_internal = (iomem_addr[31:24] == 8'h02);   // spimemio/UART — leave to internal back-pressure
 
+  // ---- SoC -> DDR3 write window ----------------------------------------
+  // The engine's weight store lives in DDR3.  This lean build had no upload
+  // path (eth tied off), so the SoC now feeds DDR3 directly: a 32-bit data
+  // port (0x30) fills a 512-bit beat one word at a time; a control reg (0x31)
+  // sets the 64-byte-aligned byte address.  The 16th word toggles ddr_wr_req
+  // (the BL=1 64-byte AXI write handled by ddr_write_master in the top) and
+  // STALLS the CPU (iomem_ready held low) until the 2FF-synced ddr_wr_ack
+  // toggle matches, then auto-advances the address by 64 for the next beat.
+  // Back-pressure means firmware just streams 16 words/beat with no polling.
+  wire sel_ddrd = (iomem_addr[31:24] == 8'h30);   // DDR write data port (push 32b)
+  wire sel_ddra = (iomem_addr[31:24] == 8'h31);   // DDR write addr/control
+  reg  [3:0] dw_idx;                               // word fill index 0..15
+  reg        dw_wait;                              // beat issued, awaiting ack
+  reg        ddr_ack_s0, ddr_ack_s1;              // 2FF sync of ui-clk ddr_wr_ack
+
   typedef enum logic [1:0] { B_IDLE, B_WR, B_RD, B_RD_WAIT } bst_t;
   bst_t bst;
 
@@ -113,9 +128,15 @@ module picosoc_eth_bridge (
       master_address <= 32'h0; master_read <= 1'b0; master_write <= 1'b0;
       master_writedata <= 32'h0; master_byteenable <= 4'h0;
       bst <= B_IDLE;
+      ddr_wr_req <= 1'b0; ddr_wr_addr <= 30'h0; ddr_wr_data <= 512'h0;
+      dw_idx <= 4'h0; dw_wait <= 1'b0; ddr_ack_s0 <= 1'b0; ddr_ack_s1 <= 1'b0;
+      ddr_wr_done_count <= 32'h0; ddr_wr_ack_count <= 32'h0;
     end else begin
       iomem_ready <= 1'b0;
       master_read <= 1'b0; master_write <= 1'b0;
+      // 2FF sync of the ui-clk write-ack toggle into eth_clk.
+      ddr_ack_s0 <= ddr_wr_ack;
+      ddr_ack_s1 <= ddr_ack_s0;
 
       // single-cycle: engine status snapshot
       if (iomem_valid && !iomem_ready && sel_hb) begin
@@ -123,14 +144,57 @@ module picosoc_eth_bridge (
         iomem_rdata <= {hb_done_flags, hb_out_len, hb_last_token, hb_state};
       end
 
-      // catch-all: any iomem address NOT mapped here (LED 0x03, eth 0x20, DDR
-      // 0x30 — none wired in this lean build) is acked immediately with 0 so a
-      // stray firmware access can never stall the PicoRV32 forever.  EXCLUDE
-      // sel_internal (0x02 spimemio/UART) — that region is governed by the SoC's
-      // internal UART back-pressure, and acking it here defeats it.
-      if (iomem_valid && !iomem_ready && !sel_reg && !sel_hb && !sel_internal) begin
+      // catch-all: any iomem address NOT mapped here (LED 0x03, eth 0x20 — not
+      // wired in this lean build) is acked immediately with 0 so a stray
+      // firmware access can never stall the PicoRV32 forever.  EXCLUDE
+      // sel_internal (0x02 spimemio/UART — governed by the UART's own
+      // back-pressure) and the DDR write window (0x30/0x31 — handled below).
+      if (iomem_valid && !iomem_ready && !sel_reg && !sel_hb && !sel_internal
+          && !sel_ddrd && !sel_ddra) begin
         iomem_ready <= 1'b1;
         iomem_rdata <= 32'h0;
+      end
+
+      // ---- SoC -> DDR3 write window ----
+      if (dw_wait) begin
+        // 512-bit beat issued; wait for the AXI write to complete (ack toggle
+        // mirrors req), then release the stalled 16th-word write + advance addr.
+        if (ddr_ack_s1 == ddr_wr_req) begin
+          dw_wait          <= 1'b0;
+          dw_idx           <= 4'h0;
+          ddr_wr_addr      <= ddr_wr_addr + 30'd64;   // next 64-byte beat
+          ddr_wr_ack_count <= ddr_wr_ack_count + 32'd1;
+          iomem_ready      <= 1'b1;                    // ack the pending 0x30 write
+        end
+      end else begin
+        // 0x31: set 64-byte-aligned byte address (write) / read back {busy,addr}.
+        if (iomem_valid && !iomem_ready && sel_ddra) begin
+          if (|iomem_wstrb) begin
+            ddr_wr_addr <= iomem_wdata[29:0];
+            dw_idx      <= 4'h0;
+          end
+          iomem_rdata <= {dw_wait, 1'b0, ddr_wr_addr};
+          iomem_ready <= 1'b1;
+        end
+        // 0x30: push next 32-bit word into the 512-bit beat (LSW first); a read
+        // returns the current fill index (so a stray read can't hang the CPU).
+        if (iomem_valid && !iomem_ready && sel_ddrd) begin
+          if (|iomem_wstrb) begin
+            ddr_wr_data[dw_idx*32 +: 32] <= iomem_wdata;
+            if (dw_idx == 4'd15) begin
+              ddr_wr_req        <= ~ddr_wr_req;          // issue the beat
+              dw_wait           <= 1'b1;                 // stall until ack
+              ddr_wr_done_count <= ddr_wr_done_count + 32'd1;
+              // iomem_ready stays low -> CPU blocks on this write until ack
+            end else begin
+              dw_idx      <= dw_idx + 4'd1;
+              iomem_ready <= 1'b1;
+            end
+          end else begin
+            iomem_rdata <= {28'h0, dw_idx};
+            iomem_ready <= 1'b1;
+          end
+        end
       end
 
       // Avalon-MM bridge to the engine regmap (waitrequest=0; reads pulse

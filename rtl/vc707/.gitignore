@@ -60,6 +60,9 @@ src/soc/*.bin
 src/soc/*.o
 # generated progmem BRAM INIT (baked from firmware by bin2init.py)
 src/soc/progmem_init*.svh
+# generated engine-regmap C header (host/gen_regmap.py; the .svh sibling lives in
+# rtl/generated/ which is already ignored).  Commit the generator, not the output.
+src/soc/regmap_gen.h
 # Stray Verilator lint/obj dirs
 src/smollm/obj_dir/
 # generated updatemem memory map

@@ -304,6 +304,7 @@ read_verilog -sv { \
     src/weight_stream_axi.sv \
     src/weight_tile_cache.sv \
     src/ddr_write_master.sv \
+    src/idle_scan_crc.sv \
     src/vc707_microgpt_eth.sv \
     src/smollm/cordic_sincos.sv \
     src/smollm/matvec_int8_engine.sv \
