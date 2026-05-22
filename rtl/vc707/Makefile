@@ -464,6 +464,21 @@ fw-swap: $(SOC_DIR)/$(SWAP_FW).mem
 	  $(VIVADO) -nojournal -mode batch -source scripts/swap_fw.tcl
 	@echo "=== firmware swapped ($(SWAP_TOP) <- $(SWAP_FW)) -> $(SWAP_BIT_OUT) (reflash) ==="
 
+# Fast JTAG download via openFPGALoader (SRAM, volatile).  ~12 s.
+#   * Needs the SOURCE build of openFPGALoader — the packaged 0.12.0 lacks the
+#     xc7vx485t IDCODE.  Set OFL=, or `sudo make install` in its build dir.
+#   * 15 MHz is the safe rate; 30 MHz garbles the JTAG IDCODE on this board
+#     ("Unknown device 0x67d0e027"), so OLOAD_FREQ is fixed low here.
+#   * Only works on MATCH_CYCLE-NoWait bitstreams (picosoc.xdc) — otherwise the
+#     design stalls on DCI match and never starts.
+OFL        ?= /tmp/openFPGALoader/build/openFPGALoader
+OLOAD_FREQ ?= 15000000
+OLOAD_BIT  ?= work/vc707_picosoc_shell_jtag.bit
+.PHONY: oload
+oload:
+	@test -f $(OLOAD_BIT) || { echo "ERROR: $(OLOAD_BIT) missing"; exit 1; }
+	$(OFL) -c digilent --freq $(OLOAD_FREQ) $(OLOAD_BIT)
+
 # Quick convenience target: bake BFP hex + run the Verilator layer test.
 # Useful for sanity-checking precision after RTL edits before launching a
 # full Vivado synth (≈45 min on VC707).
