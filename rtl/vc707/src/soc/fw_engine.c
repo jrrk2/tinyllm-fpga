@@ -189,13 +189,23 @@ static uint16_t cksum16(const uint8_t *p, uint32_t n) {  /* internet checksum (I
     return ~s;
 }
 
-/* Reg-read value: serve the counters bfp_client polls for flow control from our
- * own state (so it sees real upload progress); else read the engine regmap. */
+/* Reg-read value: serve the flow-control counters bfp_client polls from our own
+ * state so its adaptive pacing auto-throttles to our drain rate (no manual -r).
+ * The real backlog in the SoC is the MAC RX ring (frames the MAC queued but the
+ * firmware hasn't processed) = (nextbuf - firstbuf) from RSR.  We expose that as
+ * rx-done: done(0x1A)=eth_beats (processed), rx(0x19)=processed+queued, so
+ * bfp_client's backlog = rx-done = ring depth -> it holds off (with -B) when we
+ * fall behind.  0x18 returns the raw {lastbuf,nextbuf,firstbuf} it expects. */
 static uint32_t eth_regval(uint16_t a) {
+    if (a == 0x18 || a == 0x19) {
+        uint32_t rsr   = ETH(ETH_RSR);
+        uint32_t depth = ((rsr >> 5) - rsr) & 0x1f;   /* (nextbuf - firstbuf) & 31 */
+        return (a == 0x18) ? (rsr & 0x7FFFu)          /* {lastbuf,nextbuf,firstbuf} */
+                           : (eth_beats + depth);     /* rx = processed + queued */
+    }
     switch (a) {
-        case 0x18: return 0;                               /* eth ring: empty   */
-        case 0x19: case 0x1A: case 0x1B: return eth_beats; /* rx / done / ack    */
-        case 0x1C: return eth_acks;                        /* FT_ACK tx count    */
+        case 0x1A: case 0x1B: return eth_beats;       /* done / ack (synchronous) */
+        case 0x1C: return eth_acks;                    /* FT_ACK tx count */
         default:   return REG(a);
     }
 }
