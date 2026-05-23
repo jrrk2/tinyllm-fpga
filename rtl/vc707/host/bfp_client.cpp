@@ -88,6 +88,13 @@ constexpr uint16_t REG_BRAM_DATA     = 0x061;   // write: {16'd0, data[15:0]} �
 constexpr uint16_t REG_BRAM_READ     = 0x062;   // read: {16'd0, BRAM[kind, addr]} — port-A readback
 constexpr uint16_t REG_N_PROMPT      = 0x063;   // r/w: active prompt length (1..NPROMPT_MAX)
 constexpr uint16_t REG_BUILD_VERSION = 0x10F;
+// idle_scan_crc engine (PicoSoC stage 3): hash a raw DDR3 region to verify an
+// upload independent of the engine/ROMs.
+constexpr uint16_t REG_SCAN_BASE = 0x080;   // byte addr (64B aligned)
+constexpr uint16_t REG_SCAN_LEN  = 0x081;   // length in 512-bit beats
+constexpr uint16_t REG_SCAN_TRIG = 0x082;   // bit0: start
+constexpr uint16_t REG_SCAN_STAT = 0x083;   // [0]=busy [1]=done
+constexpr uint16_t REG_SCAN_CRC  = 0x084;   // result
 constexpr uint16_t REG_RESULT        = 0x1D0;
 constexpr uint16_t REG_DONE          = 0x1F0;   // {30'd0, lay_done_latched, lay_done}
 constexpr uint16_t REG_RESTART       = 0x1F1;   // bit 0: write 1 to pulse restart
@@ -1211,6 +1218,53 @@ static void send_reg_write_batch(Udp& u, uint8_t seq,
     u.send(tx, 8 + batch.size() * 8);
 }
 
+// Send a reg-write batch and wait for the firmware's FT_ACK(seq), resending on
+// timeout.  The PicoSoC parser is far slower than the old HW eth_ctrl, so
+// unacked back-to-back load-roms batches overran the RX ring and (with the
+// auto-incrementing BRAM address) desynced everything after the first drop.
+// Ack-gating paces the host to the SoC's drain rate.  Returns false if no ACK
+// after several retries (the verify/patch round will then catch it).
+static bool send_reg_write_acked(Udp& u, uint8_t seq, const std::vector<RegW>& batch) {
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        send_reg_write_batch(u, seq, batch);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        while (std::chrono::steady_clock::now() < deadline) {
+            uint8_t rx[2048]; size_t n = 0;
+            if (!u.recv(rx, sizeof(rx), &n)) break;          // recv timeout -> resend
+            if (n >= 2 && rx[0] == FT_ACK && rx[1] == seq) return true;
+        }
+    }
+    return false;
+}
+
+// Rolling hash matching idle_scan_crc.sv: crc=0xFFFFFFFF; per 64-byte beat,
+// fold = XOR of its sixteen LE u32 words; crc = rotl(crc,1) ^ fold.
+static uint32_t host_scan_crc(const uint8_t* d, size_t nbeats) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t b = 0; b < nbeats; ++b) {
+        uint32_t fold = 0;
+        for (int w = 0; w < 16; ++w) {
+            uint32_t v; std::memcpy(&v, d + b * 64 + 4 * w, 4); fold ^= v;
+        }
+        crc = (crc << 1) | (crc >> 31);
+        crc ^= fold;
+    }
+    return crc;
+}
+
+// Drive the FPGA's idle_scan_crc over [base, base+len*64) and return its CRC.
+static uint32_t ddr_scan_crc(Udp& u, uint32_t base, uint32_t len_beats, uint8_t& seq) {
+    std::vector<RegW> setup = {{REG_SCAN_BASE, base},
+                               {REG_SCAN_LEN,  len_beats},
+                               {REG_SCAN_TRIG, 1}};       // base,len,trig in order
+    send_reg_write_acked(u, seq++, setup);
+    for (int i = 0; i < 1000000; ++i) {                   // poll done (bit1)
+        auto st = reg_read(u, REG_SCAN_STAT, 1, seq++);
+        if (!st.empty() && (st[0] & 2)) break;
+    }
+    return reg_read(u, REG_SCAN_CRC, 1, seq++)[0];
+}
+
 // One mismatched BRAM entry: address, what the file says it should be,
 // and what readback actually returned.
 struct Mismatch { size_t addr; uint16_t want; uint16_t got; };
@@ -1262,7 +1316,7 @@ static void patch_rom(Udp& u, int kind,
             {REG_BRAM_TARGET, target},
             {REG_BRAM_DATA,   static_cast<uint32_t>(m.want)},
         };
-        send_reg_write_batch(u, seq++, two);
+        send_reg_write_acked(u, seq++, two);
     }
 }
 
@@ -1276,8 +1330,7 @@ static void load_rom(Udp& u, int kind, const std::vector<uint16_t>& entries,
                     | (static_cast<uint32_t>(kind & 0x1f) << 18)
                     | 0u /* base_addr=0 */;
     std::vector<RegW> first = {{REG_BRAM_TARGET, target}};
-    send_reg_write_batch(u, seq++, first);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    send_reg_write_acked(u, seq++, first);
 
     // 2. Stream data writes — pack 16 entries per FT_REG_WRITE packet.
     // The destination BRAM is true-dual-port with port A clocked by
@@ -1292,7 +1345,7 @@ static void load_rom(Udp& u, int kind, const std::vector<uint16_t>& entries,
         for (size_t j = 0; j < n; ++j) {
             batch.push_back({REG_BRAM_DATA, static_cast<uint32_t>(entries[i + j])});
         }
-        send_reg_write_batch(u, seq++, batch);
+        send_reg_write_acked(u, seq++, batch);   // ack-gate: pace to the SoC's drain rate
     }
 
     // 3. Self-heal: verify-then-patch up to 3 rounds.  UDP frames can
@@ -1815,6 +1868,28 @@ int main(int argc, char** argv) {
         if (cmd == "read-crc") {
             print_crc(u);
             return 0;
+        }
+        if (cmd == "ddrcrc") {
+            // Hash the uploaded DDR3 image via the FPGA's idle_scan_crc and
+            // compare to a host hash of the .bin — verifies upload byte-fidelity
+            // independent of the engine/ROMs.  No reflash; DDR contents survive.
+            std::string path = (argi < argc) ? argv[argi]
+                                             : std::string("release/lbfp_full_DDR3.bin");
+            std::ifstream f(path, std::ios::binary);
+            if (!f) { std::fprintf(stderr, "ddrcrc: cannot open %s\n", path.c_str()); return 2; }
+            f.seekg(0, std::ios::end);
+            size_t sz = static_cast<size_t>(f.tellg());
+            f.seekg(0);
+            std::vector<uint8_t> data(sz);
+            f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(sz));
+            size_t nbeats = sz / 64;
+            uint32_t href = host_scan_crc(data.data(), nbeats);
+            uint8_t seq = 90;
+            uint32_t hw = ddr_scan_crc(u, 0, static_cast<uint32_t>(nbeats), seq);
+            std::printf("ddrcrc: %s  %zu beats (%.1f MB)  hw=0x%08x  host=0x%08x  %s\n",
+                        path.c_str(), nbeats, sz / 1e6, hw, href,
+                        hw == href ? "MATCH (upload byte-faithful)" : "MISMATCH");
+            return hw == href ? 0 : 1;
         }
         if (cmd == "version") {
             auto bv = reg_read(u, REG_BUILD_VERSION, 1, 1)[0];
