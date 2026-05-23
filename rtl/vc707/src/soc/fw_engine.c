@@ -50,6 +50,15 @@
 #define FT_REG_RSP   0x03u
 #define FT_ACK       0x06u
 #define FPGA_UDP_PORT 19783u  /* 0x4D47 "MG" — only frames to this port are handled */
+#define ETYPE_ARP 0x0806u
+#define ETYPE_IP  0x0800u
+#define IPPROTO_ICMP 1u
+#define IPPROTO_UDP  17u
+/* FPGA static IP — host pings/targets this; ARP makes it reachable. */
+#define FIP0 192u
+#define FIP1 168u
+#define FIP2 1u
+#define FIP3 42u
 
 /* UART_TXDELAY (compile-time, default OFF): busy-wait one+ byte-time after every
  * UART byte so multi-char output survives even if the CPU isn't stalled by the
@@ -142,13 +151,15 @@ static void cmd_scan(void) {
     print_(hw == ref ? "  PASS\n" : "  FAIL\n");
 }
 
-static uint8_t  ethf[160];        /* reply-frame scratch (42 hdr + payload) */
+static uint8_t  ethf[256];        /* reply-frame scratch (headers + payload) */
 static uint32_t eth_beats = 0;    /* DDR3 beats written from eth frames */
-static uint32_t eth_acks  = 0;    /* FT_ACK / FT_REG_RSP replies sent */
+static uint32_t eth_acks  = 0;    /* replies sent (ACK/REG_RSP/ARP/ICMP) */
+static const uint8_t FMAC[6] = {0x02,0x00,0x00,0x4D,0x47,0x31};  /* FPGA MAC */
+static const uint8_t FIP[4]  = {FIP0, FIP1, FIP2, FIP3};         /* FPGA IP  */
 
 static void eth_init(void) {
     ETH(ETH_MACLO) = MAC_LO;
-    ETH(ETH_MACHI) = MAC_HI | (1u << 22) | (1u << 19);  /* enable + promiscuous */
+    ETH(ETH_MACHI) = MAC_HI | (1u << 22);   /* enable; no promiscuous — ARP makes us reachable */
     ETH(ETH_RXEN)  = 31;
 }
 
@@ -167,9 +178,13 @@ static void eth_tx_bytes(const uint8_t *s, uint32_t n) {   /* always TX buffer 0
             s[i] | (s[i+1] << 8) | (s[i+2] << 16) | (s[i+3] << 24);
 }
 static void bswap(uint8_t *a, uint8_t *c, int n) { while (n--) { uint8_t t = *a; *a++ = *c; *c++ = t; } }
-static uint16_t ipck(const uint8_t *p) {           /* IP header checksum over 20 bytes */
+static uint8_t rxb(uint32_t b, uint32_t off) {     /* one frame byte from the RX buffer */
+    return ETH(ETH_RX(b, off >> 3) + (off & 4)) >> ((off & 3) * 8);
+}
+static uint16_t cksum16(const uint8_t *p, uint32_t n) {  /* internet checksum (IP/ICMP) */
     uint32_t s = 0;
-    for (int i = 0; i < 20; i += 2) s += (p[i] << 8) | p[i+1];
+    for (uint32_t i = 0; i + 1 < n; i += 2) s += (p[i] << 8) | p[i+1];
+    if (n & 1) s += p[n-1] << 8;
     while (s >> 16) s = (s & 0xFFFF) + (s >> 16);
     return ~s;
 }
@@ -196,7 +211,7 @@ static void eth_reply(uint32_t plen) {
     ethf[38] = ulen >> 8;  ethf[39] = ulen;    /* UDP length (BE)      */
     ethf[40] = 0; ethf[41] = 0;                /* UDP checksum = 0     */
     ethf[24] = 0; ethf[25] = 0;
-    uint16_t ck = ipck(&ethf[14]);             /* IP checksum over hdr */
+    uint16_t ck = cksum16(&ethf[14], 20);      /* IP checksum over hdr */
     ethf[24] = ck >> 8; ethf[25] = ck;
     uint32_t flen = 42 + plen;
     while (flen < 60) ethf[flen++] = 0;        /* pad to eth min frame */
@@ -205,53 +220,97 @@ static void eth_reply(uint32_t plen) {
     eth_acks++;
 }
 
-/* Service one RX frame (filtered to our UDP port):
- *   FT_DDR_WRITE -> 64B payload into DDR3 (beat = RX words 6..13) + FT_ACK
- *   FT_REG_WRITE -> regmap writes (entry i in RX word 6+i)        + FT_ACK
- *   FT_REG_READ  -> FT_REG_RSP with the requested register values            */
+/* ARP: reply to a who-has for our IP with "is-at FMAC". */
+static void eth_arp(uint32_t b) {
+    eth_rx_bytes(b, ethf, 48);                     /* eth(14)+ARP(28)=42, read 48 */
+    if (ethf[20] != 0 || ethf[21] != 1) return;    /* OPER must be request (1) */
+    if (ethf[38]!=FIP[0] || ethf[39]!=FIP[1] || ethf[40]!=FIP[2] || ethf[41]!=FIP[3]) return; /* TPA != us */
+    for (int i = 0; i < 6; i++) { ethf[i] = ethf[22+i]; ethf[32+i] = ethf[22+i]; }   /* dst & THA = requester MAC */
+    for (int i = 0; i < 4; i++)   ethf[38+i] = ethf[28+i];                           /* TPA = requester IP */
+    for (int i = 0; i < 6; i++) { ethf[6+i] = FMAC[i]; ethf[22+i] = FMAC[i]; }       /* src & SHA = us */
+    for (int i = 0; i < 4; i++)   ethf[28+i] = FIP[i];                               /* SPA = us */
+    ethf[20] = 0; ethf[21] = 2;                    /* OPER = reply (2) */
+    uint32_t flen = 42;
+    while (flen < 60) ethf[flen++] = 0;
+    eth_tx_bytes(ethf, (flen + 3) & ~3u);
+    ETH(ETH_TPLR) = flen;
+    eth_acks++;
+}
+
+/* ICMP: reply to an echo request (ping) with an echo reply. */
+static void eth_icmp(uint32_t b) {
+    uint32_t iptot = (rxb(b, 16) << 8) | rxb(b, 17);   /* IP total length */
+    uint32_t flen  = 14 + iptot;
+    if (flen > sizeof(ethf)) return;                   /* oversize ping — ignore */
+    eth_rx_bytes(b, ethf, (flen + 3) & ~3u);
+    if (ethf[34] != 8) return;                         /* ICMP type 8 = echo request */
+    bswap(&ethf[0], &ethf[6], 6);                      /* swap eth MAC */
+    bswap(&ethf[26], &ethf[30], 4);                    /* swap IP src/dst */
+    ethf[34] = 0;                                       /* echo reply */
+    ethf[36] = 0; ethf[37] = 0;
+    uint16_t ic = cksum16(&ethf[34], iptot - 20);      /* ICMP checksum over message */
+    ethf[36] = ic >> 8; ethf[37] = ic;
+    ethf[24] = 0; ethf[25] = 0;
+    uint16_t ip = cksum16(&ethf[14], 20);              /* IP header checksum */
+    ethf[24] = ip >> 8; ethf[25] = ip;
+    while (flen < 60) ethf[flen++] = 0;
+    eth_tx_bytes(ethf, (flen + 3) & ~3u);
+    ETH(ETH_TPLR) = flen;
+    eth_acks++;
+}
+
+/* Service one RX frame: ARP who-has us -> reply; ICMP echo to us -> reply; UDP to
+ * our IP:port -> the bfp_client FT_* protocol (DDR upload / regmap, with replies). */
 static void eth_handle(void) {
     uint32_t rsr = ETH(ETH_RSR);
     if (!(rsr & (1u << 15))) return;
     uint32_t b = rsr & 0x1f;
-    uint32_t w4 = ETH(ETH_RX(b, 4) + 4);                       /* bytes 36-39 */
-    uint16_t dport = ((w4 & 0xFF) << 8) | ((w4 >> 8) & 0xFF);  /* UDP dst port (BE) */
-    uint32_t w5  = ETH(ETH_RX(b, 5));
-    uint8_t  ft  = (w5 >> 16) & 0xFF;                          /* byte 42 */
-    uint8_t  seq = (w5 >> 24) & 0xFF;                          /* byte 43 */
-    if (dport == FPGA_UDP_PORT) {
-        if (ft == FT_DDR_WRITE) {
-            DDR_ADDR = ETH(ETH_RX(b, 5) + 4) & 0x3FFFFFFFu;    /* bytes 44-47 */
-            for (uint32_t c = 0; c < 8; c++) {                 /* RX words 6..13 */
-                DDR_DATA = ETH(ETH_RX(b, 6 + c));
-                DDR_DATA = ETH(ETH_RX(b, 6 + c) + 4);
+    uint16_t etype = (rxb(b, 12) << 8) | rxb(b, 13);
+    if (etype == ETYPE_ARP) {
+        eth_arp(b);
+    } else if (etype == ETYPE_IP &&
+               rxb(b,30)==FIP[0] && rxb(b,31)==FIP[1] && rxb(b,32)==FIP[2] && rxb(b,33)==FIP[3]) {
+        uint8_t proto = rxb(b, 23);
+        if (proto == IPPROTO_ICMP) {
+            eth_icmp(b);
+        } else if (proto == IPPROTO_UDP && ((rxb(b,36) << 8) | rxb(b,37)) == FPGA_UDP_PORT) {
+            uint32_t w5  = ETH(ETH_RX(b, 5));
+            uint8_t  ft  = (w5 >> 16) & 0xFF;             /* byte 42 = frame type */
+            uint8_t  seq = (w5 >> 24) & 0xFF;             /* byte 43 = seq */
+            if (ft == FT_DDR_WRITE) {
+                DDR_ADDR = ETH(ETH_RX(b, 5) + 4) & 0x3FFFFFFFu;   /* bytes 44-47 */
+                for (uint32_t c = 0; c < 8; c++) {                /* RX words 6..13 */
+                    DDR_DATA = ETH(ETH_RX(b, 6 + c));
+                    DDR_DATA = ETH(ETH_RX(b, 6 + c) + 4);
+                }
+                eth_beats++;
+                eth_rx_bytes(b, ethf, 48);
+                ethf[42] = FT_ACK; ethf[43] = seq;
+                eth_reply(2);
+            } else if (ft == FT_REG_WRITE) {
+                uint8_t n = ETH(ETH_RX(b, 5) + 4) & 0xFF;
+                for (uint32_t i = 0; i < n; i++) {
+                    uint32_t lo = ETH(ETH_RX(b, 6 + i));
+                    REG((lo >> 16) & 0xFFFF) = ETH(ETH_RX(b, 6 + i) + 4);
+                }
+                eth_rx_bytes(b, ethf, 48);
+                ethf[42] = FT_ACK; ethf[43] = seq;
+                eth_reply(2);
+            } else if (ft == FT_REG_READ) {
+                uint32_t w5h    = ETH(ETH_RX(b, 5) + 4);
+                uint16_t addr   = w5h & 0xFFFF;
+                uint8_t  nwords = (w5h >> 16) & 0xFF;
+                if (nwords > 19) nwords = 19;
+                eth_rx_bytes(b, ethf, 48);
+                ethf[42] = FT_REG_RSP; ethf[43] = seq;
+                ethf[44] = addr; ethf[45] = addr >> 8;
+                ethf[46] = nwords; ethf[47] = 0; ethf[48] = 0; ethf[49] = 0;
+                for (uint32_t i = 0; i < nwords; i++) {
+                    uint32_t v = eth_regval(addr + i);
+                    ethf[50+i*4] = v; ethf[51+i*4] = v>>8; ethf[52+i*4] = v>>16; ethf[53+i*4] = v>>24;
+                }
+                eth_reply(8 + nwords * 4);
             }
-            eth_beats++;
-            eth_rx_bytes(b, ethf, 48);                         /* request hdrs -> ethf */
-            ethf[42] = FT_ACK; ethf[43] = seq;
-            eth_reply(2);
-        } else if (ft == FT_REG_WRITE) {
-            uint8_t n = ETH(ETH_RX(b, 5) + 4) & 0xFF;          /* payload[2] = n_writes */
-            for (uint32_t i = 0; i < n; i++) {
-                uint32_t lo = ETH(ETH_RX(b, 6 + i));
-                REG((lo >> 16) & 0xFFFF) = ETH(ETH_RX(b, 6 + i) + 4);
-            }
-            eth_rx_bytes(b, ethf, 48);
-            ethf[42] = FT_ACK; ethf[43] = seq;
-            eth_reply(2);
-        } else if (ft == FT_REG_READ) {
-            uint32_t w5h    = ETH(ETH_RX(b, 5) + 4);           /* bytes 44-47 */
-            uint16_t addr   = w5h & 0xFFFF;                    /* payload[2:3] start addr */
-            uint8_t  nwords = (w5h >> 16) & 0xFF;              /* payload[4] nwords */
-            if (nwords > 19) nwords = 19;
-            eth_rx_bytes(b, ethf, 48);
-            ethf[42] = FT_REG_RSP; ethf[43] = seq;
-            ethf[44] = addr; ethf[45] = addr >> 8;
-            ethf[46] = nwords; ethf[47] = 0; ethf[48] = 0; ethf[49] = 0;
-            for (uint32_t i = 0; i < nwords; i++) {
-                uint32_t v = eth_regval(addr + i);
-                ethf[50+i*4] = v; ethf[51+i*4] = v>>8; ethf[52+i*4] = v>>16; ethf[53+i*4] = v>>24;
-            }
-            eth_reply(8 + nwords * 4);
         }
     }
     ETH(ETH_RSR) = (b + 1) & 0x1f;                    /* free the buffer */
