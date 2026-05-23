@@ -396,6 +396,15 @@ $(SOC_DIR)/firmware_engine.mem: $(SOC_DIR)/fw_engine.c $(REGMAP_H) $(SOC_DIR)/st
 	python3 $(SOC_DIR)/bin2mem.py $(SOC_DIR)/fw_engine.bin > $@
 	@echo "=== picosoc-engine firmware: $$(stat -c%s $(SOC_DIR)/fw_engine.bin) bytes -> $@ ==="
 
+# Minimal eth-TX probe firmware (fw_ethtx.c): broadcasts a fixed frame ~1/s for
+# tcpdump.  Swap onto a built engine bit:  make fw-swap SWAP_FW=firmware_ethtx
+$(SOC_DIR)/firmware_ethtx.mem: $(SOC_DIR)/fw_ethtx.c $(SOC_DIR)/start.s $(SOC_DIR)/soc.lds $(SOC_DIR)/bin2mem.py
+	$(RISCV_CROSS)gcc -Os -march=rv32im -mabi=ilp32 -ffreestanding -nostdlib -nostartfiles \
+	    -Wl,-T,$(SOC_DIR)/soc.lds -o $(SOC_DIR)/fw_ethtx.elf $(SOC_DIR)/start.s $(SOC_DIR)/fw_ethtx.c -lgcc
+	$(RISCV_CROSS)objcopy -O binary $(SOC_DIR)/fw_ethtx.elf $(SOC_DIR)/fw_ethtx.bin
+	python3 $(SOC_DIR)/bin2mem.py $(SOC_DIR)/fw_ethtx.bin > $@
+	@echo "=== ethtx firmware: $$(stat -c%s $(SOC_DIR)/fw_ethtx.bin) bytes -> $@ ==="
+
 # picosoc_ila IP — generated from its committed source tcl (same pattern as the
 # engine ILAs); regenerated only when the tcl changes.  Defined here (before the
 # picosoc-engine / picosoc targets that use it) so Make expands it at parse time.
