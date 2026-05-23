@@ -106,8 +106,8 @@ module picosoc_noflash (
 	// it from its catch-all so this internal decode is the sole owner.  Single-
 	// cycle ack; the BRAM port-B write lands on the same edge the CPU completes.
 	wire        prog_wr_sel = mem_valid && (mem_addr[31:24] == 8'h50);
-	wire        prog_we_b   = prog_wr_sel && (|mem_wstrb);
-	wire [9:0]  prog_addr_b = mem_addr[11:2];
+	wire [3:0]  prog_we_b   = prog_wr_sel ? mem_wstrb : 4'b0;   // per-byte lane WE
+	wire [10:0] prog_addr_b = mem_addr[12:2];                   // 2048-word index
 	wire [31:0] prog_data_b = mem_wdata;
 
 	assign mem_ready =

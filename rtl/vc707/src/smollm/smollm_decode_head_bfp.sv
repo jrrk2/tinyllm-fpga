@@ -81,8 +81,12 @@ module smollm_decode_head_bfp #(
   // zero, the final RMSNorm output is all-zero, lm_head logits are all
   // zero, and argmax pins to lane 0 chunk 0 = token 0 every step.
   initial begin
-    $readmemh("../generated/lbfp_full_NORM_W_m.hex", rom_NW_m);
-    $readmemh("../generated/lbfp_full_NORM_W_e.hex", rom_NW_e);
+    // Use PREFIX (not a hardcoded ../generated path) so NORM_W loads from the
+    // SAME dir as EMBED — a hardcoded ../generated resolves to the stale/wrong
+    // generated dir in sims run from sim/, loading a D=576 NORM_W into a D=960
+    // array (rest zero) -> wrong RMSNorm -> degenerate logits.
+    $readmemh({PREFIX, "NORM_W_m.hex"}, rom_NW_m);
+    $readmemh({PREFIX, "NORM_W_e.hex"}, rom_NW_e);
   end
 `endif
 

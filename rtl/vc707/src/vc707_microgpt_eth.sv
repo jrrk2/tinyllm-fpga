@@ -2098,19 +2098,26 @@ module vc707_microgpt_eth (
   // ================================================================
   //  ILA-WEIGHTS — full 512-bit weight beat as the MIG delivers it into
   //  the engine (i_lay_st/i_emb g_stream.beat_buf), ui_clk (200 MHz),
-  //  2048 samples.  Trigger on probe5 (restart_edge_ui) rising to frame
-  //  one inference run's weight stream from the top.  This is the exact
-  //  net whose timing the scan-CRC mux had broken; capture it raw to
-  //  confirm clean weight delivery on the rebuilt (timing-closed) bit.
+  //  2048 samples.  rdata + araddr are DATA-ONLY probes (no trigger
+  //  comparator — that 512-wide comparator was the -53 ps net).
+  //
+  //  Capture control is enabled: in the HW manager set the capture
+  //  condition to  rvalid==1 && rready==1  so the buffer PACKS real
+  //  weight beats (araddr is held stable across each burst, so every
+  //  captured beat carries its true source address).  arvalid/arready
+  //  let you align the returned beats to the AR that requested them.
+  //  Trigger on probe7 (restart_edge_ui) rising to frame one run.
   // ================================================================
   microgpt_ila_weights i_ila_weights (
     .clk    ( ui_clk          ),
-    .probe0 ( m_axi_rdata     ),  // 512  weight beat into the engine
-    .probe1 ( m_axi_rvalid    ),  // 1
-    .probe2 ( m_axi_rready    ),  // 1
-    .probe3 ( m_axi_rlast     ),  // 1
-    .probe4 ( m_axi_araddr    ),  // 30   weight region address
-    .probe5 ( restart_edge_ui )   // 1    engine restart pulse (TRIGGER)
+    .probe0 ( m_axi_rdata     ),  // 512  weight beat into the engine (DATA)
+    .probe1 ( m_axi_rvalid    ),  // 1    R valid
+    .probe2 ( m_axi_rready    ),  // 1    R ready  (capture qual: rvalid&&rready)
+    .probe3 ( m_axi_rlast     ),  // 1    R last (burst delimiter)
+    .probe4 ( m_axi_araddr    ),  // 30   source addr, held over burst (DATA)
+    .probe5 ( m_axi_arvalid   ),  // 1    AR valid
+    .probe6 ( m_axi_arready   ),  // 1    AR ready
+    .probe7 ( restart_edge_ui )   // 1    engine restart pulse (TRIGGER)
   );
 `endif
 

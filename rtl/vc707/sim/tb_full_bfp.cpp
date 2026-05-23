@@ -35,8 +35,8 @@ int main(int argc, char** argv) {
   Verilated::commandArgs(argc, argv);
   d = new Vtb_full_bfp;
 
-  auto prompt = read_tokens("../generated/lbfp_full_PROMPT_TOKENS.txt");
-  auto golden = read_tokens("../generated/lbfp_full_GOLDEN_TOKENS.txt");
+  auto prompt = read_tokens("../../generated/lbfp_full_PROMPT_TOKENS.txt");
+  auto golden = read_tokens("../../generated/lbfp_full_GOLDEN_TOKENS.txt");
   std::fprintf(stderr, "[tb_full_bfp] prompt=%zu tokens, golden=%zu tokens\n",
                prompt.size(), golden.size());
 

@@ -9,8 +9,8 @@ module progmem (
     input  wire [31:0] addr,
     output wire [31:0] rdata,
     // Port-B CPU store interface (ignored here — this is a fixed test ROM).
-    input  wire        we_b,
-    input  wire [9:0]  addr_b,
+    input  wire [3:0]  we_b,
+    input  wire [10:0] addr_b,
     input  wire [31:0] data_b
 );
 

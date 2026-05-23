@@ -49,7 +49,7 @@ module tb_full_bfp (
   wire  signed [NT_D*BFP_EXP_W-1:0]     emb_e;
   wire                                  emb_done;
   embed_lookup_bfp #(
-    .D(D), .VOCAB(VOCAB), .PREFIX("../generated/lbfp_full_"),
+    .D(D), .VOCAB(VOCAB), .PREFIX("../../generated/lbfp_full_"),
     .STREAM_LOOKUP(1'b0)
   ) i_emb (
     .clk(clk), .rst(rst), .start(emb_start),
@@ -75,7 +75,7 @@ module tb_full_bfp (
   wire                                  lay_done;
   smollm_multilayer_tm_bfp #(
     .D(D), .H_Q(H_Q), .H_KV(H_KV), .HD(HD),
-    .FFN(FFN), .MAX_CTX(MAX_CTX), .NL(NL), .PREFIX("../generated/lbfp_full_")
+    .FFN(FFN), .MAX_CTX(MAX_CTX), .NL(NL), .PREFIX("../../generated/lbfp_full_")
   ) i_lay (
     .clk(clk), .rst(rst), .start(lay_start),
     .pos(pos), .kv_pos(kv_pos),
@@ -111,7 +111,7 @@ module tb_full_bfp (
   wire  [15:0]                          dec_token;
   wire                                  dec_done;
   smollm_decode_head_bfp #(
-    .D(D), .VOCAB(VOCAB), .PREFIX("../generated/lbfp_full_")
+    .D(D), .VOCAB(VOCAB), .PREFIX("../../generated/lbfp_full_")
     // STREAM_WEIGHTS parameter removed from DUT; streamer is always
     // present but dormant when ws_base_*=0 and m_axi handshake stuck.
   ) i_dec (

@@ -1241,7 +1241,7 @@ static bool send_reg_write_acked(Udp& u, uint8_t seq, const std::vector<RegW>& b
 // port-B window (picosoc_noflash), so this never touches a privileged socket.
 // ---------------------------------------------------------------------
 constexpr int PROG_WORDS_PER_FRAME = 16;     // 64 B payload, matches the firmware cap
-constexpr int PROG_TOTAL_WORDS     = 1024;   // progmem depth (RAMB36E1, 1024 x 32)
+constexpr int PROG_TOTAL_WORDS     = 2048;   // progmem depth (4x RAMB16_S9_S9, 2048 x 32)
 
 // Stream `words` (LE u32) into progmem starting at word `dest`, ack-gated.
 static bool prog_write(Udp& u, uint16_t dest,
