@@ -1,9 +1,9 @@
-/* fw_engine.c — PicoSoC + real-engine console (lean build).
- * UART is the only SoC-visible channel in this engine top (LEDs belong to the
- * engine; the eth LSU bus + ddr_wr upload path are tied off in this lean build).
- * It serves an interactive single-key menu that reads the engine regmap over the
- * Avalon master bridge (iomem 0x10) + the status snapshot (iomem 0x40), so every
- * command also proves the SoC<->engine register path works.  No globals. */
+/* fw_engine.c — PicoSoC + real-engine console + weight uploader.
+ * Channels: UART menu (debug) on 0x02; engine regmap via the Avalon bridge
+ * (iomem 0x10) + status snapshot (0x40); DDR3 write window (0x30/0x31); idle
+ * scan-CRC (regmap 0x080-0x084); and the ethernet MAC over the LSU window (0x20).
+ * Stage 2: the firmware parses bfp_client's UDP frames (FT_DDR_WRITE -> DDR3) in
+ * the main loop, replacing the old microgpt_eth_ctrl HW FSM. */
 #include <stdint.h>
 
 #define reg_uart_clkdiv (*(volatile uint32_t *)0x02000004)
@@ -30,6 +30,20 @@
  * makes each beat's fold non-zero so the rolling scan-CRC actually moves. */
 #define DDR_TEST_MUL   0x9E3779B1u
 
+/* Ethernet MAC over the LSU window (iomem 0x20 + lsu_byte_addr).  Each 32-bit
+ * access maps to a 64-bit LSU word (low half = +0, high half = +4).  bfp_client
+ * sends raw UDP frames; the payload starts at frame byte 42 (= RX 64-bit word 5,
+ * byte 2).  This build parses FT_DDR_WRITE only (weight upload). */
+#define ETH(off)  (*(volatile uint32_t *)(0x20000000u + (off)))
+#define ETH_MACLO 0x0800u
+#define ETH_MACHI 0x0808u   /* [20]irq_en [19]promiscuous ... [15:0]mac[47:32] */
+#define ETH_RXEN  0x0828u
+#define ETH_RSR   0x0830u   /* rd: [15]=ready,[4:0]=buf ; wr: (buf+1) frees */
+#define ETH_RX(b, w) (0x10000u + ((uint32_t)(b) << 11) + ((uint32_t)(w) << 3))
+#define MAC_LO 0x004D4731u  /* old eth_ctrl MAC (promiscuous below, so it's moot) */
+#define MAC_HI 0x00000200u
+#define FT_DDR_WRITE 0x0Au  /* UDP payload byte 0 = frame byte 42 */
+
 /* UART_TXDELAY (compile-time, default OFF): busy-wait one+ byte-time after every
  * UART byte so multi-char output survives even if the CPU isn't stalled by the
  * UART back-pressure.  Used to confirm the bridge catch-all overrun on the old
@@ -51,7 +65,7 @@ static void hex_(uint32_t v, int nyb) {
 
 static void menu(void) {
     print_("\nfw_engine " __DATE__ " " __TIME__ "\n");
-    print_("v ver  c crc  s status  w ddrwr  k scancrc  r restart  ? menu\n");
+    print_("v ver  c crc  s status  w ddrwr  k scancrc  e eth  r restart  ? menu\n");
 }
 
 static void cmd_version(void) {
@@ -121,14 +135,47 @@ static void cmd_scan(void) {
     print_(hw == ref ? "  PASS\n" : "  FAIL\n");
 }
 
+static uint32_t eth_beats = 0;   /* DDR3 beats written from eth frames (debug) */
+
+static void eth_init(void) {
+    ETH(ETH_MACLO) = MAC_LO;
+    ETH(ETH_MACHI) = MAC_HI | (1u << 22) | (1u << 19);  /* enable + promiscuous */
+    ETH(ETH_RXEN)  = 31;
+}
+
+/* Service one RX frame.  FT_DDR_WRITE -> stream the 64-byte payload into DDR3 at
+ * the frame's byte address.  Byte layout matches the old HW FSM: the 512-bit beat
+ * = RX 64-bit words 6..13, so DDR window word 2c/2c+1 = lo/hi of RX word 6+c. */
+static void eth_handle(void) {
+    uint32_t rsr = ETH(ETH_RSR);
+    if (!(rsr & (1u << 15))) return;                  /* no frame ready */
+    uint32_t b = rsr & 0x1f;
+    uint32_t w5 = ETH(ETH_RX(b, 5));                  /* frame bytes 40-43 */
+    if (((w5 >> 16) & 0xFF) == FT_DDR_WRITE) {        /* byte 42 = frame type */
+        DDR_ADDR = ETH(ETH_RX(b, 5) + 4) & 0x3FFFFFFFu;   /* bytes 44-47 = byte addr */
+        for (uint32_t c = 0; c < 8; c++) {            /* RX words 6..13 = 64 data bytes */
+            DDR_DATA = ETH(ETH_RX(b, 6 + c));             /* lo 32 */
+            DDR_DATA = ETH(ETH_RX(b, 6 + c) + 4);         /* hi 32 */
+        }
+        eth_beats++;
+    }
+    ETH(ETH_RSR) = (b + 1) & 0x1f;                    /* free the buffer */
+}
+
+static void cmd_eth(void) {
+    print_("eth beats="); hex_(eth_beats, 8); putc_('\n');
+}
+
 void main(void)
 {
     reg_uart_clkdiv = UART_DIV;
     print_("\n=== PicoSoC engine console ===\n");
     cmd_version();
+    eth_init();
     menu();
     print_("> ");
     for (;;) {
+        eth_handle();                 /* service one eth RX frame (weight upload) */
         int32_t c = reg_uart_data;
         if (c == -1) continue;
         char ch = (char)c;
@@ -140,6 +187,7 @@ void main(void)
             case 's': cmd_status();  break;
             case 'w': cmd_ddrwrite();break;
             case 'k': cmd_scan();    break;
+            case 'e': cmd_eth();     break;
             case 'r': cmd_restart(); break;
             case '?':
             case 'h': menu();        break;
