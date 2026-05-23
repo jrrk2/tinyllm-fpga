@@ -183,8 +183,18 @@ if {$_picosoc_engine} {
     exec python3 -E src/soc/bin2init.py $_fwbin > src/soc/progmem_init.svh
     puts "INFO: baked progmem_init.svh from $_fwbin"
     # Weight-beat ILA (default ON; WEIGHT_ILA=0 disables): captures the full
-    # 512-bit m_axi_rdata into the engine, triggered by restart_edge_ui.
-    set _wila [expr {![info exists ::env(WEIGHT_ILA)] || [string trim $::env(WEIGHT_ILA)] ne "0"}]
+    # 512-bit m_axi_rdata into the engine, triggered by restart_edge_ui.  Gate on
+    # the .xci EXISTING too, so the WEIGHT_ILA define, the read_ip, and the
+    # instance stay coherent: a missing IP degrades to "no ILA" with a warning
+    # rather than a read_ip error or an unresolved-module elaboration failure.
+    # (The Makefile builds it as part of $(ips) before this runs, so normally it
+    # exists.)
+    set _wxci "ip/microgpt_ila_weights/microgpt_ila_weights.srcs/sources_1/ip/microgpt_ila_weights/microgpt_ila_weights.xci"
+    set _wila_req [expr {![info exists ::env(WEIGHT_ILA)] || [string trim $::env(WEIGHT_ILA)] ne "0"}]
+    set _wila     [expr {$_wila_req && [file exists $_wxci]}]
+    if {$_wila_req && !$_wila} {
+        puts "WARNING: WEIGHT_ILA requested but $_wxci missing — building WITHOUT the weight ILA"
+    }
 
     set _d [get_property verilog_define [current_fileset]]
     lappend _d "PICOSOC_ENGINE" "PICORV32_REGS=picosoc_regs" "PROGMEM_HEX=\"$_fwmem\"" "PROGMEM_RAMB"
@@ -197,7 +207,7 @@ if {$_picosoc_engine} {
         read_ip { "ip/picosoc_ila/picosoc_ila.srcs/sources_1/ip/picosoc_ila/picosoc_ila.xci" }
     }
     if {$_wila && [llength [get_ips -quiet microgpt_ila_weights]] == 0} {
-        read_ip { "ip/microgpt_ila_weights/microgpt_ila_weights.srcs/sources_1/ip/microgpt_ila_weights/microgpt_ila_weights.xci" }
+        read_ip $_wxci
     }
 
     # UART console pins (usb_uart_tx/rx) come from the single shared

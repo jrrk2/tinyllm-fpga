@@ -59,7 +59,13 @@ ip-dir := ip
 # targets (program/oload/fw-swap) read the stable work/ copies, not the project.
 VPROJECT ?= microgpt_eth
 
+WEIGHT_ILA ?= 1        # weight-beat ILA (picosoc-engine); WEIGHT_ILA=0 omits it
 ips := gig_ethernet_pcs_pma_0.xci xlnx_mig_7_ddr3.xci microgpt_ila_core.xci microgpt_ila_axi.xci
+# Weight-beat ILA — in $(ips) so $(bit) builds it BEFORE run.tcl reads it
+# (race-free, same as the other IPs).
+ifneq ($(WEIGHT_ILA),0)
+ips += microgpt_ila_weights.xci
+endif
 ips := $(addprefix $(work-dir)/, $(ips))
 
 # ----------------------------------------------------------------------
@@ -416,13 +422,9 @@ $(picosoc-ila-xci): $(ip-dir)/picosoc_ila/tcl/run.tcl
 	@cd $(ip-dir)/picosoc_ila && $(MAKE) clean && $(MAKE)
 
 # microgpt_ila_weights IP — 512-bit weight-beat capture (m_axi_rdata into the
-# engine), ui_clk, triggered by restart_edge_ui.  Same committed-tcl pattern.
+# engine), ui_clk, triggered by restart_edge_ui.  Built via the $(ips) pattern
+# rule (added to $(ips) near the top so $(bit) depends on it — race-free).
 # Default ON; WEIGHT_ILA=0 builds without it.
-WEIGHT_ILA ?= 1
-weight-ila-xci := $(ip-dir)/microgpt_ila_weights/microgpt_ila_weights.srcs/sources_1/ip/microgpt_ila_weights/microgpt_ila_weights.xci
-$(weight-ila-xci): $(ip-dir)/microgpt_ila_weights/tcl/run.tcl
-	@echo "=== generating microgpt_ila_weights IP ==="
-	@cd $(ip-dir)/microgpt_ila_weights && $(MAKE) clean && $(MAKE)
 
 # Smoke firmware: minimal UART-only test, used by picosoc-engine-smoke below.
 $(SOC_DIR)/firmware_smoke.mem: $(SOC_DIR)/fw_smoke.c $(SOC_DIR)/start.s $(SOC_DIR)/soc.lds $(SOC_DIR)/bin2mem.py
@@ -454,9 +456,6 @@ picosoc-engine: export ENGINE_FW_MEM := $(abspath $(SOC_DIR)/$(ENGINE_FW).mem)
 picosoc-engine: export VPROJECT := picosoc_engine-$(BUILD_STAMP)
 ifneq ($(PICOSOC_ILA),0)
 picosoc-engine: $(picosoc-ila-xci)
-endif
-ifneq ($(WEIGHT_ILA),0)
-picosoc-engine: $(weight-ila-xci)
 endif
 picosoc-engine: $(SOC_DIR)/$(ENGINE_FW).mem $(bit)
 	@mkdir -p $(work-dir)
