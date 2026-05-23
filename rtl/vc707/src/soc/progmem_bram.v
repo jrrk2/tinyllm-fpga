@@ -16,7 +16,14 @@ module progmem (
     input  wire        valid,
     output wire        ready,
     input  wire [31:0] addr,
-    output wire [31:0] rdata
+    output wire [31:0] rdata,
+    // Port-B CPU store interface — self-modifying / ethernet-loaded overlays.
+    // The CPU writes instruction memory via the 0x50 window decoded in
+    // picosoc_noflash; we_b pulses one cycle per word, addr_b is the 1024-word
+    // index, data_b the word.  Same clock domain as the fetch port (no CDC).
+    input  wire        we_b,
+    input  wire [9:0]  addr_b,
+    input  wire [31:0] data_b
 );
     localparam MEM_ADDR_MASK = 32'h0010_0000; // progmem region select bit
 
@@ -50,8 +57,11 @@ module progmem (
         .DIADI       (32'b0),  .DIPADIP  (4'b0),  .WEA   (4'b0),
         .DOADO       (doa),    .DOPADOP  (),
         .REGCEAREGCE (1'b0),   .RSTRAMARSTRAM(1'b0), .RSTREGARSTREG(1'b0),
-        .CLKBWRCLK   (clk),    .ENBWREN  (1'b0),
-        .ADDRBWRADDR (16'b0),  .DIBDI    (32'b0), .DIPBDIP(4'b0), .WEBWE(8'b0),
+        .CLKBWRCLK   (clk),    .ENBWREN  (we_b),
+        // Port B = CPU store port: word index addr_b at ADDRBWRADDR[14:5], all
+        // 4 byte lanes enabled (WEBWE[3:0]) when we_b.  WRITE_FIRST (set above).
+        .ADDRBWRADDR ({1'b0, addr_b, 5'b0}),  .DIBDI(data_b), .DIPBDIP(4'b0),
+        .WEBWE       (we_b ? 8'h0F : 8'h00),
         .DOBDO       (),       .DOPBDOP  (),
         .REGCEB      (1'b0),   .RSTRAMB  (1'b0),  .RSTREGB(1'b0),
         .CASCADEINA  (1'b0),   .CASCADEINB(1'b0), .CASCADEOUTA(), .CASCADEOUTB(),
@@ -65,6 +75,8 @@ module progmem (
 `ifdef PROGMEM_HEX
     initial $readmemh(`PROGMEM_HEX, mem);
 `endif
+    always @(posedge clk)
+        if (we_b) mem[addr_b] <= data_b;      // port-B CPU store (overlays)
     reg [31:0] rdata_r;
     always @(posedge clk)
         rdata_r <= mem[addr[11:2]];

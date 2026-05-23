@@ -525,30 +525,6 @@ module vc707_microgpt_eth (
       dbg_stage_sel_reg <= jtag_master_writedata[4:0];
   end
 
-  // Idle DDR3 scan-CRC control (drives idle_scan_crc in ui_clk).  The SoC sets
-  // the region, then pulses trig; the scanner streams [base, base+len*64) and
-  // rolling-hashes the RAW 512-bit beats (host-computable; verifies an upload
-  // round-trips).  Distinct from 0x04A (the engine's run hash over the unpacked
-  // weight bus).  0x080 base byte addr (64B aligned), 0x081 len in 512b beats,
-  // 0x082 bit0 -> start; status read 0x083, crc read 0x084.
-  reg [29:0] scan_base_eth;
-  reg [31:0] scan_len_eth;
-  reg        scan_trig_tog_eth;
-  always @(posedge eth_clk) begin
-    if (rst_sys) begin
-      scan_base_eth     <= 30'd0;
-      scan_len_eth      <= 32'd0;
-      scan_trig_tog_eth <= 1'b0;
-    end else begin
-      if (jtag_master_write && jtag_word_addr == R_SCAN_BASE)
-        scan_base_eth <= jtag_master_writedata[29:0];
-      if (jtag_master_write && jtag_word_addr == R_SCAN_LEN)
-        scan_len_eth  <= jtag_master_writedata;
-      if (jtag_master_write && jtag_word_addr == R_SCAN_TRIG && jtag_master_writedata[0])
-        scan_trig_tog_eth <= ~scan_trig_tog_eth;
-    end
-  end
-
   // Eth-side shadow regs for runtime factor-override CDC.  Reset + write
   // logic both live in the main jtag_master_write always block below; the
   // declaration here keeps the signal visible across the file.
@@ -1278,25 +1254,26 @@ module vc707_microgpt_eth (
     // AXI master to MIG (ui_clk domain).
     .clk_axi      ( ui_clk            ),
     .rst_axi      ( ui_clk_sync_rst   ),
-    // Read channel goes via the top-level 2:1 mux (ws_* = weight reader side;
-    // the idle scan-CRC master shares the MIG read port when the engine's idle).
-    .m_axi_arvalid( ws_arvalid     ),
-    .m_axi_arready( ws_arready     ),
-    .m_axi_arid   ( ws_arid        ),
-    .m_axi_araddr ( ws_araddr      ),
-    .m_axi_arlen  ( ws_arlen       ),
-    .m_axi_arsize ( ws_arsize      ),
-    .m_axi_arburst( ws_arburst     ),
-    .m_axi_arlock ( ws_arlock      ),
-    .m_axi_arcache( ws_arcache     ),
-    .m_axi_arprot ( ws_arprot      ),
-    .m_axi_arqos  ( ws_arqos       ),
-    .m_axi_rvalid ( ws_rvalid      ),
-    .m_axi_rready ( ws_rready      ),
-    .m_axi_rid    ( ws_rid         ),
-    .m_axi_rdata  ( ws_rdata       ),
-    .m_axi_rresp  ( ws_rresp       ),
-    .m_axi_rlast  ( ws_rlast       ),
+    // Read channel connects directly to the MIG (the scan-CRC AR/R mux was
+    // removed: it added a long route into g_stream.beat_buf and broke clk_pll_i
+    // timing closure -> non-deterministic weight beats).
+    .m_axi_arvalid( m_axi_arvalid     ),
+    .m_axi_arready( m_axi_arready     ),
+    .m_axi_arid   ( m_axi_arid        ),
+    .m_axi_araddr ( m_axi_araddr      ),
+    .m_axi_arlen  ( m_axi_arlen       ),
+    .m_axi_arsize ( m_axi_arsize      ),
+    .m_axi_arburst( m_axi_arburst     ),
+    .m_axi_arlock ( m_axi_arlock      ),
+    .m_axi_arcache( m_axi_arcache     ),
+    .m_axi_arprot ( m_axi_arprot      ),
+    .m_axi_arqos  ( m_axi_arqos       ),
+    .m_axi_rvalid ( m_axi_rvalid      ),
+    .m_axi_rready ( m_axi_rready      ),
+    .m_axi_rid    ( m_axi_rid         ),
+    .m_axi_rdata  ( m_axi_rdata       ),
+    .m_axi_rresp  ( m_axi_rresp       ),
+    .m_axi_rlast  ( m_axi_rlast       ),
     .wr_kind      ( bram_kind_eth      ),
     .wr_addr      ( bram_port_addr_eth ),
     .wr_data      ( bram_data_eth      ),
@@ -1381,94 +1358,6 @@ module vc707_microgpt_eth (
     bfp_r_cnt_eth       <= bfp_r_cnt_ui;
     bfp_last_araddr_eth <= bfp_last_araddr_ui;
   end
-
-  // ======================================================================
-  //  Idle DDR3 scan-CRC master (ui_clk).  Verifies an upload by streaming a
-  //  region and rolling-hashing the RAW beats — without running inference.
-  //  Shares the MIG read channel with the weight reader via a 2:1 mux gated
-  //  by its own busy flag; the SoC only triggers it when the engine is idle,
-  //  so there is no real contention.  Controlled via regmap 0x080-0x084.
-  // ----------------------------------------------------------------------
-  // Weight-reader read channel (renamed off i_lay_st by the rename above).
-  wire        ws_arvalid, ws_arready, ws_arlock, ws_rvalid, ws_rready, ws_rlast;
-  wire [4:0]  ws_arid, ws_rid;
-  wire [29:0] ws_araddr;
-  wire [7:0]  ws_arlen;
-  wire [2:0]  ws_arsize, ws_arprot;
-  wire [1:0]  ws_arburst, ws_rresp;
-  wire [3:0]  ws_arcache, ws_arqos;
-  wire [511:0]ws_rdata;
-  // Scan-CRC read channel.
-  wire        sc_arvalid, sc_arready, sc_arlock, sc_rvalid, sc_rready, sc_rlast;
-  wire [4:0]  sc_arid, sc_rid;
-  wire [29:0] sc_araddr;
-  wire [7:0]  sc_arlen;
-  wire [2:0]  sc_arsize, sc_arprot;
-  wire [1:0]  sc_arburst, sc_rresp;
-  wire [3:0]  sc_arcache, sc_arqos;
-  wire [511:0]sc_rdata;
-
-  // CDC: scan control eth_clk -> ui_clk (base/len are static at trig time; the
-  // trig toggle is edge-detected into a 1-cycle ui_clk pulse).
-  (* ASYNC_REG = "TRUE" *) reg [29:0] scan_base_s0, scan_base_ui;
-  (* ASYNC_REG = "TRUE" *) reg [31:0] scan_len_s0,  scan_len_ui;
-  (* ASYNC_REG = "TRUE" *) reg [2:0]  scan_trig_sync_ui;
-  always_ff @(posedge ui_clk) begin
-    scan_base_s0 <= scan_base_eth; scan_base_ui <= scan_base_s0;
-    scan_len_s0  <= scan_len_eth;  scan_len_ui  <= scan_len_s0;
-    scan_trig_sync_ui <= {scan_trig_sync_ui[1:0], scan_trig_tog_eth};
-  end
-  wire scan_trig_pulse_ui = scan_trig_sync_ui[2] ^ scan_trig_sync_ui[1];
-
-  wire        scan_busy_ui, scan_done_ui;
-  wire [31:0] scan_crc_ui;
-
-  idle_scan_crc #(.AXI_ADDR_WIDTH(30), .AXI_DATA_WIDTH(512), .AXI_ID_WIDTH(5)) i_scan_crc (
-    .clk(ui_clk), .rst(ui_clk_sync_rst),
-    .base(scan_base_ui), .len(scan_len_ui), .trig(scan_trig_pulse_ui),
-    .busy(scan_busy_ui), .done(scan_done_ui), .crc(scan_crc_ui),
-    .m_axi_arvalid(sc_arvalid), .m_axi_arready(sc_arready), .m_axi_arid(sc_arid),
-    .m_axi_araddr(sc_araddr), .m_axi_arlen(sc_arlen), .m_axi_arsize(sc_arsize),
-    .m_axi_arburst(sc_arburst), .m_axi_arlock(sc_arlock), .m_axi_arcache(sc_arcache),
-    .m_axi_arprot(sc_arprot), .m_axi_arqos(sc_arqos),
-    .m_axi_rvalid(sc_rvalid), .m_axi_rready(sc_rready), .m_axi_rid(sc_rid),
-    .m_axi_rdata(sc_rdata), .m_axi_rresp(sc_rresp), .m_axi_rlast(sc_rlast)
-  );
-
-  // 2:1 read-channel mux (sel = scan busy).  AR + rready come from the active
-  // master; the MIG's arready/R fan out to whichever master holds the bus.
-  assign m_axi_arvalid = scan_busy_ui ? sc_arvalid : ws_arvalid;
-  assign m_axi_arid    = scan_busy_ui ? sc_arid    : ws_arid;
-  assign m_axi_araddr  = scan_busy_ui ? sc_araddr  : ws_araddr;
-  assign m_axi_arlen   = scan_busy_ui ? sc_arlen   : ws_arlen;
-  assign m_axi_arsize  = scan_busy_ui ? sc_arsize  : ws_arsize;
-  assign m_axi_arburst = scan_busy_ui ? sc_arburst : ws_arburst;
-  assign m_axi_arlock  = scan_busy_ui ? sc_arlock  : ws_arlock;
-  assign m_axi_arcache = scan_busy_ui ? sc_arcache : ws_arcache;
-  assign m_axi_arprot  = scan_busy_ui ? sc_arprot  : ws_arprot;
-  assign m_axi_arqos   = scan_busy_ui ? sc_arqos   : ws_arqos;
-  assign m_axi_rready  = scan_busy_ui ? sc_rready  : ws_rready;
-  assign ws_arready = scan_busy_ui ? 1'b0 : m_axi_arready;
-  assign sc_arready = scan_busy_ui ? m_axi_arready : 1'b0;
-  assign ws_rvalid  = scan_busy_ui ? 1'b0 : m_axi_rvalid;
-  assign sc_rvalid  = scan_busy_ui ? m_axi_rvalid : 1'b0;
-  assign ws_rid   = m_axi_rid;    assign sc_rid   = m_axi_rid;
-  assign ws_rdata = m_axi_rdata;  assign sc_rdata = m_axi_rdata;
-  assign ws_rresp = m_axi_rresp;  assign sc_rresp = m_axi_rresp;
-  assign ws_rlast = m_axi_rlast;  assign sc_rlast = m_axi_rlast;
-
-  // CDC: scan status ui_clk -> eth_clk for the regmap reads (crc is quasi-static
-  // once done, so a plain 2FF resample is safe).
-  (* ASYNC_REG = "TRUE" *) reg [1:0]  scan_busy_sync, scan_done_sync;
-  (* ASYNC_REG = "TRUE" *) reg [31:0] scan_crc_s0, scan_crc_eth;
-  always_ff @(posedge eth_clk) begin
-    scan_busy_sync <= {scan_busy_sync[0], scan_busy_ui};
-    scan_done_sync <= {scan_done_sync[0], scan_done_ui};
-    scan_crc_s0    <= scan_crc_ui;
-    scan_crc_eth   <= scan_crc_s0;
-  end
-  wire scan_busy_eth = scan_busy_sync[1];
-  wire scan_done_eth = scan_done_sync[1];
 
   wire         ddr_wr_req_eth;
   wire [29:0]  ddr_wr_addr_eth;
@@ -2063,8 +1952,6 @@ module vc707_microgpt_eth (
       R_AXI_AR_CNT: read_data_comb = bfp_ar_cnt_eth;
       R_AXI_R_CNT:  read_data_comb = bfp_r_cnt_eth;
       R_AXI_ARADDR: read_data_comb = {2'd0, bfp_last_araddr_eth};
-      R_SCAN_STAT:  read_data_comb = {30'd0, scan_done_eth, scan_busy_eth};
-      R_SCAN_CRC:   read_data_comb = scan_crc_eth;
 
       // 0x00D: core_clk-domain FSM observation (single-cycle snapshot)
       10'h00D: read_data_comb = {
@@ -2204,6 +2091,26 @@ module vc707_microgpt_eth (
     .probe7 ( ila_start_load_axi   ),  // 1
     .probe8 ( ila_tile_idx         ),  // 2
     .probe9 ( ila_beat_idx         )   // 7
+  );
+`endif
+
+`ifdef WEIGHT_ILA
+  // ================================================================
+  //  ILA-WEIGHTS — full 512-bit weight beat as the MIG delivers it into
+  //  the engine (i_lay_st/i_emb g_stream.beat_buf), ui_clk (200 MHz),
+  //  2048 samples.  Trigger on probe5 (restart_edge_ui) rising to frame
+  //  one inference run's weight stream from the top.  This is the exact
+  //  net whose timing the scan-CRC mux had broken; capture it raw to
+  //  confirm clean weight delivery on the rebuilt (timing-closed) bit.
+  // ================================================================
+  microgpt_ila_weights i_ila_weights (
+    .clk    ( ui_clk          ),
+    .probe0 ( m_axi_rdata     ),  // 512  weight beat into the engine
+    .probe1 ( m_axi_rvalid    ),  // 1
+    .probe2 ( m_axi_rready    ),  // 1
+    .probe3 ( m_axi_rlast     ),  // 1
+    .probe4 ( m_axi_araddr    ),  // 30   weight region address
+    .probe5 ( restart_edge_ui )   // 1    engine restart pulse (TRIGGER)
   );
 `endif
 

@@ -415,6 +415,15 @@ $(picosoc-ila-xci): $(ip-dir)/picosoc_ila/tcl/run.tcl
 	@echo "=== generating picosoc_ila IP ==="
 	@cd $(ip-dir)/picosoc_ila && $(MAKE) clean && $(MAKE)
 
+# microgpt_ila_weights IP — 512-bit weight-beat capture (m_axi_rdata into the
+# engine), ui_clk, triggered by restart_edge_ui.  Same committed-tcl pattern.
+# Default ON; WEIGHT_ILA=0 builds without it.
+WEIGHT_ILA ?= 1
+weight-ila-xci := $(ip-dir)/microgpt_ila_weights/microgpt_ila_weights.srcs/sources_1/ip/microgpt_ila_weights/microgpt_ila_weights.xci
+$(weight-ila-xci): $(ip-dir)/microgpt_ila_weights/tcl/run.tcl
+	@echo "=== generating microgpt_ila_weights IP ==="
+	@cd $(ip-dir)/microgpt_ila_weights && $(MAKE) clean && $(MAKE)
+
 # Smoke firmware: minimal UART-only test, used by picosoc-engine-smoke below.
 $(SOC_DIR)/firmware_smoke.mem: $(SOC_DIR)/fw_smoke.c $(SOC_DIR)/start.s $(SOC_DIR)/soc.lds $(SOC_DIR)/bin2mem.py
 	$(RISCV_CROSS)gcc -Os -march=rv32im -mabi=ilp32 -ffreestanding -nostdlib -nostartfiles \
@@ -440,16 +449,20 @@ ENGINE_FW ?= firmware_engine
 .PHONY: picosoc-engine
 picosoc-engine: export PICOSOC_ENGINE := 1
 picosoc-engine: export PICOSOC_ILA := $(PICOSOC_ILA)
+picosoc-engine: export WEIGHT_ILA := $(WEIGHT_ILA)
 picosoc-engine: export ENGINE_FW_MEM := $(abspath $(SOC_DIR)/$(ENGINE_FW).mem)
 picosoc-engine: export VPROJECT := picosoc_engine-$(BUILD_STAMP)
 ifneq ($(PICOSOC_ILA),0)
 picosoc-engine: $(picosoc-ila-xci)
 endif
+ifneq ($(WEIGHT_ILA),0)
+picosoc-engine: $(weight-ila-xci)
+endif
 picosoc-engine: $(SOC_DIR)/$(ENGINE_FW).mem $(bit)
 	@mkdir -p $(work-dir)
 	@cp $(VPROJECT).runs/impl_1/vc707_microgpt_eth.bit ./$(work-dir)/ 2>/dev/null || true
 	@cp $(VPROJECT).runs/impl_1/vc707_microgpt_eth_routed.dcp ./$(work-dir)/ 2>/dev/null || true
-	@echo "=== picosoc-engine built: $(ENGINE_FW), ILA=$(PICOSOC_ILA), progmem=RAMB16, proj=$(VPROJECT) -> $(work-dir)/ ==="
+	@echo "=== picosoc-engine built: $(ENGINE_FW), ILA=$(PICOSOC_ILA), weight_ila=$(WEIGHT_ILA), progmem=RAMB16, proj=$(VPROJECT) -> $(work-dir)/ ==="
 
 # Smoke build: wipe + rebuild with the minimal Hello/echo firmware AND the ILA,
 # so we get a clean proof-of-life and on-chip visibility in one bitstream.

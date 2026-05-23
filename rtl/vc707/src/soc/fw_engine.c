@@ -1,9 +1,11 @@
 /* fw_engine.c — PicoSoC + real-engine console + weight uploader.
  * Channels: UART menu (debug) on 0x02; engine regmap via the Avalon bridge
- * (iomem 0x10) + status snapshot (0x40); DDR3 write window (0x30/0x31); idle
- * scan-CRC (regmap 0x080-0x084); and the ethernet MAC over the LSU window (0x20).
- * Stage 2: the firmware parses bfp_client's UDP frames (FT_DDR_WRITE -> DDR3) in
- * the main loop, replacing the old microgpt_eth_ctrl HW FSM. */
+ * (iomem 0x10) + status snapshot (0x40); DDR3 write window (0x30/0x31); the
+ * progmem self-write window (0x50, port B) for ethernet-loaded overlays; and the
+ * ethernet MAC over the LSU window (0x20).
+ * Stage 2: the firmware parses bfp_client's UDP frames in the main loop
+ * (FT_DDR_WRITE -> DDR3; FT_PROG_WRITE/EXEC -> self-modifying overlays),
+ * replacing the old microgpt_eth_ctrl HW FSM. */
 #include <stdint.h>
 
 #define reg_uart_clkdiv (*(volatile uint32_t *)0x02000004)
@@ -25,9 +27,17 @@
 #define DDR_DATA (*(volatile uint32_t *)0x30000000u)
 #define DDR_ADDR (*(volatile uint32_t *)0x31000000u)
 #define DDR_TEST_BEATS 16u                /* test pattern size (16*64 = 1 KiB) */
-/* word(i) = i * MUL with an ODD multiplier, so the 16 words of a 64-byte beat
- * don't XOR-cancel (16 *consecutive* ints fold to 0 — a useless test).  This
- * makes each beat's fold non-zero so the rolling scan-CRC actually moves. */
+
+/* progmem self-write window (port B): a store to PROGW(word) writes instruction
+ * memory word `word` (0..1023) via progmem's second BRAM port — same clock as
+ * the fetch port, so the write is visible to the next fetch.  PROG_BASE is the
+ * matching fetch address the CPU runs from, so an overlay loaded at word W is
+ * entered at PROG_BASE + W*4.  This is the self-modifying / eth-loaded-overlay
+ * path: receive code over UDP, store it here, then jump/call it. */
+#define PROGW(word) (*(volatile uint32_t *)(0x50000000u + ((uint32_t)(word) << 2)))
+#define PROG_BASE   0x00100000u
+/* word(i) = i * MUL with an ODD multiplier for the 'w' DDR write test pattern,
+ * so consecutive words are non-trivial (host can recompute + verify the region). */
 #define DDR_TEST_MUL   0x9E3779B1u
 
 /* Ethernet MAC over the LSU window (iomem 0x20 + lsu_byte_addr).  Each 32-bit
@@ -49,6 +59,8 @@
 #define FT_REG_READ  0x02u
 #define FT_REG_RSP   0x03u
 #define FT_ACK       0x06u
+#define FT_PROG_WRITE 0x0Bu /* {dest_word(16b), nwords(8b)} + code words -> progmem port B */
+#define FT_PROG_EXEC  0x0Cu /* {entry_word(16b)} -> call PROG_BASE+entry*4, ACK with retval */
 #define FPGA_UDP_PORT 19783u  /* 0x4D47 "MG" — only frames to this port are handled */
 #define ETYPE_ARP 0x0806u
 #define ETYPE_IP  0x0800u
@@ -81,7 +93,7 @@ static void hex_(uint32_t v, int nyb) {
 
 static void menu(void) {
     print_("\nfw_engine " __DATE__ " " __TIME__ "\n");
-    print_("v ver  c crc  s status  w ddrwr  k scancrc  e eth  r restart  ? menu\n");
+    print_("v ver  c crc  s status  w ddrwr  e eth  r restart  ? menu\n");
 }
 
 static void cmd_version(void) {
@@ -113,19 +125,6 @@ static void cmd_restart(void) {
     print_("restart pulsed (0x1F1)\n");
 }
 
-/* Roll the same hash the idle scanner computes in HW (idle_scan_crc.sv):
- * crc=0xFFFFFFFF; per 64-byte beat fold = XOR of its 16 words; crc=rotl(crc,1)^fold. */
-static uint32_t scan_ref(uint32_t nbeats) {
-    uint32_t crc = 0xFFFFFFFFu, gi = 0;
-    for (uint32_t b = 0; b < nbeats; b++) {
-        uint32_t fold = 0;
-        for (uint32_t w = 0; w < 16; w++) { fold ^= gi * DDR_TEST_MUL; gi++; }
-        crc = (crc << 1) | (crc >> 31);
-        crc ^= fold;
-    }
-    return crc;
-}
-
 /* 'w': stream a known word(i)=i*MUL pattern into DDR3 via the bridge window. */
 static void cmd_ddrwrite(void) {
     print_("ddr write "); hex_(DDR_TEST_BEATS, 2); print_(" beats @0...");
@@ -134,21 +133,6 @@ static void cmd_ddrwrite(void) {
     for (uint32_t b = 0; b < DDR_TEST_BEATS; b++)
         for (uint32_t w = 0; w < 16; w++) DDR_DATA = gi++ * DDR_TEST_MUL;
     print_("done\n");
-}
-
-/* 'k': trigger the idle scan-CRC over the written region, compare to the C ref. */
-static void cmd_scan(void) {
-    print_("scan-CRC ");
-    REG(R_SCAN_BASE) = 0;
-    REG(R_SCAN_LEN)  = DDR_TEST_BEATS;
-    REG(R_SCAN_TRIG) = 1;
-    uint32_t to = 4000000u;
-    while (!(REG(R_SCAN_STAT) & 2) && --to) { }    /* bit1 = done */
-    if (!to) { print_("TIMEOUT (scanner not responding)\n"); return; }
-    uint32_t hw  = REG(R_SCAN_CRC);
-    uint32_t ref = scan_ref(DDR_TEST_BEATS);
-    print_("hw="); hex_(hw, 8); print_(" ref="); hex_(ref, 8);
-    print_(hw == ref ? "  PASS\n" : "  FAIL\n");
 }
 
 static uint8_t  ethf[256];        /* reply-frame scratch (headers + payload) */
@@ -320,6 +304,31 @@ static void eth_handle(void) {
                     ethf[50+i*4] = v; ethf[51+i*4] = v>>8; ethf[52+i*4] = v>>16; ethf[53+i*4] = v>>24;
                 }
                 eth_reply(8 + nwords * 4);
+            } else if (ft == FT_PROG_WRITE) {
+                /* {dest_word(16b), nwords(8b)} @ bytes 44-46, then code words from
+                 * byte 48 — store each into progmem via the port-B 0x50 window. */
+                uint32_t w5h    = ETH(ETH_RX(b, 5) + 4);
+                uint16_t dest   = w5h & 0xFFFF;
+                uint8_t  nwords = (w5h >> 16) & 0xFF;
+                if (nwords > 16) nwords = 16;          /* 16 words (64 B) per frame */
+                for (uint32_t j = 0; j < nwords; j++) {
+                    uint32_t v = (j & 1) ? ETH(ETH_RX(b, 6 + (j >> 1)) + 4)
+                                         : ETH(ETH_RX(b, 6 + (j >> 1)));
+                    PROGW(dest + j) = v;               /* self-modify: write code word */
+                }
+                eth_rx_bytes(b, ethf, 48);
+                ethf[42] = FT_ACK; ethf[43] = seq;
+                eth_reply(2);
+            } else if (ft == FT_PROG_EXEC) {
+                /* {entry_word(16b)} @ bytes 44-45 — call the loaded overlay as a
+                 * leaf function and return its 32-bit result in the ACK. */
+                uint16_t entry = ETH(ETH_RX(b, 5) + 4) & 0xFFFF;
+                eth_rx_bytes(b, ethf, 48);             /* capture reply headers first */
+                uint32_t (*fn)(void) = (uint32_t (*)(void))(PROG_BASE + ((uint32_t)entry << 2));
+                uint32_t r = fn();
+                ethf[42] = FT_ACK; ethf[43] = seq;
+                ethf[44] = r; ethf[45] = r >> 8; ethf[46] = r >> 16; ethf[47] = r >> 24;
+                eth_reply(6);
             }
         }
     }
@@ -351,7 +360,6 @@ void main(void)
             case 'c': cmd_crc();     break;
             case 's': cmd_status();  break;
             case 'w': cmd_ddrwrite();break;
-            case 'k': cmd_scan();    break;
             case 'e': cmd_eth();     break;
             case 'r': cmd_restart(); break;
             case '?':

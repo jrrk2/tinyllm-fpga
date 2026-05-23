@@ -102,6 +102,7 @@ module picosoc_eth_bridge (
   // "echo + '>' only" symptom).  The shell never had this because its decode only
   // acks 0x03/0x10/0x20/0x30/0x31, never 0x02.
   wire sel_internal = (iomem_addr[31:24] == 8'h02);   // spimemio/UART — leave to internal back-pressure
+  wire sel_prog     = (iomem_addr[31:24] == 8'h50);   // progmem self-write — owned by picosoc_noflash (port B)
 
   // ---- SoC -> DDR3 write window ----------------------------------------
   // The engine's weight store lives in DDR3.  This lean build had no upload
@@ -164,7 +165,7 @@ module picosoc_eth_bridge (
       // the UART's own back-pressure), the DDR write window (0x30/0x31), and the
       // eth window (0x20) — all handled by their own FSMs below.
       if (iomem_valid && !iomem_ready && !sel_reg && !sel_hb && !sel_internal
-          && !sel_ddrd && !sel_ddra && !sel_eth) begin
+          && !sel_ddrd && !sel_ddra && !sel_eth && !sel_prog) begin
         iomem_ready <= 1'b1;
         iomem_rdata <= 32'h0;
       end

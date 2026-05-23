@@ -99,9 +99,21 @@ module picosoc_noflash (
 	wire [31:0] simpleuart_reg_dat_do;
 	wire        simpleuart_reg_dat_wait;
 
-	assign mem_ready = 
+	// ---- progmem self-write window (0x50): the CPU writes its own instruction
+	// memory via progmem port B (self-modifying / ethernet-loaded overlays).  A
+	// store to 0x50000000 + (word<<2) writes progmem word `word`.  0x50 also
+	// appears on the iomem bus (addr[31:24] > 0x01), but the eth bridge excludes
+	// it from its catch-all so this internal decode is the sole owner.  Single-
+	// cycle ack; the BRAM port-B write lands on the same edge the CPU completes.
+	wire        prog_wr_sel = mem_valid && (mem_addr[31:24] == 8'h50);
+	wire        prog_we_b   = prog_wr_sel && (|mem_wstrb);
+	wire [9:0]  prog_addr_b = mem_addr[11:2];
+	wire [31:0] prog_data_b = mem_wdata;
+
+	assign mem_ready =
             (iomem_valid && iomem_ready) || progmem_ready || ram_ready || spimemio_cfgreg_sel ||
-			simpleuart_reg_div_sel || (simpleuart_reg_dat_sel && !simpleuart_reg_dat_wait);
+			simpleuart_reg_div_sel || (simpleuart_reg_dat_sel && !simpleuart_reg_dat_wait) ||
+			prog_wr_sel;
 
 	assign mem_rdata = 
             (iomem_valid && iomem_ready) ? iomem_rdata :
@@ -151,7 +163,10 @@ module picosoc_noflash (
         .valid  (mem_valid && mem_addr >= 4*MEM_WORDS && mem_addr < 32'h 0200_0000),
         .ready  (progmem_ready),
         .addr   (mem_addr),
-        .rdata  (progmem_rdata)
+        .rdata  (progmem_rdata),
+        .we_b   (prog_we_b),
+        .addr_b (prog_addr_b),
+        .data_b (prog_data_b)
     );
 
 	simpleuart simpleuart (

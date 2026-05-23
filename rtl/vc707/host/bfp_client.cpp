@@ -63,12 +63,14 @@ constexpr uint16_t    DEFAULT_PEER_PORT = 19783;
 // for where this gets baked into the wire.
 constexpr const char* FPGA_MAC = "02:00:00:4d:47:31";
 
-constexpr uint8_t FT_REG_WRITE = 0x01;
-constexpr uint8_t FT_REG_READ  = 0x02;
-constexpr uint8_t FT_REG_RSP   = 0x03;
-constexpr uint8_t FT_HEARTBEAT = 0x04;
-constexpr uint8_t FT_ACK       = 0x06;
-constexpr uint8_t FT_DDR_WRITE = 0x0A;
+constexpr uint8_t FT_REG_WRITE  = 0x01;
+constexpr uint8_t FT_REG_READ   = 0x02;
+constexpr uint8_t FT_REG_RSP    = 0x03;
+constexpr uint8_t FT_HEARTBEAT  = 0x04;
+constexpr uint8_t FT_ACK        = 0x06;
+constexpr uint8_t FT_DDR_WRITE  = 0x0A;
+constexpr uint8_t FT_PROG_WRITE = 0x0B;   // {dest_word(16b), nwords(8b)} + code -> progmem port B
+constexpr uint8_t FT_PROG_EXEC  = 0x0C;   // {entry_word(16b)} -> call PROG_BASE+entry*4, ACK retval
 
 // Register addresses (10-bit, see vc707_microgpt_eth.sv ~line 1500).
 constexpr uint16_t REG_DDR_LOAD_TOG  = 0x010;   // bit 0 toggles DDR-write swap (legacy)
@@ -88,13 +90,6 @@ constexpr uint16_t REG_BRAM_DATA     = 0x061;   // write: {16'd0, data[15:0]} �
 constexpr uint16_t REG_BRAM_READ     = 0x062;   // read: {16'd0, BRAM[kind, addr]} — port-A readback
 constexpr uint16_t REG_N_PROMPT      = 0x063;   // r/w: active prompt length (1..NPROMPT_MAX)
 constexpr uint16_t REG_BUILD_VERSION = 0x10F;
-// idle_scan_crc engine (PicoSoC stage 3): hash a raw DDR3 region to verify an
-// upload independent of the engine/ROMs.
-constexpr uint16_t REG_SCAN_BASE = 0x080;   // byte addr (64B aligned)
-constexpr uint16_t REG_SCAN_LEN  = 0x081;   // length in 512-bit beats
-constexpr uint16_t REG_SCAN_TRIG = 0x082;   // bit0: start
-constexpr uint16_t REG_SCAN_STAT = 0x083;   // [0]=busy [1]=done
-constexpr uint16_t REG_SCAN_CRC  = 0x084;   // result
 constexpr uint16_t REG_RESULT        = 0x1D0;
 constexpr uint16_t REG_DONE          = 0x1F0;   // {30'd0, lay_done_latched, lay_done}
 constexpr uint16_t REG_RESTART       = 0x1F1;   // bit 0: write 1 to pulse restart
@@ -1237,32 +1232,76 @@ static bool send_reg_write_acked(Udp& u, uint8_t seq, const std::vector<RegW>& b
     return false;
 }
 
-// Rolling hash matching idle_scan_crc.sv: crc=0xFFFFFFFF; per 64-byte beat,
-// fold = XOR of its sixteen LE u32 words; crc = rotl(crc,1) ^ fold.
-static uint32_t host_scan_crc(const uint8_t* d, size_t nbeats) {
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t b = 0; b < nbeats; ++b) {
-        uint32_t fold = 0;
-        for (int w = 0; w < 16; ++w) {
-            uint32_t v; std::memcpy(&v, d + b * 64 + 4 * w, 4); fold ^= v;
+// ---------------------------------------------------------------------
+// Self-modifying overlay loader (progmem port-B window, FT_PROG_*).  All
+// over plain UDP — no privileges — so this whole push/exec loop is sudo-free.
+// progload streams an rv32im raw binary into progmem words [dest..], 16
+// words (64 B) per frame, ack-gated; progexec calls an entry word and returns
+// the firmware's 32-bit result.  The firmware writes progmem via the 0x50
+// port-B window (picosoc_noflash), so this never touches a privileged socket.
+// ---------------------------------------------------------------------
+constexpr int PROG_WORDS_PER_FRAME = 16;     // 64 B payload, matches the firmware cap
+constexpr int PROG_TOTAL_WORDS     = 1024;   // progmem depth (RAMB36E1, 1024 x 32)
+
+// Stream `words` (LE u32) into progmem starting at word `dest`, ack-gated.
+static bool prog_write(Udp& u, uint16_t dest,
+                       const std::vector<uint32_t>& words, uint8_t& seq) {
+    for (size_t off = 0; off < words.size(); off += PROG_WORDS_PER_FRAME) {
+        size_t   n = std::min<size_t>(PROG_WORDS_PER_FRAME, words.size() - off);
+        uint16_t d = static_cast<uint16_t>(dest + off);
+        uint8_t  tx[6 + PROG_WORDS_PER_FRAME * 4];
+        tx[0] = FT_PROG_WRITE; tx[1] = seq;
+        tx[2] = d & 0xff; tx[3] = (d >> 8) & 0xff;
+        tx[4] = static_cast<uint8_t>(n); tx[5] = 0;
+        for (size_t j = 0; j < n; ++j) std::memcpy(tx + 6 + j * 4, &words[off + j], 4);
+        bool acked = false;
+        for (int attempt = 0; attempt < 8 && !acked; ++attempt) {
+            u.send(tx, 6 + n * 4);
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+            while (std::chrono::steady_clock::now() < deadline) {
+                uint8_t rx[2048]; size_t rn = 0;
+                if (!u.recv(rx, sizeof(rx), &rn)) break;
+                if (rn >= 2 && rx[0] == FT_ACK && rx[1] == seq) { acked = true; break; }
+            }
         }
-        crc = (crc << 1) | (crc >> 31);
-        crc ^= fold;
+        if (!acked) {
+            std::fprintf(stderr, "prog_write: no ACK at word %u\n", (unsigned)(dest + off));
+            return false;
+        }
+        ++seq;
     }
-    return crc;
+    return true;
 }
 
-// Drive the FPGA's idle_scan_crc over [base, base+len*64) and return its CRC.
-static uint32_t ddr_scan_crc(Udp& u, uint32_t base, uint32_t len_beats, uint8_t& seq) {
-    std::vector<RegW> setup = {{REG_SCAN_BASE, base},
-                               {REG_SCAN_LEN,  len_beats},
-                               {REG_SCAN_TRIG, 1}};       // base,len,trig in order
-    send_reg_write_acked(u, seq++, setup);
-    for (int i = 0; i < 1000000; ++i) {                   // poll done (bit1)
-        auto st = reg_read(u, REG_SCAN_STAT, 1, seq++);
-        if (!st.empty() && (st[0] & 2)) break;
+// Call the overlay at progmem word `entry`; its 32-bit return comes back in the ACK.
+static bool prog_exec(Udp& u, uint16_t entry, uint32_t& result, uint8_t& seq) {
+    uint8_t tx[8] = {FT_PROG_EXEC, seq,
+                     static_cast<uint8_t>(entry & 0xff),
+                     static_cast<uint8_t>((entry >> 8) & 0xff), 0, 0, 0, 0};
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        u.send(tx, sizeof(tx));
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            uint8_t rx[2048]; size_t rn = 0;
+            if (!u.recv(rx, sizeof(rx), &rn)) break;
+            if (rn >= 6 && rx[0] == FT_ACK && rx[1] == seq) {
+                std::memcpy(&result, rx + 2, 4);
+                ++seq; return true;
+            }
+        }
     }
-    return reg_read(u, REG_SCAN_CRC, 1, seq++)[0];
+    return false;
+}
+
+// Read a raw (objcopy -O binary) rv32im image as LE u32 words, zero-padding the tail.
+static std::vector<uint32_t> load_bin_words(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open " + path);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
+                                std::istreambuf_iterator<char>());
+    std::vector<uint32_t> words((bytes.size() + 3) / 4, 0u);
+    if (!bytes.empty()) std::memcpy(words.data(), bytes.data(), bytes.size());
+    return words;
 }
 
 // One mismatched BRAM entry: address, what the file says it should be,
@@ -1689,7 +1728,14 @@ void usage() {
         "  verify-roms <dir>  read every BRAM entry back and compare to\n"
         "                     the .hex files (~7 s; per-entry round-trip)\n"
         "  all     <bin>      load-roms → verify-roms → upload → restart\n"
-        "                     → tokens (rom dir = bin's parent)\n",
+        "                     → tokens (rom dir = bin's parent)\n"
+        "  progload <bin> [dest_word] [exec_word]\n"
+        "                     stream an rv32im raw binary into progmem via the\n"
+        "                     port-B 0x50 window (self-modifying overlay), then\n"
+        "                     call exec_word and print its u32 return.  dest\n"
+        "                     default 512, exec default = dest.  sudo-free UDP.\n"
+        "  progexec <word>    call an already-loaded overlay entry word; print\n"
+        "                     its u32 return\n",
         FPGA_MAC, DEFAULT_PEER_IP);
 }
 
@@ -1869,27 +1915,46 @@ int main(int argc, char** argv) {
             print_crc(u);
             return 0;
         }
-        if (cmd == "ddrcrc") {
-            // Hash the uploaded DDR3 image via the FPGA's idle_scan_crc and
-            // compare to a host hash of the .bin — verifies upload byte-fidelity
-            // independent of the engine/ROMs.  No reflash; DDR contents survive.
-            std::string path = (argi < argc) ? argv[argi]
-                                             : std::string("release/lbfp_full_DDR3.bin");
-            std::ifstream f(path, std::ios::binary);
-            if (!f) { std::fprintf(stderr, "ddrcrc: cannot open %s\n", path.c_str()); return 2; }
-            f.seekg(0, std::ios::end);
-            size_t sz = static_cast<size_t>(f.tellg());
-            f.seekg(0);
-            std::vector<uint8_t> data(sz);
-            f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(sz));
-            size_t nbeats = sz / 64;
-            uint32_t href = host_scan_crc(data.data(), nbeats);
-            uint8_t seq = 90;
-            uint32_t hw = ddr_scan_crc(u, 0, static_cast<uint32_t>(nbeats), seq);
-            std::printf("ddrcrc: %s  %zu beats (%.1f MB)  hw=0x%08x  host=0x%08x  %s\n",
-                        path.c_str(), nbeats, sz / 1e6, hw, href,
-                        hw == href ? "MATCH (upload byte-faithful)" : "MISMATCH");
-            return hw == href ? 0 : 1;
+        if (cmd == "progload") {
+            // Stream an rv32im raw binary into progmem via the port-B 0x50 window
+            // (self-modifying overlay), sudo-free over UDP.  Optional dest word
+            // (default 512 = high overlay region) and exec entry word (default =
+            // dest, runs it and prints the 32-bit return).  No reflash.
+            //   progload <file.bin> [dest_word] [exec_entry_word]
+            if (argi >= argc) { usage(); return 2; }
+            std::string path = argv[argi++];
+            uint16_t dest = (argi < argc) ? static_cast<uint16_t>(std::stoul(argv[argi++], nullptr, 0)) : 512;
+            int exec_entry = (argi < argc) ? static_cast<int>(std::stoul(argv[argi++], nullptr, 0)) : dest;
+            std::vector<uint32_t> words = load_bin_words(path);
+            if (dest + words.size() > PROG_TOTAL_WORDS) {
+                std::fprintf(stderr, "progload: %s is %zu words; dest %u overflows progmem (%d)\n",
+                             path.c_str(), words.size(), dest, PROG_TOTAL_WORDS);
+                return 2;
+            }
+            uint8_t seq = 100;
+            std::printf("progload: %s -> progmem word %u (%zu words)...\n",
+                        path.c_str(), dest, words.size());
+            if (!prog_write(u, dest, words, seq)) return 1;
+            std::printf("progload: %zu words written + acked\n", words.size());
+            if (exec_entry >= 0) {
+                uint32_t r = 0;
+                if (!prog_exec(u, static_cast<uint16_t>(exec_entry), r, seq)) {
+                    std::fprintf(stderr, "progload: exec at word %d — no ACK\n", exec_entry);
+                    return 1;
+                }
+                std::printf("progexec word %d -> 0x%08x (%u)\n", exec_entry, r, r);
+            }
+            return 0;
+        }
+        if (cmd == "progexec") {
+            // Call an already-loaded overlay entry word; print its 32-bit return.
+            //   progexec <entry_word>
+            if (argi >= argc) { usage(); return 2; }
+            uint16_t entry = static_cast<uint16_t>(std::stoul(argv[argi++], nullptr, 0));
+            uint8_t seq = 120; uint32_t r = 0;
+            if (!prog_exec(u, entry, r, seq)) { std::fprintf(stderr, "progexec: no ACK\n"); return 1; }
+            std::printf("progexec word %u -> 0x%08x (%u)\n", entry, r, r);
+            return 0;
         }
         if (cmd == "version") {
             auto bv = reg_read(u, REG_BUILD_VERSION, 1, 1)[0];

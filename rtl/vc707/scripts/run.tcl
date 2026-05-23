@@ -182,14 +182,22 @@ if {$_picosoc_engine} {
     regsub {firmware_([^/]*)\.mem$} $_fwmem {fw_\1.bin} _fwbin
     exec python3 -E src/soc/bin2init.py $_fwbin > src/soc/progmem_init.svh
     puts "INFO: baked progmem_init.svh from $_fwbin"
+    # Weight-beat ILA (default ON; WEIGHT_ILA=0 disables): captures the full
+    # 512-bit m_axi_rdata into the engine, triggered by restart_edge_ui.
+    set _wila [expr {![info exists ::env(WEIGHT_ILA)] || [string trim $::env(WEIGHT_ILA)] ne "0"}]
+
     set _d [get_property verilog_define [current_fileset]]
     lappend _d "PICOSOC_ENGINE" "PICORV32_REGS=picosoc_regs" "PROGMEM_HEX=\"$_fwmem\"" "PROGMEM_RAMB"
     if {$_eila} { lappend _d "PICOSOC_ILA" }
+    if {$_wila} { lappend _d "WEIGHT_ILA" }
     set_property verilog_define $_d [current_fileset]
-    puts "INFO: PICOSOC_ENGINE — SoC front-end (ILA=$_eila, fw=$_fwmem, progmem=RAMB16)"
+    puts "INFO: PICOSOC_ENGINE — SoC front-end (ILA=$_eila, weight_ila=$_wila, fw=$_fwmem, progmem=RAMB16)"
 
     if {$_eila && [llength [get_ips -quiet picosoc_ila]] == 0} {
         read_ip { "ip/picosoc_ila/picosoc_ila.srcs/sources_1/ip/picosoc_ila/picosoc_ila.xci" }
+    }
+    if {$_wila && [llength [get_ips -quiet microgpt_ila_weights]] == 0} {
+        read_ip { "ip/microgpt_ila_weights/microgpt_ila_weights.srcs/sources_1/ip/microgpt_ila_weights/microgpt_ila_weights.xci" }
     }
 
     # UART console pins (usb_uart_tx/rx) come from the single shared
