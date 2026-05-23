@@ -39,10 +39,17 @@
 #define ETH_MACHI 0x0808u   /* [20]irq_en [19]promiscuous ... [15:0]mac[47:32] */
 #define ETH_RXEN  0x0828u
 #define ETH_RSR   0x0830u   /* rd: [15]=ready,[4:0]=buf ; wr: (buf+1) frees */
+#define ETH_TPLR  0x0810u   /* write {tbuf<<11 | byte_len} -> send */
 #define ETH_RX(b, w) (0x10000u + ((uint32_t)(b) << 11) + ((uint32_t)(w) << 3))
+#define ETH_TX(t, w) (0x1000u  + ((uint32_t)(t) << 11) + ((uint32_t)(w) << 3))
 #define MAC_LO 0x004D4731u  /* old eth_ctrl MAC (promiscuous below, so it's moot) */
 #define MAC_HI 0x00000200u
 #define FT_DDR_WRITE 0x0Au  /* UDP payload byte 0 = frame byte 42 */
+#define FT_REG_WRITE 0x01u
+#define FT_REG_READ  0x02u
+#define FT_REG_RSP   0x03u
+#define FT_ACK       0x06u
+#define FPGA_UDP_PORT 19783u  /* 0x4D47 "MG" — only frames to this port are handled */
 
 /* UART_TXDELAY (compile-time, default OFF): busy-wait one+ byte-time after every
  * UART byte so multi-char output survives even if the CPU isn't stalled by the
@@ -135,7 +142,9 @@ static void cmd_scan(void) {
     print_(hw == ref ? "  PASS\n" : "  FAIL\n");
 }
 
-static uint32_t eth_beats = 0;   /* DDR3 beats written from eth frames (debug) */
+static uint8_t  ethf[160];        /* reply-frame scratch (42 hdr + payload) */
+static uint32_t eth_beats = 0;    /* DDR3 beats written from eth frames */
+static uint32_t eth_acks  = 0;    /* FT_ACK / FT_REG_RSP replies sent */
 
 static void eth_init(void) {
     ETH(ETH_MACLO) = MAC_LO;
@@ -143,27 +152,114 @@ static void eth_init(void) {
     ETH(ETH_RXEN)  = 31;
 }
 
-/* Service one RX frame.  FT_DDR_WRITE -> stream the 64-byte payload into DDR3 at
- * the frame's byte address.  Byte layout matches the old HW FSM: the 512-bit beat
- * = RX 64-bit words 6..13, so DDR window word 2c/2c+1 = lo/hi of RX word 6+c. */
+/* Copy n (mult of 4) bytes between a byte array and the RX/TX LSU window.  Each
+ * 64-bit LSU word is two 32-bit halves: ETH_RX/TX(b,w) = low half (bytes w*8..+3),
+ * +4 = high half.  i>>3 = word index, i&4 = the half offset. */
+static void eth_rx_bytes(uint32_t b, uint8_t *d, uint32_t n) {
+    for (uint32_t i = 0; i < n; i += 4) {
+        uint32_t v = ETH(ETH_RX(b, i >> 3) + (i & 4));
+        d[i] = v; d[i+1] = v >> 8; d[i+2] = v >> 16; d[i+3] = v >> 24;
+    }
+}
+static void eth_tx_bytes(const uint8_t *s, uint32_t n) {   /* always TX buffer 0 */
+    for (uint32_t i = 0; i < n; i += 4)
+        ETH(ETH_TX(0, i >> 3) + (i & 4)) =
+            s[i] | (s[i+1] << 8) | (s[i+2] << 16) | (s[i+3] << 24);
+}
+static void bswap(uint8_t *a, uint8_t *c, int n) { while (n--) { uint8_t t = *a; *a++ = *c; *c++ = t; } }
+static uint16_t ipck(const uint8_t *p) {           /* IP header checksum over 20 bytes */
+    uint32_t s = 0;
+    for (int i = 0; i < 20; i += 2) s += (p[i] << 8) | p[i+1];
+    while (s >> 16) s = (s & 0xFFFF) + (s >> 16);
+    return ~s;
+}
+
+/* Reg-read value: serve the counters bfp_client polls for flow control from our
+ * own state (so it sees real upload progress); else read the engine regmap. */
+static uint32_t eth_regval(uint16_t a) {
+    switch (a) {
+        case 0x18: return 0;                               /* eth ring: empty   */
+        case 0x19: case 0x1A: case 0x1B: return eth_beats; /* rx / done / ack    */
+        case 0x1C: return eth_acks;                        /* FT_ACK tx count    */
+        default:   return REG(a);
+    }
+}
+
+/* Reply by reflecting the request headers in ethf[0..41] (swap MAC/IP/port, fix
+ * lengths + IP checksum); payload pre-filled at ethf[42..].  Sent from TX buf 0. */
+static void eth_reply(uint32_t plen) {
+    bswap(&ethf[0],  &ethf[6],  6);   /* eth dst<->src MAC  */
+    bswap(&ethf[26], &ethf[30], 4);   /* IP  src<->dst      */
+    bswap(&ethf[34], &ethf[36], 2);   /* UDP src<->dst port */
+    uint32_t iplen = 28 + plen, ulen = 8 + plen;
+    ethf[16] = iplen >> 8; ethf[17] = iplen;   /* IP total length (BE) */
+    ethf[38] = ulen >> 8;  ethf[39] = ulen;    /* UDP length (BE)      */
+    ethf[40] = 0; ethf[41] = 0;                /* UDP checksum = 0     */
+    ethf[24] = 0; ethf[25] = 0;
+    uint16_t ck = ipck(&ethf[14]);             /* IP checksum over hdr */
+    ethf[24] = ck >> 8; ethf[25] = ck;
+    uint32_t flen = 42 + plen;
+    while (flen < 60) ethf[flen++] = 0;        /* pad to eth min frame */
+    eth_tx_bytes(ethf, (flen + 3) & ~3u);
+    ETH(ETH_TPLR) = flen;                       /* tbuf 0, byte_len = flen */
+    eth_acks++;
+}
+
+/* Service one RX frame (filtered to our UDP port):
+ *   FT_DDR_WRITE -> 64B payload into DDR3 (beat = RX words 6..13) + FT_ACK
+ *   FT_REG_WRITE -> regmap writes (entry i in RX word 6+i)        + FT_ACK
+ *   FT_REG_READ  -> FT_REG_RSP with the requested register values            */
 static void eth_handle(void) {
     uint32_t rsr = ETH(ETH_RSR);
-    if (!(rsr & (1u << 15))) return;                  /* no frame ready */
+    if (!(rsr & (1u << 15))) return;
     uint32_t b = rsr & 0x1f;
-    uint32_t w5 = ETH(ETH_RX(b, 5));                  /* frame bytes 40-43 */
-    if (((w5 >> 16) & 0xFF) == FT_DDR_WRITE) {        /* byte 42 = frame type */
-        DDR_ADDR = ETH(ETH_RX(b, 5) + 4) & 0x3FFFFFFFu;   /* bytes 44-47 = byte addr */
-        for (uint32_t c = 0; c < 8; c++) {            /* RX words 6..13 = 64 data bytes */
-            DDR_DATA = ETH(ETH_RX(b, 6 + c));             /* lo 32 */
-            DDR_DATA = ETH(ETH_RX(b, 6 + c) + 4);         /* hi 32 */
+    uint32_t w4 = ETH(ETH_RX(b, 4) + 4);                       /* bytes 36-39 */
+    uint16_t dport = ((w4 & 0xFF) << 8) | ((w4 >> 8) & 0xFF);  /* UDP dst port (BE) */
+    uint32_t w5  = ETH(ETH_RX(b, 5));
+    uint8_t  ft  = (w5 >> 16) & 0xFF;                          /* byte 42 */
+    uint8_t  seq = (w5 >> 24) & 0xFF;                          /* byte 43 */
+    if (dport == FPGA_UDP_PORT) {
+        if (ft == FT_DDR_WRITE) {
+            DDR_ADDR = ETH(ETH_RX(b, 5) + 4) & 0x3FFFFFFFu;    /* bytes 44-47 */
+            for (uint32_t c = 0; c < 8; c++) {                 /* RX words 6..13 */
+                DDR_DATA = ETH(ETH_RX(b, 6 + c));
+                DDR_DATA = ETH(ETH_RX(b, 6 + c) + 4);
+            }
+            eth_beats++;
+            eth_rx_bytes(b, ethf, 48);                         /* request hdrs -> ethf */
+            ethf[42] = FT_ACK; ethf[43] = seq;
+            eth_reply(2);
+        } else if (ft == FT_REG_WRITE) {
+            uint8_t n = ETH(ETH_RX(b, 5) + 4) & 0xFF;          /* payload[2] = n_writes */
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t lo = ETH(ETH_RX(b, 6 + i));
+                REG((lo >> 16) & 0xFFFF) = ETH(ETH_RX(b, 6 + i) + 4);
+            }
+            eth_rx_bytes(b, ethf, 48);
+            ethf[42] = FT_ACK; ethf[43] = seq;
+            eth_reply(2);
+        } else if (ft == FT_REG_READ) {
+            uint32_t w5h    = ETH(ETH_RX(b, 5) + 4);           /* bytes 44-47 */
+            uint16_t addr   = w5h & 0xFFFF;                    /* payload[2:3] start addr */
+            uint8_t  nwords = (w5h >> 16) & 0xFF;              /* payload[4] nwords */
+            if (nwords > 19) nwords = 19;
+            eth_rx_bytes(b, ethf, 48);
+            ethf[42] = FT_REG_RSP; ethf[43] = seq;
+            ethf[44] = addr; ethf[45] = addr >> 8;
+            ethf[46] = nwords; ethf[47] = 0; ethf[48] = 0; ethf[49] = 0;
+            for (uint32_t i = 0; i < nwords; i++) {
+                uint32_t v = eth_regval(addr + i);
+                ethf[50+i*4] = v; ethf[51+i*4] = v>>8; ethf[52+i*4] = v>>16; ethf[53+i*4] = v>>24;
+            }
+            eth_reply(8 + nwords * 4);
         }
-        eth_beats++;
     }
     ETH(ETH_RSR) = (b + 1) & 0x1f;                    /* free the buffer */
 }
 
 static void cmd_eth(void) {
-    print_("eth beats="); hex_(eth_beats, 8); putc_('\n');
+    print_("eth beats="); hex_(eth_beats, 8);
+    print_(" acks=");      hex_(eth_acks, 8); putc_('\n');
 }
 
 void main(void)

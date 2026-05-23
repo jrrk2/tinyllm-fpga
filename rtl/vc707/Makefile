@@ -372,7 +372,7 @@ SOC_DIR     := src/soc
 # Firmware build: C + asm -> .bin -> .mem.  The .mem both inits the progmem BRAM
 # at synth (PROGMEM_HEX) and is the `updatemem -data` payload for fw-update.
 $(SOC_DIR)/firmware_shell.mem: $(SOC_DIR)/fw_shell.c $(SOC_DIR)/start.s $(SOC_DIR)/soc.lds $(SOC_DIR)/bin2mem.py
-	$(RISCV_CROSS)gcc -Os -march=rv32im -mabi=ilp32 -ffreestanding -nostdlib -nostartfiles \
+	$(RISCV_CROSS)gcc -Os -march=rv32imc -mabi=ilp32 -ffreestanding -nostdlib -nostartfiles \
 	    -Wl,-T,$(SOC_DIR)/soc.lds -o $(SOC_DIR)/fw_shell.elf $(SOC_DIR)/start.s $(SOC_DIR)/fw_shell.c -lgcc
 	$(RISCV_CROSS)objcopy -O binary $(SOC_DIR)/fw_shell.elf $(SOC_DIR)/fw_shell.bin
 	python3 $(SOC_DIR)/bin2mem.py $(SOC_DIR)/fw_shell.bin > $@
@@ -390,7 +390,7 @@ $(REGMAP_H) $(REGMAP_SVH) &: host/gen_regmap.py
 	python3 host/gen_regmap.py
 
 $(SOC_DIR)/firmware_engine.mem: $(SOC_DIR)/fw_engine.c $(REGMAP_H) $(SOC_DIR)/start.s $(SOC_DIR)/soc.lds $(SOC_DIR)/bin2mem.py
-	$(RISCV_CROSS)gcc -Os -march=rv32im -mabi=ilp32 -ffreestanding -nostdlib -nostartfiles $(EXTRA_CFLAGS) \
+	$(RISCV_CROSS)gcc -Os -march=rv32imc -mabi=ilp32 -ffreestanding -nostdlib -nostartfiles $(EXTRA_CFLAGS) \
 	    -Wl,-T,$(SOC_DIR)/soc.lds -o $(SOC_DIR)/fw_engine.elf $(SOC_DIR)/start.s $(SOC_DIR)/fw_engine.c -lgcc
 	$(RISCV_CROSS)objcopy -O binary $(SOC_DIR)/fw_engine.elf $(SOC_DIR)/fw_engine.bin
 	python3 $(SOC_DIR)/bin2mem.py $(SOC_DIR)/fw_engine.bin > $@
@@ -408,7 +408,7 @@ $(picosoc-ila-xci): $(ip-dir)/picosoc_ila/tcl/run.tcl
 
 # Smoke firmware: minimal UART-only test, used by picosoc-engine-smoke below.
 $(SOC_DIR)/firmware_smoke.mem: $(SOC_DIR)/fw_smoke.c $(SOC_DIR)/start.s $(SOC_DIR)/soc.lds $(SOC_DIR)/bin2mem.py
-	$(RISCV_CROSS)gcc -Os -march=rv32im -mabi=ilp32 -ffreestanding -nostdlib -nostartfiles \
+	$(RISCV_CROSS)gcc -Os -march=rv32imc -mabi=ilp32 -ffreestanding -nostdlib -nostartfiles \
 	    -Wl,-T,$(SOC_DIR)/soc.lds -o $(SOC_DIR)/fw_smoke.elf $(SOC_DIR)/start.s $(SOC_DIR)/fw_smoke.c -lgcc
 	$(RISCV_CROSS)objcopy -O binary $(SOC_DIR)/fw_smoke.elf $(SOC_DIR)/fw_smoke.bin
 	python3 $(SOC_DIR)/bin2mem.py $(SOC_DIR)/fw_smoke.bin > $@
