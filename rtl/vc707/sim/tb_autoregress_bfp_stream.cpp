@@ -23,7 +23,10 @@ int main(int argc, char** argv) {
   d->eval();
   for (int i = 0; i < 8; ++i) tick();
   d->rst = 0; tick();
-  d->go = 1; tick();
+  // autoregress_bfp_top stretches its core-side reset to 9 cycles after
+  // `rst` falls (restart-aware reset, see the module); the FPGA top holds
+  // start as a level until done, so hold `go` across that window too.
+  d->go = 1; for (int i = 0; i < 16; ++i) tick();
   d->go = 0;
 
   // Cycle ceiling — streaming adds ~1 cycle/beat × ~1500 chunks/token

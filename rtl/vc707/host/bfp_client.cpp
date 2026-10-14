@@ -330,6 +330,7 @@ struct UploadStats {
     int    retries     = 0;
     int    acked       = 0;
     double seconds     = 0.0;
+    bool   aborted     = false;   // FPGA stopped draining (see STALL_TIMEOUT)
 };
 
 UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
@@ -415,6 +416,10 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
     std::atomic<int>      eth_ring_peak{0};
     std::atomic<int>      eth_ring_max{0};        // lastbuf
     std::atomic<bool>     poll_stop{false};
+    // Give up (instead of spinning forever) when the FPGA's DDR done counter
+    // makes no progress for this long while we are flow-controlled.
+    constexpr auto STALL_TIMEOUT = std::chrono::seconds(5);
+    bool aborted = false;
     std::thread poller([&]() {
         while (!poll_stop.load(std::memory_order_relaxed)) {
             try {
@@ -524,6 +529,10 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
                 // send_secs above the nominal r when the wire / MIG
                 // path can't keep up — and that stretch is exactly
                 // what the cost model needs to see.
+                // Bounded: a firmware that never services FT_DDR_WRITE_N never
+                // advances done_count, so `ahead` would otherwise hold us here
+                // forever (that is how the old-firmware "hang" looked).
+                auto stall_deadline = std::chrono::steady_clock::now() + STALL_TIMEOUT;
                 while (true) {
                     uint32_t fdone   = fpga_done_delta.load(std::memory_order_relaxed);
                     int      backlog = fpga_backlog.load(std::memory_order_relaxed);
@@ -531,8 +540,10 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
                     bool stuffed = (backlog > backlog_limit);
                     bool ringful = (eth_ring.load(std::memory_order_relaxed) > ETH_RING_LIMIT);
                     if (!ahead && !stuffed && !ringful) break;
+                    if (std::chrono::steady_clock::now() > stall_deadline) { aborted = true; break; }
                     std::this_thread::yield();
                 }
+                if (aborted) break;
                 int chunk_idx = probe_base + i;
                 uint32_t addr = base + static_cast<uint32_t>(chunk_idx) * CHUNK;
                 uint8_t tx[6 + MAX_CHUNKS_PER_FRAME * CHUNK];
@@ -547,6 +558,7 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
                 global_sent += nfr;
                 i += nfr;
             }
+            if (aborted) break;
             // Capture send-only wall-clock BEFORE the drain — this is
             // the actual achievable throughput at target r (backstops
             // included).  Earlier versions divided by send+drain time,
@@ -603,6 +615,15 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
 
         probe_drain_stop.store(true, std::memory_order_relaxed);
         probe_drainer.join();
+        if (aborted) {
+            std::printf("[upload] ERROR: FPGA stopped draining during the rate probe "
+                        "(no DDR done progress for %.0f s, acked=%d).  A firmware that "
+                        "predates FT_DDR_WRITE_N (0x0D) ignores batched frames: rerun "
+                        "with -b 1, or fw-swap the current fw_engine.\n",
+                        std::chrono::duration<double>(STALL_TIMEOUT).count(),
+                        acked_total.load(std::memory_order_relaxed));
+            std::fflush(stdout);
+        }
         target_mbps = best_rate;
         std::printf("[probe] committed target_mbps = %.1f "
                     "(projected upload cost %.1f s)\n",
@@ -621,7 +642,7 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
     auto t0 = std::chrono::steady_clock::now();
     int retries_total = 0;
 
-    for (int pass = 1; pass <= max_passes; ++pass) {
+    for (int pass = 1; pass <= max_passes && !aborted; ++pass) {
         // Build the list of chunks still needing a send for this pass.
         // Pass 1 skips chunks that the probe already got ACKed — probe
         // doubles as real work, no need to resend.
@@ -699,6 +720,7 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
             //   (c) the MAC RX ring is nearly full — the PicoSoC firmware drains
             //       it one frame at a time; overflowing it just drops frames
             //       that pass 2+ then has to resend.
+            auto stall_deadline = std::chrono::steady_clock::now() + STALL_TIMEOUT;
             while (true) {
                 uint32_t fdone = fpga_done_delta.load(std::memory_order_relaxed);
                 int      backlog = fpga_backlog.load(std::memory_order_relaxed);
@@ -706,7 +728,16 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
                 bool stuffed = (backlog > backlog_limit);
                 bool ringful = (eth_ring.load(std::memory_order_relaxed) > ETH_RING_LIMIT);
                 if (!ahead && !stuffed && !ringful) break;
+                if (std::chrono::steady_clock::now() > stall_deadline) { aborted = true; break; }
                 std::this_thread::yield();
+            }
+            if (aborted) {
+                std::printf("[upload] ERROR: FPGA stopped draining in pass %d (no DDR done "
+                            "progress for %.0f s) — aborting.  Old firmware without "
+                            "FT_DDR_WRITE_N?  Rerun with -b 1, or fw-swap.\n",
+                            pass, std::chrono::duration<double>(STALL_TIMEOUT).count());
+                std::fflush(stdout);
+                break;
             }
 
             int chunk_idx = work[i];
@@ -818,7 +849,7 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
     std::printf("[upload] done in %.2fs, %d/%d acked (%.2f MB/s), passes=%d, missing=%d\n",
                 secs, a, n_real, mbps, retries_total + 1, missing);
     u.set_recv_timeout(RECV_TIMEOUT_MS);
-    return {(size_t)n_bytes, retries_total, a, secs};
+    return {(size_t)n_bytes, retries_total, a, secs, aborted};
 }
 
 // ---------------------------------------------------------------------
@@ -1930,9 +1961,9 @@ int main(int argc, char** argv) {
 
         if (cmd == "upload") {
             if (argi >= argc) { usage(); return 2; }
-            upload(u, peer_ip, peer_port, argv[argi], 0, 4,
-                   lead_limit, poll_ms, target_mbps, backlog_limit, chunks_per_frame);
-            return 0;
+            auto st = upload(u, peer_ip, peer_port, argv[argi], 0, 4,
+                             lead_limit, poll_ms, target_mbps, backlog_limit, chunks_per_frame);
+            return st.aborted ? 1 : 0;
         }
         if (cmd == "verify") {
             if (argi >= argc) { usage(); return 2; }

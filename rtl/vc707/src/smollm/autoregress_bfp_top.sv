@@ -213,10 +213,24 @@ module autoregress_bfp_top #(
   // both sides restart from the same idle state.  A request issued by the core
   // while the AXI side is still in reset is not lost: the toggle handshake
   // compares the synced level against tog_seen_axi, so it fires on release.
+  //
+  // The core side must ALSO stay in reset until the AXI side has actually
+  // cleared those levels.  With a 1-cycle core reset, embed_lookup_bfp's
+  // done_sync_core left reset at T and sampled done_axi at T+1 (25 ns at
+  // 40 MHz) while the clear only lands ~15-20 ns after T (2FF sync into
+  // ui_clk + one ui_clk cycle + routing): on an unlucky phase it caught the
+  // stale 1, which became a `done` pulse exactly when the FSM reached
+  // S_EMB_WAIT, and the run started from the previous run's last embedding
+  // row (~2-3 % of restarts on chip, build eeefcb2).  So every core-side
+  // sub-module and the FSM below take rst_core_i, the same stretched reset
+  // (8 cycles = 200 ns) registered once for fanout; it releases well after
+  // the AXI side has gone quiet.
   // ---------------------------------------------------------------------------
-  logic [3:0] rst_sr_core;
-  always_ff @(posedge clk) rst_sr_core <= {rst_sr_core[2:0], rst};
+  logic [7:0] rst_sr_core;
+  always_ff @(posedge clk) rst_sr_core <= {rst_sr_core[6:0], rst};
   wire rst_long_core = rst | (|rst_sr_core);
+  logic rst_core_i;
+  always_ff @(posedge clk) rst_core_i <= rst_long_core;
   (* ASYNC_REG = "TRUE" *) logic [1:0] rst_sync_axi;
   always_ff @(posedge clk_axi) rst_sync_axi <= {rst_sync_axi[0], rst_long_core};
   wire rst_axi_i = rst_axi | rst_sync_axi[1];
@@ -265,7 +279,7 @@ module autoregress_bfp_top #(
     .AXI_ADDR_WIDTH(AXI_ADDR_WIDTH),
     .AXI_ID_WIDTH(AXI_ID_WIDTH)
   ) i_emb (
-    .clk(clk), .rst(rst), .start(mdl_start),
+    .clk(clk), .rst(rst_core_i), .start(mdl_start),
     .token_id(mdl_token_in),
     .hidden_m(emb_m), .hidden_e(emb_e), .done(emb_done),
     .ws_base_EMBED_LU_m(ws_base_EMBED_LU_m),
@@ -306,7 +320,7 @@ module autoregress_bfp_top #(
     .AXI_ADDR_WIDTH(AXI_ADDR_WIDTH),
     .AXI_ID_WIDTH(AXI_ID_WIDTH)
   ) i_lay (
-    .clk(clk), .rst(rst), .start(lay_start),
+    .clk(clk), .rst(rst_core_i), .start(lay_start),
     .pos(mdl_pos), .kv_pos(mdl_kv_pos),
     .hidden_in_m(lay_in_m), .hidden_in_e(lay_in_e),
     .hidden_out_m(lay_out_m), .hidden_out_e(lay_out_e),
@@ -360,7 +374,7 @@ module autoregress_bfp_top #(
     .AXI_ADDR_WIDTH(AXI_ADDR_WIDTH),
     .AXI_ID_WIDTH(AXI_ID_WIDTH)
   ) i_dec (
-    .clk(clk), .rst(rst), .start(dec_start),
+    .clk(clk), .rst(rst_core_i), .start(dec_start),
     .hidden_in_m(dec_in_m), .hidden_in_e(dec_in_e),
     .token_out(dec_token), .done(dec_done),
     .ws_base_EMBED_m(ws_base_EMBED_m),
@@ -404,7 +418,7 @@ module autoregress_bfp_top #(
   logic [15:0] result_buf [0:N_STEPS-1];
 
   always_ff @(posedge clk) begin
-    if (rst) begin
+    if (rst_core_i) begin
       state       <= S_IDLE;
       step        <= '0;
       last_token  <= '0;
