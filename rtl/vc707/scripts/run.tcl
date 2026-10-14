@@ -342,6 +342,7 @@ read_verilog -sv { \
     src/smollm/embed_lookup_bfp.sv \
     src/smollm/smollm_multilayer_tm_bfp.sv \
     src/smollm/smollm_decode_head_bfp.sv \
+    src/smollm/axi_r_slice.sv \
     src/smollm/autoregress_bfp_top.sv \
 }
 

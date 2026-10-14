@@ -198,8 +198,22 @@ module autoregress_bfp_top #(
   assign m_axi_arcache = emb_arvalid ? emb_arcache : lay_arvalid ? lay_arcache : dec_arcache;
   assign m_axi_arprot  = emb_arvalid ? emb_arprot  : lay_arvalid ? lay_arprot  : dec_arprot;
   assign m_axi_arqos   = emb_arvalid ? emb_arqos   : lay_arvalid ? lay_arqos   : dec_arqos;
-  // rready: broadcast `1`; each sub-module ignores rvalid when inactive.
-  assign m_axi_rready  = emb_rready & lay_rready & dec_rready;
+  // Read-data channel: one register slice right at the MIG (clk_axi), then
+  // broadcast.  See axi_r_slice.sv — the MIG's SRL FIFO output straight into
+  // the three 512-wide consumers was the 200 MHz critical path and lost
+  // timing by ~0.1 ns, corrupting weight beats non-deterministically on chip.
+  wire                    r_rvalid, r_rready, r_rlast;
+  wire [AXI_ID_WIDTH-1:0] r_rid;
+  wire [511:0]            r_rdata;
+  wire [1:0]              r_rresp;
+  axi_r_slice #(.ID_W(AXI_ID_WIDTH), .DATA_W(512)) i_rslice (
+    .clk(clk_axi), .rst(rst_axi),
+    .s_rvalid(m_axi_rvalid), .s_rready(m_axi_rready), .s_rid(m_axi_rid),
+    .s_rdata(m_axi_rdata),   .s_rresp(m_axi_rresp),   .s_rlast(m_axi_rlast),
+    .m_rvalid(r_rvalid),     .m_rready(r_rready),     .m_rid(r_rid),
+    .m_rdata(r_rdata),       .m_rresp(r_rresp),       .m_rlast(r_rlast));
+  // rready: broadcast; each sub-module ignores rvalid when inactive.
+  assign r_rready = emb_rready & lay_rready & dec_rready;
 
   // arready arrives back; route to whichever source's arvalid is winning.
   wire emb_arready = m_axi_arready & emb_arvalid;
@@ -207,9 +221,9 @@ module autoregress_bfp_top #(
   wire dec_arready = m_axi_arready & (~emb_arvalid) & (~lay_arvalid) & dec_arvalid;
   // rvalid / rid / rdata / rresp / rlast broadcast — at most one
   // sub-module's load FSM is in its R-state at any moment.
-  wire emb_rvalid_b = m_axi_rvalid;
-  wire lay_rvalid_b = m_axi_rvalid;
-  wire dec_rvalid_b = m_axi_rvalid;
+  wire emb_rvalid_b = r_rvalid;
+  wire lay_rvalid_b = r_rvalid;
+  wire dec_rvalid_b = r_rvalid;
 
   // ---------------------------------------------------------------------------
   // embed_lookup_bfp.
@@ -247,10 +261,10 @@ module autoregress_bfp_top #(
     .m_axi_arqos  (emb_arqos),
     .m_axi_rvalid (emb_rvalid_b),
     .m_axi_rready (emb_rready),
-    .m_axi_rid    (m_axi_rid),
-    .m_axi_rdata  (m_axi_rdata),
-    .m_axi_rresp  (m_axi_rresp),
-    .m_axi_rlast  (m_axi_rlast)
+    .m_axi_rid    (r_rid),
+    .m_axi_rdata  (r_rdata),
+    .m_axi_rresp  (r_rresp),
+    .m_axi_rlast  (r_rlast)
   );
 
   // ---------------------------------------------------------------------------
@@ -296,10 +310,10 @@ module autoregress_bfp_top #(
     .m_axi_arqos  (lay_arqos),
     .m_axi_rvalid (lay_rvalid_b),
     .m_axi_rready (lay_rready),
-    .m_axi_rid    (m_axi_rid),
-    .m_axi_rdata  (m_axi_rdata),
-    .m_axi_rresp  (m_axi_rresp),
-    .m_axi_rlast  (m_axi_rlast),
+    .m_axi_rid    (r_rid),
+    .m_axi_rdata  (r_rdata),
+    .m_axi_rresp  (r_rresp),
+    .m_axi_rlast  (r_rlast),
     .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(wr_data), .wr_en(wr_en),
     .clk_wr(clk_wr), .wr_rdata(lay_wr_rdata),
     .snap_layer_sel(snap_layer_sel), .snap_step_sel(snap_step_sel),
@@ -342,10 +356,10 @@ module autoregress_bfp_top #(
     .m_axi_arqos  (dec_arqos),
     .m_axi_rvalid (dec_rvalid_b),
     .m_axi_rready (dec_rready),
-    .m_axi_rid    (m_axi_rid),
-    .m_axi_rdata  (m_axi_rdata),
-    .m_axi_rresp  (m_axi_rresp),
-    .m_axi_rlast  (m_axi_rlast),
+    .m_axi_rid    (r_rid),
+    .m_axi_rdata  (r_rdata),
+    .m_axi_rresp  (r_rresp),
+    .m_axi_rlast  (r_rlast),
     .wr_kind(wr_kind), .wr_addr(wr_addr), .wr_data(wr_data), .wr_en(wr_en),
     .clk_wr(clk_wr), .wr_rdata(dec_wr_rdata)
   );
