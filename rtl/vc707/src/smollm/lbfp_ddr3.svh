@@ -1,4 +1,4 @@
-// lbfp_ddr3.svh — DDR3 byte-offset map for the full SmolLM2-135M
+// lbfp_ddr3.svh — DDR3 byte-offset map for the full SmolLM2 (135M/360M)
 // block-FP weight set, consumed by weight_streamer_bfp_mt.sv.
 //
 //   The host (over Ethernet) uploads a single .bin file produced by
@@ -65,25 +65,31 @@
 
 // Gamma matrices: NL × D × 16 b mantissas + NL × NT_D × 8 b exps (narrow).
 // Padding matches host/gen_smollm_blockfp_ddr.py uniform 4 KB alignment.
+// Sizes are DERIVED from the cfg (NL, D) — they used to be hard-coded for
+// smollm135 (NL=30, D=576: 34,560 → 0x9000 / 1,080 → 0x1000), which silently
+// put every region from EMBED_m onward 0xC000 bytes too LOW for smollm360
+// (NL=32, D=960: 61,440 = 0xF000) — the lm_head and embed_lookup then read
+// misaligned DDR3 data and the FPGA emitted deterministic garbage tokens.
+`define LBFP_ALIGN4K(n)       ((((n)) + `LBFP_DDR3_ALIGN - 1) & ~(`LBFP_DDR3_ALIGN - 1))
+`define LBFP_GAMMA_SIZE_M     `LBFP_ALIGN4K(`LBFP_FULL_NL * `LBFP_FULL_D * 2)
+`define LBFP_GAMMA_SIZE_E     `LBFP_ALIGN4K(`LBFP_FULL_NL * (`LBFP_FULL_D / 16))
 `define LBFP_BASE_G1_M        (`LBFP_BASE_WDN_E + 30'(`LBFP_REGION_SIZE_E(`LBFP_FULL_D, `LBFP_FULL_FFN)))
-// NL × D × 2 B = 34,560 → 36,864 (4 KB-aligned)
-`define LBFP_BASE_G1_E        (`LBFP_BASE_G1_M + 30'h0_9000)
-// NL × NT_D × 1 B = 1,080 → 4,096
-`define LBFP_BASE_G2_M        (`LBFP_BASE_G1_E + 30'h0_1000)
-`define LBFP_BASE_G2_E        (`LBFP_BASE_G2_M + 30'h0_9000)
+`define LBFP_BASE_G1_E        (`LBFP_BASE_G1_M + 30'(`LBFP_GAMMA_SIZE_M))
+`define LBFP_BASE_G2_M        (`LBFP_BASE_G1_E + 30'(`LBFP_GAMMA_SIZE_E))
+`define LBFP_BASE_G2_E        (`LBFP_BASE_G2_M + 30'(`LBFP_GAMMA_SIZE_M))
 
-// EMBED table (49152 × 576): wide-packed for lm_head AND narrow row-wise
+// EMBED table (VOCAB × D): wide-packed for lm_head AND narrow row-wise
 // for embed_lookup.  Both stored separately in DDR3.
-`define LBFP_BASE_EMBED_M     (`LBFP_BASE_G2_E + 30'h0_1000)
+`define LBFP_BASE_EMBED_M     (`LBFP_BASE_G2_E + 30'(`LBFP_GAMMA_SIZE_E))
 `define LBFP_BASE_EMBED_E     (`LBFP_BASE_EMBED_M + 30'(`LBFP_FULL_VOCAB / 16 * `LBFP_FULL_D * `LBFP_BYTES_M_PER_COL))
 `define LBFP_BASE_EMBED_LU_M  (`LBFP_BASE_EMBED_E + 30'(`LBFP_FULL_VOCAB / 16 * (`LBFP_FULL_D / 16) * `LBFP_BYTES_E_PER_TILE))
 `define LBFP_BASE_EMBED_LU_E  (`LBFP_BASE_EMBED_LU_M + 30'(`LBFP_FULL_VOCAB * `LBFP_FULL_D * 2))
 
-// norm_w (final RMS gamma), 576 × 2 B mantissas + 36 × 1 B exps.
+// norm_w (final RMS gamma), D × 2 B mantissas + NT_D × 1 B exps.
 // EMBED_LU_e padded to 64 B per row by the baker for AXI alignment, so
 // total = VOCAB × 64 B (not VOCAB × NT_D).
 `define LBFP_BASE_NORM_W_M    (`LBFP_BASE_EMBED_LU_E + 30'(`LBFP_FULL_VOCAB * 64))
-`define LBFP_BASE_NORM_W_E    (`LBFP_BASE_NORM_W_M + 30'h1_0000)
+`define LBFP_BASE_NORM_W_E    (`LBFP_BASE_NORM_W_M + 30'(`LBFP_ALIGN4K(`LBFP_FULL_D * 2)))
 
 // Total DDR3 image size in 128-bit entries (one entry per mock_axi_slave
 // mem[] slot).  Conservatively rounded up — extra entries init to 0.

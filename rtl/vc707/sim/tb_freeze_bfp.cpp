@@ -123,7 +123,10 @@ int main(int argc, char** argv) {
 
   // Run.
   d->start = 1; tick(); d->start = 0;
-  const uint64_t budget = 5'000'000;
+  // Cycle budget: ~1M cycles/layer at smollm360, so a 32-layer freeze needs
+  // ~35M.  Override with FREEZE_BUDGET=<cycles> (default 5M keeps the L0-L3
+  // demo quick).
+  const uint64_t budget = std::getenv("FREEZE_BUDGET") ? strtoull(std::getenv("FREEZE_BUDGET"), nullptr, 10) : 5'000'000;
   while (!d->done && cyc < budget) tick();
 
   // Max per-tile exponent of hidden_out — the saturation indicator (matches

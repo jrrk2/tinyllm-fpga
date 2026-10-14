@@ -7,7 +7,8 @@
 // (same one in generated/silu_lut.hex).  Each block-FP gate element is
 // converted to a Q1.15-at-scale-32 LUT index by aligning its mantissa to
 // the LUT's fixed scale; if the magnitude exceeds the LUT range, we
-// saturate (silu is smooth enough at the boundary that ±1 LSB clip is
+// bypass the table (silu(x)=x above, 0 below — see gate_ovf_* below;
+// the old ±1-LSB "saturate" comment was wrong for smollm360, whose gate
 // negligible vs the calibrated outlier behavior).
 //
 // Pipeline (streaming, one element per cycle):
@@ -60,22 +61,46 @@ module swiglu_bfp #(
   //   LUT-index      = sat_int16(gate_at_lut15)
   //   silu_at_lut15  = silu_lut[LUT-index]   (Q1.15 at SILU_LUT_SCALE)
   // -----------------------------------------------------------------------
-  logic signed [31:0]  gate_shifted_w;
+  // gate_shifted_w = gate at the LUT's fixed scale (Q1.15 @ SILU_LUT_SCALE),
+  // kept at full width (48 b) so an out-of-range gate is NOT lost: the LUT
+  // only covers [-32, +32), but SmolLM2-360M's layer-3 "massive activation"
+  // neuron has gate ≈ 46 (u ≈ 64, mlp ≈ 2930).  The old 16-bit saturation
+  // clipped it to silu(32) = 32, scaling that neuron — and through the
+  // down-proj every lane of the layer-3 hidden — by 32/46 ≈ 0.70, which
+  // skewed all later layers.  Outside the table silu(x) = x (x ≥ 32,
+  // sigmoid == 1 to 16-bit precision) and silu(x) = 0 (x ≤ -32), so we
+  // bypass the LUT with the unsaturated gate (or 0) in the same Q-format.
+  logic signed [47:0]  gate_shifted_w;
   logic signed [BFP_MANT_W-1:0] gate_lut_idx;
+  logic                gate_ovf_pos, gate_ovf_neg;
   always_comb begin
     logic signed [BFP_EXP_W:0] shamt;
     shamt = $signed({in_gate_exp[BFP_EXP_W-1], in_gate_exp}) - LUT_SCALE_LOG2;
     // shamt > 0 → left-shift m_gate (real value bigger); negative → right shift
-    if (shamt >= 0) gate_shifted_w = $signed(in_gate_mant) <<<   shamt[4:0];
-    else            gate_shifted_w = $signed(in_gate_mant) >>> (-shamt[4:0]);
-    // Saturate to int16
-    if      (gate_shifted_w >  32'sd32767)  gate_lut_idx =  16'sd32767;
-    else if (gate_shifted_w < -32'sd32768)  gate_lut_idx = -16'sd32768;
-    else                                     gate_lut_idx =  gate_shifted_w[15:0];
+    if (shamt >= 0) gate_shifted_w = 48'($signed(in_gate_mant)) <<<   shamt[4:0];
+    else            gate_shifted_w = 48'($signed(in_gate_mant)) >>> (-shamt[4:0]);
+    gate_ovf_pos = (gate_shifted_w >  48'sd32767);
+    gate_ovf_neg = (gate_shifted_w < -48'sd32768);
+    // Saturate the LUT index to int16 (only used when in range)
+    if      (gate_ovf_pos)  gate_lut_idx =  16'sd32767;
+    else if (gate_ovf_neg)  gate_lut_idx = -16'sd32768;
+    else                    gate_lut_idx =  gate_shifted_w[15:0];
   end
 
   logic signed [BFP_MANT_W-1:0] silu_at_lut;
-  always_ff @(posedge clk) silu_at_lut <= silu_lut[$unsigned(gate_lut_idx)];
+  logic signed [47:0]           gate_shifted_r;
+  logic                         ovf_pos_r, ovf_neg_r;
+  always_ff @(posedge clk) begin
+    silu_at_lut    <= silu_lut[$unsigned(gate_lut_idx)];
+    gate_shifted_r <= gate_shifted_w;
+    ovf_pos_r      <= gate_ovf_pos;
+    ovf_neg_r      <= gate_ovf_neg;
+  end
+  // silu operand at LUT scale: table value in range, else x (pos) / 0 (neg).
+  logic signed [47:0] silu_w;
+  always_comb silu_w = ovf_pos_r ? gate_shifted_r
+                     : ovf_neg_r ? 48'sd0
+                     :             48'($signed(silu_at_lut));
 
   // Pipeline up alongside the LUT registered output, so silu_at_lut and
   // up are aligned (1 cycle of LUT latency).
@@ -90,13 +115,14 @@ module swiglu_bfp #(
     last_r     <= in_valid && last_elem;
   end
 
-  // Compute prod = silu_at_lut * up_mant_r — 32-bit signed.
-  // Real value: silu_at_lut15 * up_real = silu_at_lut/2^15 * SILU_LUT_SCALE
+  // Compute prod = silu_w * up_mant_r — 64-bit signed (48 × 16).
+  // Real value: silu_at_lut15 * up_real = silu_w/2^15 * SILU_LUT_SCALE
   //                                     * m_up/2^15 * 2^e_up
-  //           = silu_at_lut * m_up * 2^(e_up + LUT_SCALE_LOG2 - 30)
-  // So prod's effective exponent = e_up + LUT_SCALE_LOG2 - 30.
-  logic signed [31:0] prod_w;
-  always_comb prod_w = silu_at_lut * up_mant_r;
+  //           = silu_w * m_up * 2^(e_up + LUT_SCALE_LOG2 - 30)
+  // So prod's effective exponent = e_up + LUT_SCALE_LOG2 - 30 (unchanged by
+  // the out-of-range bypass, which stays in the same Q-format).
+  logic signed [63:0] prod_w;
+  always_comb prod_w = silu_w * up_mant_r;
 
   // -----------------------------------------------------------------------
   // Stage 2: tile-quantize the per-element products.
@@ -104,8 +130,8 @@ module swiglu_bfp #(
   //   - At end of tile (or on last element), compute shift = max_lead-14,
   //     emit aligned mantissas with one shared exponent.
   // -----------------------------------------------------------------------
-  logic signed [31:0]            prod_buf [0:BFP_TILE-1];
-  logic [4:0]                    max_lead_r;
+  logic signed [63:0]            prod_buf [0:BFP_TILE-1];
+  logic [5:0]                    max_lead_r;
   logic [CW-1:0]                 load_idx;
   logic [CW-1:0]                 emit_idx;
   logic                          emit_phase;
@@ -114,13 +140,13 @@ module swiglu_bfp #(
   // Effective tile up_exp (shared) latched when load_idx==0
   logic signed [BFP_EXP_W-1:0]   up_exp_tile_r;
 
-  // Compute new_lead for this product (5 bits since 32-bit signed)
-  logic [4:0]  new_lead;
+  // Compute new_lead for this product (6 bits since 64-bit signed)
+  logic [5:0]  new_lead;
   always_comb begin
-    automatic logic [31:0] abs_v;
-    abs_v = prod_w[31] ? ($unsigned(~prod_w) + 1'b1) : $unsigned(prod_w);
-    new_lead = 5'd0;
-    for (int i = 0; i < 32; i++) if (abs_v[i]) new_lead = i[4:0];
+    automatic logic [63:0] abs_v;
+    abs_v = prod_w[63] ? ($unsigned(~prod_w) + 1'b1) : $unsigned(prod_w);
+    new_lead = 6'd0;
+    for (int i = 0; i < 64; i++) if (abs_v[i]) new_lead = i[5:0];
   end
 
   // FSM
@@ -178,10 +204,10 @@ module swiglu_bfp #(
         S_EMIT: begin
           begin : emit_blk
             automatic logic signed [7:0]  shamt_s;
-            automatic logic signed [31:0] sh_w;
-            shamt_s = $signed({3'b0, max_lead_r}) - 8'sd14;
-            if (shamt_s >= 0) sh_w = prod_buf[emit_idx] >>>   shamt_s[4:0];
-            else              sh_w = prod_buf[emit_idx] <<< (-shamt_s[4:0]);
+            automatic logic signed [63:0] sh_w;
+            shamt_s = $signed({2'b0, max_lead_r}) - 8'sd14;
+            if (shamt_s >= 0) sh_w = prod_buf[emit_idx] >>>   shamt_s[5:0];
+            else              sh_w = prod_buf[emit_idx] <<< (-shamt_s[5:0]);
             out_y_mant <= sh_w[BFP_MANT_W-1:0];
             // out_e = e_up + LUT_SCALE_LOG2 - 30 + shamt + 15 = e_up + shamt -10
             begin : exp_blk

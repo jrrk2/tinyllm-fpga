@@ -198,14 +198,21 @@ module smollm_layer_bfp #(
   // and pack lane-by-lane below.
   logic [BFP_MANT_W-1:0] sim_vinit_flat [0:NL*MAX_CTX*H_KV*HD-1];
   initial begin
-    $readmemh("../generated/lbfp_G1_m.hex", rom_G1_m);
-    $readmemh("../generated/lbfp_G1_e.hex", rom_G1_e);
-    $readmemh("../generated/lbfp_G2_m.hex", rom_G2_m);
-    $readmemh("../generated/lbfp_G2_e.hex", rom_G2_e);
-    $readmemh("../generated/lbfp_K_INIT_m.hex", i_kv_k_m_bram.mem);
-    $readmemh("../generated/lbfp_K_INIT_e.hex", i_kv_k_e_bram.mem);
-    $readmemh("../generated/lbfp_V_INIT_e.hex", i_kv_v_e_bram.mem);
-    $readmemh("../generated/lbfp_V_INIT_m.hex", sim_vinit_flat);
+    // Paths come from PREFIX (the selftest tb passes "../generated/lbfp_",
+    // the full-model tbs "../generated/lbfp_full_").  They used to be
+    // hard-coded to the lbfp_ selftest bake, so every full-model sim
+    // (freeze / stream / full) silently ran with the random-bake gammas
+    // (~1.0) instead of the model's — catastrophic for SmolLM2-360M whose
+    // layer-0 gammas are ~0.003..0.013, and the source of the bogus
+    // "RTL over-amplifies at L0" sim lead.
+    $readmemh({PREFIX, "G1_m.hex"}, rom_G1_m);
+    $readmemh({PREFIX, "G1_e.hex"}, rom_G1_e);
+    $readmemh({PREFIX, "G2_m.hex"}, rom_G2_m);
+    $readmemh({PREFIX, "G2_e.hex"}, rom_G2_e);
+    $readmemh({PREFIX, "K_INIT_m.hex"}, i_kv_k_m_bram.mem);
+    $readmemh({PREFIX, "K_INIT_e.hex"}, i_kv_k_e_bram.mem);
+    $readmemh({PREFIX, "V_INIT_e.hex"}, i_kv_v_e_bram.mem);
+    $readmemh({PREFIX, "V_INIT_m.hex"}, sim_vinit_flat);
     for (int e = 0; e < NL*MAX_CTX*KVV_CHUNKS_PER_KVPOS; e++)
       for (int l = 0; l < LANES; l++)
         i_kv_v_chk_bram.mem[e][l*BFP_MANT_W +: BFP_MANT_W] =

@@ -89,15 +89,21 @@ module weight_streamer_bfp_mt #(
   //  Per AXI beat (512 b):  2 mantissa col entries  (2 × 256 b)
   //                         4 exponent tile entries (4 × 128 b)
   //
-  //  Bank sizes (1536-col worst case):
-  //    bank_m: 1536 col entries / 2 per beat = 768 beats × 512 b = 393 Kbit
-  //    bank_e:   96 tile entries / 4 per beat =  24 beats × 512 b ≈ 12 Kbit
+  //  Bank sizes:
+  //    smollm135 (IN_DIM_MAX=1536): bank_m  768 beats -> 1024;  bank_e 24 -> 32
+  //    smollm360 (IN_DIM_MAX=2560): bank_m 1280 beats -> 2048;  bank_e 40 -> 64
+  //  Both depths are derived from IN_DIM_MAX.  They used to be hard-capped
+  //  at 1024 / 32 (the smollm135 worst case), so the FFN=2560 down-proj
+  //  (in_dim=2560 -> 1280 mantissa beats, 160 tiles -> 40 exp beats) wrapped
+  //  the 10-/5-bit write index and columns 0..511 / tiles 0..31 were silently
+  //  overwritten by columns 2048..2559 / tiles 128..159 -> wrong DN matvec on
+  //  every layer of smollm360 (sim+FPGA), invisible to the sim_shadow selftest.
   // ------------------------------------------------------------------
-  localparam int M_BEATS_MAX = IN_DIM_MAX / 2;          // 768 for in_dim=1536
-  localparam int E_BEATS_MAX = (IN_DIM_MAX / 16) / 4;   // 24 for NT_in=96
-  // Round to next power of two for clean addressing.
-  localparam int M_BANK_DEPTH = (M_BEATS_MAX > 512) ? 1024 : 512;   // 1024 entries
-  localparam int E_BANK_DEPTH = 32;
+  localparam int M_BEATS_MAX = IN_DIM_MAX / 2;          // 768 for in_dim=1536, 1280 for 2560
+  localparam int E_BEATS_MAX = ((IN_DIM_MAX / 16) + 3) / 4;   // 24 for NT_in=96, 40 for 160
+  // Round up to the next power of two (>= the beat count) for clean addressing.
+  localparam int M_BANK_DEPTH = (M_BEATS_MAX > 512) ? (1 << $clog2(M_BEATS_MAX)) : 512;
+  localparam int E_BANK_DEPTH = (E_BEATS_MAX > 32)  ? (1 << $clog2(E_BEATS_MAX)) : 32;
   localparam int M_BANK_AW    = $clog2(M_BANK_DEPTH);
   localparam int E_BANK_AW    = $clog2(E_BANK_DEPTH);
 
@@ -192,9 +198,9 @@ module weight_streamer_bfp_mt #(
   logic [11:0]               m_total_beats;       // in_dim / 2
   logic [11:0]               m_beats_remaining;
   logic [AXI_ADDR_WIDTH-1:0] m_next_addr;
-  logic [9:0]                bank_m_widx;         // write addr into bank_m
+  logic [M_BANK_AW-1:0]      bank_m_widx;         // write addr into bank_m
   logic [11:0]               e_total_beats;
-  logic [9:0]                bank_e_widx;
+  logic [E_BANK_AW-1:0]      bank_e_widx;
   logic [8:0]                cur_burst_beats;     // 1..256
   logic                      ready_axi;
 
