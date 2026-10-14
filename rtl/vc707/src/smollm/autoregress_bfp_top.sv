@@ -198,6 +198,29 @@ module autoregress_bfp_top #(
   assign m_axi_arcache = emb_arvalid ? emb_arcache : lay_arvalid ? lay_arcache : dec_arcache;
   assign m_axi_arprot  = emb_arvalid ? emb_arprot  : lay_arvalid ? lay_arprot  : dec_arprot;
   assign m_axi_arqos   = emb_arvalid ? emb_arqos   : lay_arvalid ? lay_arqos   : dec_arqos;
+  // ---------------------------------------------------------------------------
+  // Restart-aware AXI-side reset.  `rst` (core clock) includes the host restart
+  // pulse, but the sub-modules' AXI-side logic was only ever reset by rst_axi
+  // (the MIG ui_clk reset).  Each of embed_lookup_bfp / weight_streamer_bfp_mt
+  // latches its completion level (done_axi / ready_axi) on the AXI side until
+  // the NEXT request, and the core side re-synchronises that level from a
+  // reset sync chain.  So on every run after the first, the stale level from
+  // the previous run's last transfer was still high when the new run started,
+  // and whether the core consumed stale beat_buf/bank contents or the new ones
+  // came down to the async clock phase -> non-deterministic tokens on chip
+  // (first run after a bitstream load always right).  Stretch the core reset
+  // to >= 4 core cycles, sync it into clk_axi and OR it into the AXI reset so
+  // both sides restart from the same idle state.  A request issued by the core
+  // while the AXI side is still in reset is not lost: the toggle handshake
+  // compares the synced level against tog_seen_axi, so it fires on release.
+  // ---------------------------------------------------------------------------
+  logic [3:0] rst_sr_core;
+  always_ff @(posedge clk) rst_sr_core <= {rst_sr_core[2:0], rst};
+  wire rst_long_core = rst | (|rst_sr_core);
+  (* ASYNC_REG = "TRUE" *) logic [1:0] rst_sync_axi;
+  always_ff @(posedge clk_axi) rst_sync_axi <= {rst_sync_axi[0], rst_long_core};
+  wire rst_axi_i = rst_axi | rst_sync_axi[1];
+
   // Read-data channel: one register slice right at the MIG (clk_axi), then
   // broadcast.  See axi_r_slice.sv — the MIG's SRL FIFO output straight into
   // the three 512-wide consumers was the 200 MHz critical path and lost
@@ -207,7 +230,7 @@ module autoregress_bfp_top #(
   wire [511:0]            r_rdata;
   wire [1:0]              r_rresp;
   axi_r_slice #(.ID_W(AXI_ID_WIDTH), .DATA_W(512)) i_rslice (
-    .clk(clk_axi), .rst(rst_axi),
+    .clk(clk_axi), .rst(rst_axi_i),
     .s_rvalid(m_axi_rvalid), .s_rready(m_axi_rready), .s_rid(m_axi_rid),
     .s_rdata(m_axi_rdata),   .s_rresp(m_axi_rresp),   .s_rlast(m_axi_rlast),
     .m_rvalid(r_rvalid),     .m_rready(r_rready),     .m_rid(r_rid),
@@ -247,7 +270,7 @@ module autoregress_bfp_top #(
     .hidden_m(emb_m), .hidden_e(emb_e), .done(emb_done),
     .ws_base_EMBED_LU_m(ws_base_EMBED_LU_m),
     .ws_base_EMBED_LU_e(ws_base_EMBED_LU_e),
-    .clk_axi(clk_axi), .rst_axi(rst_axi),
+    .clk_axi(clk_axi), .rst_axi(rst_axi_i),
     .m_axi_arvalid(emb_arvalid),
     .m_axi_arready(emb_arready),
     .m_axi_arid   (emb_arid),
@@ -296,7 +319,7 @@ module autoregress_bfp_top #(
     .ws_base_WG_m(ws_base_WG_m),   .ws_base_WG_e(ws_base_WG_e),
     .ws_base_WU_m(ws_base_WU_m),   .ws_base_WU_e(ws_base_WU_e),
     .ws_base_WDN_m(ws_base_WDN_m), .ws_base_WDN_e(ws_base_WDN_e),
-    .clk_axi(clk_axi), .rst_axi(rst_axi),
+    .clk_axi(clk_axi), .rst_axi(rst_axi_i),
     .m_axi_arvalid(lay_arvalid),
     .m_axi_arready(lay_arready),
     .m_axi_arid   (lay_arid),
@@ -342,7 +365,7 @@ module autoregress_bfp_top #(
     .token_out(dec_token), .done(dec_done),
     .ws_base_EMBED_m(ws_base_EMBED_m),
     .ws_base_EMBED_e(ws_base_EMBED_e),
-    .clk_axi(clk_axi), .rst_axi(rst_axi),
+    .clk_axi(clk_axi), .rst_axi(rst_axi_i),
     .m_axi_arvalid(dec_arvalid),
     .m_axi_arready(dec_arready),
     .m_axi_arid   (dec_arid),
