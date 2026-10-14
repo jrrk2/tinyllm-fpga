@@ -55,6 +55,8 @@
 #define MAC_LO 0x004D4731u  /* old eth_ctrl MAC (promiscuous below, so it's moot) */
 #define MAC_HI 0x00000200u
 #define FT_DDR_WRITE 0x0Au  /* UDP payload byte 0 = frame byte 42 */
+#define FT_DDR_WRITE_N 0x0Du /* batched: same header, N x 64-B chunks (N from UDP length) */
+#define DDR_WRITE_N_MAX 22u  /* 42 + 6 + 22*64 = 1456 B: fits the MTU and the 2 KiB RX slot */
 #define FT_REG_WRITE 0x01u
 #define FT_REG_READ  0x02u
 #define FT_REG_RSP   0x03u
@@ -278,6 +280,25 @@ static void eth_handle(void) {
                     DDR_DATA = ETH(ETH_RX(b, 6 + c) + 4);
                 }
                 eth_beats++;
+                eth_rx_bytes(b, ethf, 48);
+                ethf[42] = FT_ACK; ethf[43] = seq;
+                eth_reply(2);
+            } else if (ft == FT_DDR_WRITE_N) {
+                /* Batched upload: N CONSECUTIVE 64-B chunks from byte 48, N =
+                 * (UDP length - 8 - 6) / 64 (bytes 38-39, BE).  One address
+                 * write — the bridge auto-advances 64 B per 16-word beat — and
+                 * one ACK per frame, so the per-frame cost (header parse, ACK
+                 * build + TX) is paid once per 22 chunks instead of per chunk:
+                 * the single-chunk path drained only ~0.4 MB/s on this CPU. */
+                uint32_t ulen = ((uint32_t)rxb(b, 38) << 8) | rxb(b, 39);
+                uint32_t n    = (ulen > 14u) ? ((ulen - 14u) >> 6) : 0u;
+                if (n > DDR_WRITE_N_MAX) n = DDR_WRITE_N_MAX;
+                DDR_ADDR = ETH(ETH_RX(b, 5) + 4) & 0x3FFFFFFFu;   /* bytes 44-47 */
+                for (uint32_t w = 6; w < 6 + 8 * n; w++) {        /* 8 RX words / chunk */
+                    DDR_DATA = ETH(ETH_RX(b, w));
+                    DDR_DATA = ETH(ETH_RX(b, w) + 4);
+                }
+                eth_beats += n;
                 eth_rx_bytes(b, ethf, 48);
                 ethf[42] = FT_ACK; ethf[43] = seq;
                 eth_reply(2);

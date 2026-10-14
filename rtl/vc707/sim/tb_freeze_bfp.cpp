@@ -168,6 +168,17 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 4; ++i) std::printf(" %.5f", dec(gold_m[i], gold_e[i/TILE]));
     std::printf("\nhidden_out vs golden L%02d (decoded, 0.1%% tol): %d/%d differ, worst %+.4f\n",
                 L, fails, D, worst);
+    // Optional full dump (HOUT_DUMP=<path>): "got ref" per lane, for offline
+    // correlation / rel-rms analysis beyond the single worst-lane figure.
+    if (const char* hp = std::getenv("HOUT_DUMP")) {
+      if (FILE* hf = std::fopen(hp, "w")) {
+        for (int i = 0; i < D; ++i)
+          std::fprintf(hf, "%.6e %.6e\n",
+                       dec(get_signed(d->hidden_out_m, i, MANTW), get_signed(d->hidden_out_e, i/TILE, EXPW)),
+                       dec(gold_m[i], gold_e[i/TILE]));
+        std::fclose(hf);
+      }
+    }
     if (fails) rc = 1;
   } else {
     std::printf("(no golden L%02d — out[0..7] mant:", L);

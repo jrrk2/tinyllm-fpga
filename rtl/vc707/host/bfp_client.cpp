@@ -69,6 +69,7 @@ constexpr uint8_t FT_REG_RSP    = 0x03;
 constexpr uint8_t FT_HEARTBEAT  = 0x04;
 constexpr uint8_t FT_ACK        = 0x06;
 constexpr uint8_t FT_DDR_WRITE  = 0x0A;
+constexpr uint8_t FT_DDR_WRITE_N = 0x0D;   // batched: same 6-B header, N×64 B data
 constexpr uint8_t FT_PROG_WRITE = 0x0B;   // {dest_word(16b), nwords(8b)} + code -> progmem port B
 constexpr uint8_t FT_PROG_EXEC  = 0x0C;   // {entry_word(16b)} -> call PROG_BASE+entry*4, ACK retval
 
@@ -103,6 +104,12 @@ constexpr int N_STEPS_DEFAULT = 63;
 constexpr int N_STEPS_MAX     = 64;   // regmap 0x1D0..0x1EF = 32 words = 64 × 16-bit
 
 constexpr int      CHUNK            = 64;            // bytes per FT_DDR_WRITE
+// Batched upload (FT_DDR_WRITE_N): consecutive chunks per Ethernet frame.
+// 42-B eth/IP/UDP headers + 6-B FT header + 22×64 = 1456 B < 1500-B MTU, and
+// fits the PicoSoC MAC's 2 KiB RX slot.  The firmware derives N from the
+// UDP length, so any 1..22 is legal.
+constexpr int      MAX_CHUNKS_PER_FRAME = 22;
+constexpr int      ETH_RING_LIMIT   = 24;            // pause when MAC RX ring (32 slots) this deep
 constexpr int      DEFAULT_INFLIGHT = 32;
 constexpr int      RECV_TIMEOUT_MS  = 50;
 
@@ -259,19 +266,27 @@ void encode_reg_write(uint8_t* out, uint8_t seq, uint16_t addr, uint32_t data) {
     out[15] = 0;
 }
 
-// Encode FT_DDR_WRITE: [type, seq, addr0..addr3, data...]
-// 6-byte header (NOT 8 — eth_ctrl's parser slices data starting at
-// offset 6; the two extra pad bytes I had earlier shifted every chunk
-// by 2 bytes and silently corrupted every weight).  Matches Python's
+// Encode one upload frame.  FT_DDR_WRITE wire format: [type, seq,
+// addr0..addr3, data...] — a 6-byte header (NOT 8 — the parser slices data
+// starting at offset 6; two extra pad bytes once shifted every chunk by 2
+// bytes and silently corrupted every weight).  Matches Python's
 // struct.pack("<BBI", FT_DDR_WRITE, seq, addr) + data.
-void encode_ddr_write(uint8_t* out, uint8_t seq, uint32_t addr, const uint8_t* data) {
-    out[0] = FT_DDR_WRITE;
+//
+// Such a frame holding n (1..MAX_CHUNKS_PER_FRAME) CONSECUTIVE
+// chunks starting at DDR byte `addr`.  n==1 keeps the legacy FT_DDR_WRITE
+// type (works on pre-batching firmware); n>1 uses FT_DDR_WRITE_N, which the
+// firmware answers with ONE ACK[seq] after writing all n beats.  Returns the
+// payload length.
+size_t encode_ddr_frame(uint8_t* out, uint8_t seq, uint32_t addr,
+                        const uint8_t* data, int n) {
+    out[0] = (n == 1) ? FT_DDR_WRITE : FT_DDR_WRITE_N;
     out[1] = seq;
     out[2] = static_cast<uint8_t>(addr & 0xff);
     out[3] = static_cast<uint8_t>((addr >> 8) & 0xff);
     out[4] = static_cast<uint8_t>((addr >> 16) & 0xff);
     out[5] = static_cast<uint8_t>((addr >> 24) & 0xff);
-    std::memcpy(out + 6, data, CHUNK);
+    std::memcpy(out + 6, data, (size_t)n * CHUNK);
+    return 6 + (size_t)n * CHUNK;
 }
 
 std::vector<uint32_t> reg_read(Udp& u, uint16_t addr, uint8_t nwords = 1, uint8_t seq = 1) {
@@ -322,8 +337,15 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
                    uint32_t base = 0, int max_passes = 4,
                    int lead_limit = 4096, int poll_ms = 5,
                    double target_mbps = 2.0,
-                   int backlog_limit = 32) {
+                   int backlog_limit = 32,
+                   int chunks_per_frame = 1) {
     (void)max_passes;
+    if (chunks_per_frame < 1) chunks_per_frame = 1;
+    if (chunks_per_frame > MAX_CHUNKS_PER_FRAME) chunks_per_frame = MAX_CHUNKS_PER_FRAME;
+    // -r unset: legacy single-chunk frames keep the historical 2 MB/s pace;
+    // batched frames are limited by the firmware's per-frame cost, so let
+    // the probe find the rate.
+    if (target_mbps < 0) target_mbps = (chunks_per_frame > 1) ? 0.0 : 2.0;
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("cannot open " + path);
     std::streamsize n_bytes = f.tellg();
@@ -334,8 +356,8 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
 
     int n_real = static_cast<int>((n_bytes + CHUNK - 1) / CHUNK);
     blob.resize(static_cast<size_t>(n_real) * CHUNK, 0);  // zero-pad tail
-    std::printf("[upload] file=%s  bytes=%lld  chunks=%d  passes(max)=%d\n",
-                path.c_str(), (long long)n_bytes, n_real, max_passes);
+    std::printf("[upload] file=%s  bytes=%lld  chunks=%d  passes(max)=%d  chunks/frame=%d\n",
+                path.c_str(), (long long)n_bytes, n_real, max_passes, chunks_per_frame);
 
     // Sanity check: dump the bytes that would be in the first frame
     // (chunk_idx=0).  Cross-check against Python's encode_frame() for
@@ -343,7 +365,7 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
     // format bug masquerading as a rate issue.
     {
         uint8_t probe[6 + CHUNK];
-        encode_ddr_write(probe, /*seq=*/0, /*addr=*/base, blob.data());
+        encode_ddr_frame(probe, /*seq=*/0, /*addr=*/base, blob.data(), 1);
         std::printf("[upload] first-frame probe (70 bytes, hex):\n  hdr:");
         for (int i = 0; i < 6;  ++i) std::printf(" %02x", probe[i]);
         std::printf("\n  data:");
@@ -456,7 +478,7 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
         int    probe_base = 0;   // chunk-index cursor for disjoint probe regions
 
         // One shared drainer covers all probe iterations.
-        std::deque<int>   probe_seq_q[256];
+        std::deque<std::pair<int,int>> probe_seq_q[256];   // {first chunk, n}
         std::mutex        probe_seq_mu;
         std::atomic<bool> probe_drain_stop{false};
         std::thread probe_drainer([&]() {
@@ -469,11 +491,14 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
                 if (s == 0xff) continue;
                 std::lock_guard<std::mutex> g(probe_seq_mu);
                 if (probe_seq_q[s].empty()) continue;
-                int chunk_idx = probe_seq_q[s].front();
+                auto fr = probe_seq_q[s].front();
                 probe_seq_q[s].pop_front();
-                if (!chunk_acked[chunk_idx]) {
-                    chunk_acked[chunk_idx] = 1;
-                    acked_total.fetch_add(1, std::memory_order_relaxed);
+                for (int k = 0; k < fr.second; ++k) {
+                    int ci = fr.first + k;
+                    if (!chunk_acked[ci]) {
+                        chunk_acked[ci] = 1;
+                        acked_total.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
         });
@@ -490,10 +515,11 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
             auto burst_t0 = std::chrono::steady_clock::now();
             auto next_send_at = burst_t0;
             uint8_t seq = 0;
-            for (int i = 0; i < burst_chunks; ++i) {
+            for (int i = 0; i < burst_chunks; ) {
+                int nfr = std::min(chunks_per_frame, burst_chunks - i);
                 while (std::chrono::steady_clock::now() < next_send_at)
                     std::this_thread::yield();
-                next_send_at += probe_period;
+                next_send_at += probe_period * nfr;
                 // Same backstops as main pass.  These will stretch
                 // send_secs above the nominal r when the wire / MIG
                 // path can't keep up — and that stretch is exactly
@@ -503,20 +529,23 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
                     int      backlog = fpga_backlog.load(std::memory_order_relaxed);
                     bool ahead   = (global_sent > fdone + (uint32_t)lead_limit);
                     bool stuffed = (backlog > backlog_limit);
-                    if (!ahead && !stuffed) break;
+                    bool ringful = (eth_ring.load(std::memory_order_relaxed) > ETH_RING_LIMIT);
+                    if (!ahead && !stuffed && !ringful) break;
                     std::this_thread::yield();
                 }
                 int chunk_idx = probe_base + i;
                 uint32_t addr = base + static_cast<uint32_t>(chunk_idx) * CHUNK;
-                uint8_t tx[6 + CHUNK];
-                encode_ddr_write(tx, seq, addr, blob.data() + (size_t)chunk_idx * CHUNK);
-                u.send(tx, sizeof(tx));
+                uint8_t tx[6 + MAX_CHUNKS_PER_FRAME * CHUNK];
+                size_t len = encode_ddr_frame(tx, seq, addr,
+                                              blob.data() + (size_t)chunk_idx * CHUNK, nfr);
+                u.send(tx, len);
                 {
                     std::lock_guard<std::mutex> g(probe_seq_mu);
-                    probe_seq_q[seq].push_back(chunk_idx);
+                    probe_seq_q[seq].push_back({chunk_idx, nfr});
                 }
                 ++seq;
-                ++global_sent;
+                global_sent += nfr;
+                i += nfr;
             }
             // Capture send-only wall-clock BEFORE the drain — this is
             // the actual achievable throughput at target r (backstops
@@ -609,7 +638,7 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
         std::printf("[pass %d] sending %zu chunks\n", pass, work.size());
         std::fflush(stdout);
 
-        std::deque<int> seq_q[256];
+        std::deque<std::pair<int,int>> seq_q[256];   // {first chunk, n} per in-flight frame
         std::mutex      seq_mu;
         std::atomic<bool> drain_stop{false};
 
@@ -627,11 +656,14 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
                 if (s == 0xff) continue;
                 std::lock_guard<std::mutex> g(seq_mu);
                 if (seq_q[s].empty()) continue;
-                int chunk_idx = seq_q[s].front();
+                auto fr = seq_q[s].front();
                 seq_q[s].pop_front();
-                if (!chunk_acked[chunk_idx]) {
-                    chunk_acked[chunk_idx] = 1;
-                    acked_total.fetch_add(1, std::memory_order_relaxed);
+                for (int k = 0; k < fr.second; ++k) {
+                    int ci = fr.first + k;
+                    if (!chunk_acked[ci]) {
+                        chunk_acked[ci] = 1;
+                        acked_total.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
         });
@@ -644,12 +676,19 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
         // the requested rate without rounding-up to scheduler ticks.
         auto next_send_at = std::chrono::steady_clock::now();
         uint8_t seq = 0;
-        for (size_t i = 0; i < work.size(); ++i) {
-            // Per-chunk pacing (primary throttle): wait until the
-            // scheduled send time for this chunk.
+        for (size_t i = 0; i < work.size(); ) {
+            // Group up to chunks_per_frame CONSECUTIVE chunk indices into one
+            // frame (pass 1: always full frames; retry passes: whatever runs
+            // of missing chunks remain).
+            size_t j = i;
+            while (j + 1 < work.size() && work[j + 1] == work[j] + 1 &&
+                   (int)(j + 1 - i) < chunks_per_frame) ++j;
+            int nfr = (int)(j - i + 1);
+            // Pacing (primary throttle): wait until the scheduled send time
+            // for this frame (one chunk_period per chunk it carries).
             while (std::chrono::steady_clock::now() < next_send_at)
                 std::this_thread::yield();
-            next_send_at += chunk_period;
+            next_send_at += chunk_period * nfr;
 
             // FPGA-side flow control (backstop): hold off whenever EITHER
             //   (a) cumulative send is too far ahead of MIG-write progress
@@ -657,26 +696,32 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
             //   (b) the parser→MIG backlog (rx - done, live) is too deep —
             //       autoregress reads can starve ddr_wr_master, causing
             //       the FIFO to grow even at a "safe" average rate.
+            //   (c) the MAC RX ring is nearly full — the PicoSoC firmware drains
+            //       it one frame at a time; overflowing it just drops frames
+            //       that pass 2+ then has to resend.
             while (true) {
                 uint32_t fdone = fpga_done_delta.load(std::memory_order_relaxed);
                 int      backlog = fpga_backlog.load(std::memory_order_relaxed);
                 bool ahead   = (global_sent > fdone + (uint32_t)lead_limit);
                 bool stuffed = (backlog > backlog_limit);
-                if (!ahead && !stuffed) break;
+                bool ringful = (eth_ring.load(std::memory_order_relaxed) > ETH_RING_LIMIT);
+                if (!ahead && !stuffed && !ringful) break;
                 std::this_thread::yield();
             }
 
             int chunk_idx = work[i];
             uint32_t addr = base + static_cast<uint32_t>(chunk_idx) * CHUNK;
-            uint8_t  tx[6 + CHUNK];
-            encode_ddr_write(tx, seq, addr, blob.data() + (size_t)chunk_idx * CHUNK);
-            u.send(tx, sizeof(tx));
+            uint8_t  tx[6 + MAX_CHUNKS_PER_FRAME * CHUNK];
+            size_t   len = encode_ddr_frame(tx, seq, addr,
+                                            blob.data() + (size_t)chunk_idx * CHUNK, nfr);
+            u.send(tx, len);
             {
                 std::lock_guard<std::mutex> g(seq_mu);
-                seq_q[seq].push_back(chunk_idx);
+                seq_q[seq].push_back({chunk_idx, nfr});
             }
             ++seq;
-            ++global_sent;
+            global_sent += nfr;
+            i = j + 1;
 
             // Light progress; no per-iter sleep on purpose.
             auto now = std::chrono::steady_clock::now();
@@ -744,6 +789,12 @@ UploadStats upload(Udp& u, const std::string& peer_ip, uint16_t peer_port,
         std::fflush(stdout);
 
         if (still_missing == 0) break;
+        if (pass == 1 && chunks_per_frame > 1 && newly_acked == 0) {
+            std::printf("[upload] ERROR: no ACKs at all for batched frames — the FPGA "
+                        "firmware predates FT_DDR_WRITE_N (0x0D).  Rerun with -b 1, "
+                        "or fw-swap the current fw_engine.\n");
+            break;
+        }
         // Note: FPGA done_count == n_real doesn't *prove* per-chunk
         // correctness — UDP has only a weak 16-bit checksum and the
         // parser doesn't verify it, so a flipped address bit could
@@ -1690,7 +1741,11 @@ void usage() {
     std::fprintf(stderr,
         "usage: bfp_client [-p IP:PORT] [-v VOCAB_BIN] [-m MAC]\n"
         "                  [-L LEAD_LIMIT] [-P POLL_MS] <cmd> [args]\n"
-        "  -r  target upload rate in MB/s, steady-paced per-chunk    (default 2.0,\n"
+        "  -b  64-B chunks per upload frame, 1..22                   (default 22)\n"
+        "      22 = batched FT_DDR_WRITE_N (one ACK per 1408-B frame; needs the\n"
+        "      batching fw_engine).  1 = legacy one-chunk FT_DDR_WRITE frames.\n"
+        "  -r  target upload rate in MB/s, steady-paced per-chunk    (default: 2.0\n"
+        "      for -b 1, auto-probe for batched;\n"
         "      0 = auto-probe: ramp 2/4/6/8/10 MB/s, pick min projected total)\n"
         "      Mirrors Python's structurally-slow loop — burst sends seem\n"
         "       to race the FPGA's eth_ctrl→MIG handshake even at safe averages.\n"
@@ -1749,8 +1804,9 @@ int main(int argc, char** argv) {
     std::string fpga_mac   = FPGA_MAC;
     int         lead_limit = 4096;     // backstop only — primary pace is -r
     int         poll_ms    = 5;
-    double      target_mbps = 2.0;     // matches Python's measured 1.96 MB/s
+    double      target_mbps = -1.0;    // unset: 2.0 for -b 1 (Python's 1.96 MB/s), probe for batched
     int         backlog_limit = 32;    // pause sender when parser→MIG backlog > this
+    int         chunks_per_frame = MAX_CHUNKS_PER_FRAME;   // -b: 64-B chunks per frame
     int         n_steps    = N_STEPS_DEFAULT;
     int         verify_count = 1000;   // -N for verify-sampled
 
@@ -1780,6 +1836,12 @@ int main(int argc, char** argv) {
             }
         } else if (a == "-B" && argi + 1 < argc) {
             backlog_limit = std::atoi(argv[++argi]);
+        } else if (a == "-b" && argi + 1 < argc) {
+            chunks_per_frame = std::atoi(argv[++argi]);
+            if (chunks_per_frame < 1 || chunks_per_frame > MAX_CHUNKS_PER_FRAME) {
+                std::fprintf(stderr, "-b must be 1..%d\n", MAX_CHUNKS_PER_FRAME);
+                return 2;
+            }
         } else if (a == "-N" && argi + 1 < argc) {
             verify_count = std::atoi(argv[++argi]);
         } else if (a == "-n" && argi + 1 < argc) {
@@ -1869,7 +1931,7 @@ int main(int argc, char** argv) {
         if (cmd == "upload") {
             if (argi >= argc) { usage(); return 2; }
             upload(u, peer_ip, peer_port, argv[argi], 0, 4,
-                   lead_limit, poll_ms, target_mbps, backlog_limit);
+                   lead_limit, poll_ms, target_mbps, backlog_limit, chunks_per_frame);
             return 0;
         }
         if (cmd == "verify") {
@@ -2013,10 +2075,9 @@ int main(int argc, char** argv) {
             // `all` is the bulk-bring-up path — use probe-then-commit by
             // default (target_mbps=0) so we don't crawl at the global 2 MB/s
             // default.  User can still override with -r.
-            double all_mbps = target_mbps;
-            if (target_mbps == 2.0) all_mbps = 0.0;  // default → adaptive
+            double all_mbps = (target_mbps < 0) ? 0.0 : target_mbps;  // default → adaptive
             upload(u, peer_ip, peer_port, bin, 0, 4,
-                   lead_limit, poll_ms, all_mbps, backlog_limit);
+                   lead_limit, poll_ms, all_mbps, backlog_limit, chunks_per_frame);
             // Settle: the BFP autoregress auto-restarts in a perpetual
             // loop (bfp_start_r self-fires whenever lay_done is low), so
             // it's almost certainly mid-run when upload finishes — its

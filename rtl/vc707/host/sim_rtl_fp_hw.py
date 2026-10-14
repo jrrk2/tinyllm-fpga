@@ -245,9 +245,13 @@ def main():
                 nid = int(np.random.choice(len(p), p=p))
             else:
                 nid = int(np.argmax(logits))
+            # Proper autoregression (see gen_smollm_blockfp_full.py): feed the
+            # prediction made at the last prompt position, don't repeat the
+            # last prompt token.
+            if step >= len(ids) - 1:
+                generated.append(nid)
             if step >= len(ids):
                 print(tok.decode([nid]), end='', flush=True)
-                generated.append(nid)
     print()
 
 

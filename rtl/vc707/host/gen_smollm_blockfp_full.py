@@ -438,9 +438,16 @@ def main():
             h_normed = (h / np.sqrt(np.mean(h*h) + 1e-5)) * norm_w_q
             logits = h_normed @ embed.T
             nid = int(np.argmax(logits))
+            # Proper autoregression: the prediction made at the LAST prompt
+            # position (step == len(ids)-1) is the first generated token and
+            # must be fed at step len(ids).  Previously it was dropped and the
+            # last prompt token was fed twice ("Once upon a time time, ..."),
+            # so GOLDEN_TOKENS disagreed with the RTL, which feeds its own
+            # previous prediction (autoregress_bfp_top last_token).
+            if step >= len(ids) - 1:
+                generated.append(nid)
             if step >= len(ids):
                 print(tok.decode([nid]), end='', flush=True, file=sys.stderr)
-                generated.append(nid)
     print(file=sys.stderr)
 
     # Save golden tokens (one per line) for RTL to compare against.
