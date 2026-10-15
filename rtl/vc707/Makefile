@@ -1230,3 +1230,18 @@ litex-engine: $(GENERATED_DIR)/build_version.svh
 	$(LITEX_GEN_CMD)
 litex-engine-load:
 	~/openFPGALoader/build/openFPGALoader -c digilent --freq 15000000 $(LITEX_OUT)/gateware/xilinx_vc707.bit
+LITEX_FW_DIR   := litex/fw
+LITEX_TFTP_DIR ?= $(HOME)/tftp-vc707/10:e2:d5:54:4c:4d
+.PHONY: litex-fw litex-fw-deploy litex-sd-bundle
+litex-fw:
+	$(MAKE) -C $(LITEX_FW_DIR) BUILD_DIR=../../$(LITEX_OUT)
+# Netboot: the BIOS (REMOTE_IP 192.168.1.106:6969, scripts/tftp_serve.py in
+# xc7-bitstream-tools serving ~/tftp-vc707 per MAC) fetches boot.json + FW.BIN.
+litex-fw-deploy: litex-fw
+	mkdir -p "$(LITEX_TFTP_DIR)"
+	cp $(LITEX_FW_DIR)/tinyllm_fw.bin "$(LITEX_TFTP_DIR)/FW.BIN"
+	printf '{\n "FW.BIN": "0x7f000000"\n}\n' > "$(LITEX_TFTP_DIR)/boot.json"
+	@echo "deployed to $(LITEX_TFTP_DIR)"
+# SD card bundle: make litex-sd-bundle SD_OUT=/media/<card>
+litex-sd-bundle: litex-fw
+	python3 litex/sd/make_sd_bundle.py --out "$(SD_OUT)"
