@@ -189,7 +189,17 @@ module autoregress_bfp_top #(
   // ever high; the priority ordering protects against transient overlap.
   // ---------------------------------------------------------------------------
   assign m_axi_arvalid = emb_arvalid | lay_arvalid | dec_arvalid;
-  assign m_axi_arid    = emb_arvalid ? emb_arid    : lay_arvalid ? lay_arid    : dec_arid;
+  // One ARID per read master.  The sub-modules all drive arid 0 and take ANY
+  // rvalid while in their R state; the 2026-10-15 on-chip correlation showed
+  // the first R beat after a restart coming from a weight region (another
+  // master's burst) in ~8 % of runs, which the embed loader swallowed as its
+  // own row -> garbage from token 0.  Tag each master's AR here and demux R
+  // by RID below so a beat can only reach the master that asked for it.
+  localparam logic [AXI_ID_WIDTH-1:0] ID_EMB = AXI_ID_WIDTH'(0);
+  localparam logic [AXI_ID_WIDTH-1:0] ID_LAY = AXI_ID_WIDTH'(1);
+  localparam logic [AXI_ID_WIDTH-1:0] ID_DEC = AXI_ID_WIDTH'(2);
+  assign m_axi_arid    = emb_arvalid ? ID_EMB : lay_arvalid ? ID_LAY : ID_DEC;
+  wire _unused_arid = &{1'b0, emb_arid, lay_arid, dec_arid};
   assign m_axi_araddr  = emb_arvalid ? emb_araddr  : lay_arvalid ? lay_araddr  : dec_araddr;
   assign m_axi_arlen   = emb_arvalid ? emb_arlen   : lay_arvalid ? lay_arlen   : dec_arlen;
   assign m_axi_arsize  = emb_arvalid ? emb_arsize  : lay_arvalid ? lay_arsize  : dec_arsize;
@@ -249,18 +259,20 @@ module autoregress_bfp_top #(
     .s_rdata(m_axi_rdata),   .s_rresp(m_axi_rresp),   .s_rlast(m_axi_rlast),
     .m_rvalid(r_rvalid),     .m_rready(r_rready),     .m_rid(r_rid),
     .m_rdata(r_rdata),       .m_rresp(r_rresp),       .m_rlast(r_rlast));
-  // rready: broadcast; each sub-module ignores rvalid when inactive.
-  assign r_rready = emb_rready & lay_rready & dec_rready;
+  // rready / rvalid: demuxed by RID (see ID_* above).  A beat whose RID
+  // matches nobody (none expected) is accepted and dropped.
+  assign r_rready = (r_rid == ID_EMB) ? emb_rready :
+                    (r_rid == ID_LAY) ? lay_rready :
+                    (r_rid == ID_DEC) ? dec_rready : 1'b1;
 
   // arready arrives back; route to whichever source's arvalid is winning.
   wire emb_arready = m_axi_arready & emb_arvalid;
   wire lay_arready = m_axi_arready & (~emb_arvalid) & lay_arvalid;
   wire dec_arready = m_axi_arready & (~emb_arvalid) & (~lay_arvalid) & dec_arvalid;
-  // rvalid / rid / rdata / rresp / rlast broadcast — at most one
-  // sub-module's load FSM is in its R-state at any moment.
-  wire emb_rvalid_b = r_rvalid;
-  wire lay_rvalid_b = r_rvalid;
-  wire dec_rvalid_b = r_rvalid;
+  // rdata / rresp / rlast are broadcast; rvalid is gated per master by RID.
+  wire emb_rvalid_b = r_rvalid & (r_rid == ID_EMB);
+  wire lay_rvalid_b = r_rvalid & (r_rid == ID_LAY);
+  wire dec_rvalid_b = r_rvalid & (r_rid == ID_DEC);
 
   // ---------------------------------------------------------------------------
   // embed_lookup_bfp.
