@@ -35,6 +35,9 @@ tinyllm_fw.elf: $(OBJECTS) linker.ld
 
 -include $(OBJECTS:.o=.d)
 
+# the banner carries __DATE__/__TIME__: rebuild it with any source
+main.o: net.c tok.c sdload.c tinyllm.h
+
 VPATH = $(BIOS_DIRECTORY):$(BIOS_DIRECTORY)/cmds:$(CPU_DIRECTORY)
 
 %.o: %.c

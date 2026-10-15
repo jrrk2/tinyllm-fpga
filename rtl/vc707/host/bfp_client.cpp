@@ -1797,10 +1797,10 @@ static bool blast_fetch_sums(Udp& u, uint32_t base, uint32_t block, uint32_t fir
         for (int i = 0; i < 4; ++i) { tx[2 + i] = base >> (8 * i); tx[6 + i] = block >> (8 * i); }
         tx[10] = first; tx[11] = first >> 8; tx[12] = n; tx[13] = n >> 8;
         u.send(tx, sizeof(tx));
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
         while (std::chrono::steady_clock::now() < deadline) {
             uint8_t rx[2048]; size_t got = 0;
-            if (!u.recv(rx, sizeof(rx), &got)) break;
+            if (!u.recv(rx, sizeof(rx), &got)) continue;
             if (got < 8 || rx[0] != FT_CKSUM_RSP || rx[1] != seq) continue;
             uint32_t rn = rx[4] | (rx[5] << 8);
             if (rn != n || got < 8 + 4 * n) continue;
@@ -1851,9 +1851,9 @@ int blast_upload(Udp& u, const std::string& path, uint32_t base, double target_m
         size_t off = (size_t)b * block, len = std::min((size_t)block, img.size() - off);
         want[b] = blast_cksum(img.data() + off, len);
     }
-    // The image tail may not fill the last block: pad the firmware's view by
-    // uploading a zero-filled block end so both sides sum the same bytes.
-    if (img.size() % block) img.resize((size_t)nblocks * block, 0);
+    // The last block may be partial: it is checksummed over its real length
+    // (its own request below), so nothing beyond the image is ever compared.
+    const size_t img_bytes = img.size();
     uint8_t seq = 0;
     auto t0 = std::chrono::steady_clock::now();
     u.drain();
@@ -1869,12 +1869,21 @@ int blast_upload(Udp& u, const std::string& path, uint32_t base, double target_m
         if (check.empty()) for (uint32_t b = 0; b < nblocks; ++b) check.push_back(b);
         std::vector<uint32_t> still;
         u.drain();
+        const bool tail_partial = (img_bytes % block) != 0;
         for (size_t i = 0; i < check.size(); ) {
-            // consecutive run starting at check[i], up to 64 blocks
             uint32_t first = check[i]; size_t j = i;
-            while (j < check.size() && check[j] == first + (uint32_t)(j - i) && j - i < 64) ++j;
             std::vector<uint32_t> got;
-            if (!blast_fetch_sums(u, base, block, first, (uint32_t)(j - i), got, seq)) {
+            bool ok;
+            if (tail_partial && first == nblocks - 1) {          // partial last block: own length
+                ok = blast_fetch_sums(u, base + first * block, (uint32_t)(img_bytes % block), 0, 1, got, seq);
+                j = i + 1;
+            } else {
+                // consecutive run of full blocks, 16 MiB per request keeps the CPU's reply inside the timeout
+                while (j < check.size() && check[j] == first + (uint32_t)(j - i) && j - i < 16
+                       && !(tail_partial && check[j] == nblocks - 1)) ++j;
+                ok = blast_fetch_sums(u, base, block, first, (uint32_t)(j - i), got, seq);
+            }
+            if (!ok) {
                 std::printf("[blast] no checksum reply for blocks %u..%u — firmware without FT_CKSUM_REQ?\n",
                             first, first + (uint32_t)(j - i) - 1);
                 return 1;
@@ -1884,8 +1893,9 @@ int blast_upload(Udp& u, const std::string& path, uint32_t base, double target_m
             i = j;
         }
         double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::printf("[blast] round %d: %zu/%u blocks need repair  (%.1f s)\n",
-                    round, still.size(), nblocks, secs);
+        std::printf("[blast] round %d: %zu/%u blocks need repair  (%.1f s)", round, still.size(), nblocks, secs);
+        for (size_t k = 0; k < still.size() && k < 12; ++k) std::printf("%s%u", k ? "," : "  [", still[k]);
+        std::printf("%s\n", still.empty() ? "" : (still.size() > 12 ? ",...]" : "]"));
         if (still.empty()) {
             std::printf("[blast] done in %.1fs, %zu bytes verified (%.2f MB/s)\n",
                         secs, img.size(), img.size() / secs / 1e6);
@@ -1894,7 +1904,8 @@ int blast_upload(Udp& u, const std::string& path, uint32_t base, double target_m
         if (verify_only) return 1;
         bad = still;
         for (uint32_t b : bad)
-            blast_send_range(u, img, base, (size_t)b * block, block, target_mbps * 0.5, seq);
+            blast_send_range(u, img, base, (size_t)b * block,
+                             std::min((size_t)block, img_bytes - (size_t)b * block), target_mbps * 0.5, seq);
     }
     std::printf("[blast] gave up after %d rounds, %zu blocks still differ\n", max_rounds, bad.size());
     return 1;
