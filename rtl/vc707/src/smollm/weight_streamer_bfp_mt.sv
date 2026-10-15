@@ -24,7 +24,11 @@ module weight_streamer_bfp_mt #(
   parameter int IN_DIM_MAX     = 1536,      // largest matvec input dim (FFN)
   parameter int IN_DIM_BITS    = 12,        // bits for in_dim (1536 fits 11)
   parameter int CHUNK_BITS     = 8,         // chunks per output dim (default 8 covers FFN=4096; caller can override)
-  parameter int MAX_AR_LEN     = 256,       // AXI burst max-beats (MIG default)
+  // 64 beats x 64 B = 4 KiB, the AXI4 maximum burst.  The MIG accepted 256
+  // (16 KiB), but LiteX's AXIBurst2Beat (LiteDRAM front end) keeps the beat
+  // offset in a 13-bit signed register and wraps after 4 KiB, so beats 64+ of
+  // a longer burst read the wrong address (LiteX SoC, 2026-10-15).
+  parameter int MAX_AR_LEN     = 64,
   // Sim-only selftest shadow sizing.  Default (1<<14) suits the
   // D=64 layer-selftest; the layer module overrides to cover the
   // largest matvec (max(out_dim) × max(in_dim) / 16) when running at
