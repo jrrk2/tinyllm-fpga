@@ -95,7 +95,8 @@ static void hex_(uint32_t v, int nyb) {
 
 static void menu(void) {
     print_("\nfw_engine " __DATE__ " " __TIME__ "\n");
-    print_("v ver  c crc  s status  w ddrwr  e eth  r restart  ? menu\n");
+    print_("v ver  c crc  s status  w ddrwr  e eth  r restart  ? menu  (+Enter)\n");
+    print_("or type a prompt (2+ chars) + Enter to run the model\n");
 }
 
 static void cmd_version(void) {
@@ -361,6 +362,118 @@ static void cmd_eth(void) {
     print_(" acks=");      hex_(eth_acks, 8); putc_('\n');
 }
 
+
+/* ======================= serial prompt mode =======================
+ * Type a line of text (2+ chars) + Enter on the console: the firmware
+ * tokenises it (greedy longest match against the vocabulary table the host
+ * uploaded to DDR3), loads the prompt ROM, restarts the engine, waits for
+ * done and prints the generated continuation.  Single-char lines are the
+ * debug menu commands.
+ *
+ * DDR3 read window (picosoc_eth_bridge 0x32/0x33 -> soc_ddr_bridge): a load
+ * from DDR_RD_DATA performs one 32-bit DDR3 read at DDR_RD_ADDR (stalls the
+ * CPU ~0.4 us) and advances the address by 4.  Only used while the engine
+ * is idle (stray SoC beats are dropped by the idle engine consumers).
+ *
+ * Vocabulary table (host/gen_serial_vocab.py, uploaded with
+ * `bfp_client -a 0x3C000000 upload generated/serial_vocab.bin`):
+ *   u32[0] 'SVOC'  [1] n_tokens  [2] order_off  [3] entries_off  [4] blob_off
+ *   byte 32: first-byte index, 256 x {u32 start, u32 count} into `order`
+ *   order:   u16 token ids grouped by first byte, longest token first
+ *   entries: u32 per token id = (len << 24) | blob_off
+ *   blob:    raw token bytes (same blob as bfp_vocab.bin)                */
+#define DDR_RD_DATA (*(volatile uint32_t *)0x32000000u)
+#define DDR_RD_ADDR (*(volatile uint32_t *)0x33000000u)
+#define SVOC_BASE   0x3C000000u   /* 960 MiB: above the 843 MB smollm360 image */
+#define SVOC_MAGIC  0x434F5653u   /* 'SVOC' little-endian */
+#define NPROMPT_MAX 24            /* LBFP_FULL_NPROMPT_MAX (prompt ROM depth) */
+#define N_GEN       8             /* LBFP_FULL_NGEN */
+#define LINE_MAX    160
+
+static uint32_t rd32(uint32_t a) { DDR_RD_ADDR = a; return DDR_RD_DATA; }
+static uint32_t rd8_wa = 0xFFFFFFFFu, rd8_w;        /* one-word cache for byte reads */
+static uint8_t  rd8(uint32_t a) {
+    uint32_t wa = a & ~3u;
+    if (wa != rd8_wa) { rd8_wa = wa; rd8_w = rd32(wa); }
+    return (uint8_t)(rd8_w >> (8u * (a & 3u)));
+}
+static void dec_(uint32_t v) {
+    char b[11]; int i = 10; b[i] = 0;
+    do { b[--i] = (char)('0' + v % 10u); v /= 10u; } while (v);
+    print_(b + i);
+}
+
+static uint32_t sv_order, sv_entries, sv_blob;
+static int      sv_ok;
+static int sv_init(void) {
+    rd8_wa = 0xFFFFFFFFu;
+    if (rd32(SVOC_BASE) != SVOC_MAGIC) { sv_ok = 0; return 0; }
+    sv_order   = SVOC_BASE + rd32(SVOC_BASE + 8);
+    sv_entries = SVOC_BASE + rd32(SVOC_BASE + 12);
+    sv_blob    = SVOC_BASE + rd32(SVOC_BASE + 16);
+    sv_ok = 1; return 1;
+}
+static void print_tok(uint32_t t) {
+    uint32_t e = rd32(sv_entries + t * 4u), len = e >> 24, off = e & 0xFFFFFFu;
+    for (uint32_t i = 0; i < len; i++) putc_((char)rd8(sv_blob + off + i));
+}
+/* Greedy longest match: for each position scan the first-byte group (sorted
+ * longest-first), take the first token whose bytes all match.  Byte-level BPE
+ * has a token for every single byte, so this always advances. */
+static int tokenize(const char *s, int n, uint16_t *out) {
+    int pos = 0, cnt = 0;
+    while (pos < n && cnt < NPROMPT_MAX) {
+        uint32_t ix = SVOC_BASE + 32u + (uint32_t)(uint8_t)s[pos] * 8u;
+        uint32_t start = rd32(ix), count = rd32(ix + 4u);
+        uint32_t best = 0; int best_len = 0;
+        for (uint32_t i = start; i < start + count; i++) {
+            uint32_t ow  = rd32(sv_order + (i & ~1u) * 2u);
+            uint32_t tok = (i & 1u) ? (ow >> 16) : (ow & 0xFFFFu);
+            uint32_t e   = rd32(sv_entries + tok * 4u);
+            int len = (int)(e >> 24); uint32_t off = e & 0xFFFFFFu;
+            if (len > n - pos) continue;
+            int k = 0;
+            while (k < len && (uint8_t)s[pos + k] == rd8(sv_blob + off + (uint32_t)k)) k++;
+            if (k == len) { best = tok; best_len = len; break; }
+        }
+        if (best_len == 0) { pos++; continue; }
+        out[cnt++] = (uint16_t)best; pos += best_len;
+    }
+    return cnt;
+}
+static void run_prompt(const char *line, int n) {
+    if (!sv_ok && !sv_init()) {
+        print_("no vocab table at 0x3C000000 (host: bfp_client -a 0x3C000000 upload serial_vocab.bin)\n");
+        return;
+    }
+    uint16_t toks[NPROMPT_MAX];
+    int nt = tokenize(line, n, toks);
+    if (nt == 0) return;
+    print_("tokens:");
+    for (int i = 0; i < nt; i++) { putc_(' '); dec_(toks[i]); }
+    putc_('\n');
+    for (int i = 0; i < nt; i++) {               /* prompt ROM = BRAM kind 6 */
+        REG(R_BRAM_TARGET) = (6u << 18) | (uint32_t)i;
+        REG(R_BRAM_DATA)   = toks[i];
+    }
+    REG(R_N_PROMPT) = (uint32_t)nt;
+    REG(R_RESTART)  = 1;
+    for (volatile int d = 0; d < 20000; d++);    /* let the latched done clear (CDC) */
+    uint32_t polls = 0;
+    while (!(REG(R_LAYER_DONE) & 2u)) {
+        for (volatile int d = 0; d < 100; d++);
+        if (++polls > 4000000u) { print_("engine timeout\n"); return; }
+    }
+    print_(line);
+    for (int k = nt - 1; k < nt + N_GEN; k++) {  /* prediction at the last prompt pos + N_GEN more */
+        uint32_t w = REG(R_RESULT + (k >> 1));
+        uint32_t t = (k & 1) ? (w >> 16) : (w & 0xFFFFu);
+        if (t == 0) break;                       /* <|endoftext|> */
+        print_tok(t);
+    }
+    putc_('\n');
+}
+
 void main(void)
 {
     reg_uart_clkdiv = UART_DIV;
@@ -369,24 +482,36 @@ void main(void)
     eth_init();
     menu();
     print_("> ");
+    static char line[LINE_MAX];
+    int ll = 0;
     for (;;) {
         eth_handle();                 /* service one eth RX frame (weight upload) */
         int32_t c = reg_uart_data;
         if (c == -1) continue;
         char ch = (char)c;
-        if (ch == '\r' || ch == '\n') { print_("> "); continue; }
-        putc_(ch); putc_('\n');
-        switch (ch) {
-            case 'v': cmd_version(); break;
-            case 'c': cmd_crc();     break;
-            case 's': cmd_status();  break;
-            case 'w': cmd_ddrwrite();break;
-            case 'e': cmd_eth();     break;
-            case 'r': cmd_restart(); break;
-            case '?':
-            case 'h': menu();        break;
-            default:  print_("? press ? for menu\n");
+        if (ch == 0x7f || ch == 0x08) { if (ll) { ll--; print_("\b \b"); } continue; }
+        if (ch != '\r' && ch != '\n') {
+            if (ll < LINE_MAX - 1) { line[ll++] = ch; putc_(ch); }
+            continue;
         }
+        putc_('\n');
+        if (ll == 1) {
+            switch (line[0]) {
+                case 'v': cmd_version(); break;
+                case 'c': cmd_crc();     break;
+                case 's': cmd_status();  break;
+                case 'w': cmd_ddrwrite();break;
+                case 'e': cmd_eth();     break;
+                case 'r': cmd_restart(); break;
+                case '?':
+                case 'h': menu();        break;
+                default:  print_("? press ? for menu\n");
+            }
+        } else if (ll > 1) {
+            line[ll] = 0;
+            run_prompt(line, ll);
+        }
+        ll = 0;
         print_("> ");
     }
 }

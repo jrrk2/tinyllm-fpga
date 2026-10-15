@@ -1838,6 +1838,7 @@ int main(int argc, char** argv) {
     double      target_mbps = -1.0;    // unset: 2.0 for -b 1 (Python's 1.96 MB/s), probe for batched
     int         backlog_limit = 32;    // pause sender when parser→MIG backlog > this
     int         chunks_per_frame = MAX_CHUNKS_PER_FRAME;   // -b: 64-B chunks per frame
+    uint32_t upload_base = 0;   // -a: DDR3 byte address for `upload` (default 0 = weight image)
     int         n_steps    = N_STEPS_DEFAULT;
     int         verify_count = 1000;   // -N for verify-sampled
 
@@ -1867,6 +1868,9 @@ int main(int argc, char** argv) {
             }
         } else if (a == "-B" && argi + 1 < argc) {
             backlog_limit = std::atoi(argv[++argi]);
+        } else if (a == "-a" && argi + 1 < argc) {
+            upload_base = static_cast<uint32_t>(std::strtoul(argv[++argi], nullptr, 0));
+            if (upload_base & 63u) { std::fprintf(stderr, "-a must be 64-byte aligned\n"); return 2; }
         } else if (a == "-b" && argi + 1 < argc) {
             chunks_per_frame = std::atoi(argv[++argi]);
             if (chunks_per_frame < 1 || chunks_per_frame > MAX_CHUNKS_PER_FRAME) {
@@ -1961,7 +1965,7 @@ int main(int argc, char** argv) {
 
         if (cmd == "upload") {
             if (argi >= argc) { usage(); return 2; }
-            auto st = upload(u, peer_ip, peer_port, argv[argi], 0, 4,
+            auto st = upload(u, peer_ip, peer_port, argv[argi], upload_base, 4,
                              lead_limit, poll_ms, target_mbps, backlog_limit, chunks_per_frame);
             return st.aborted ? 1 : 0;
         }

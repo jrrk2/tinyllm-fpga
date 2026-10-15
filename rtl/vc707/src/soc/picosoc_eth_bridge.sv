@@ -44,6 +44,13 @@ module picosoc_eth_bridge (
   input  wire           ddr_wr_ack,
   output logic [29:0]   ddr_wr_addr,
   output logic [511:0]  ddr_wr_data,
+  // DDR3 READ window (firmware iomem 0x33 = address, 0x32 = data) -> soc_ddr_bridge
+  // in the top.  A load from 0x32 pulses ddr_rd_req, stalls the CPU until
+  // ddr_rd_done, returns ddr_rd_data and advances the address by 4.
+  output logic          ddr_rd_req,
+  output logic [29:0]   ddr_rd_addr,
+  input  wire           ddr_rd_done,
+  input  wire  [31:0]   ddr_rd_data,
   // debug (tied off)
   output logic [5:0]    dbg_state,
   output logic [7:0]    dbg_frame_type,
@@ -115,6 +122,9 @@ module picosoc_eth_bridge (
   // Back-pressure means firmware just streams 16 words/beat with no polling.
   wire sel_ddrd = (iomem_addr[31:24] == 8'h30);   // DDR write data port (push 32b)
   wire sel_ddra = (iomem_addr[31:24] == 8'h31);   // DDR write addr/control
+  wire sel_ddrr = (iomem_addr[31:24] == 8'h32);   // DDR READ data (load = one 32-bit read)
+  wire sel_ddrra= (iomem_addr[31:24] == 8'h33);   // DDR READ address (auto +4 per load)
+  reg        dr_wait;                              // read issued, awaiting done
   reg  [3:0] dw_idx;                               // word fill index 0..15
   reg        dw_wait;                              // beat issued, awaiting ack
   reg        ddr_ack_s0, ddr_ack_s1;              // 2FF sync of ui-clk ddr_wr_ack
@@ -142,6 +152,7 @@ module picosoc_eth_bridge (
       ddr_wr_req <= 1'b0; ddr_wr_addr <= 30'h0; ddr_wr_data <= 512'h0;
       dw_idx <= 4'h0; dw_wait <= 1'b0; ddr_ack_s0 <= 1'b0; ddr_ack_s1 <= 1'b0;
       ddr_wr_done_count <= 32'h0; ddr_wr_ack_count <= 32'h0;
+      ddr_rd_req <= 1'b0; ddr_rd_addr <= 30'h0; dr_wait <= 1'b0;
       eph <= E_IDLE; eth_half <= 1'b0;
       core_lsu_addr <= 17'h0; core_lsu_wdata <= 64'h0; core_lsu_be <= 8'hFF;
       ce_d <= 1'b0; we_d <= 1'b0; framing_sel <= 1'b1;
@@ -165,7 +176,7 @@ module picosoc_eth_bridge (
       // the UART's own back-pressure), the DDR write window (0x30/0x31), and the
       // eth window (0x20) — all handled by their own FSMs below.
       if (iomem_valid && !iomem_ready && !sel_reg && !sel_hb && !sel_internal
-          && !sel_ddrd && !sel_ddra && !sel_eth && !sel_prog) begin
+          && !sel_ddrd && !sel_ddra && !sel_ddrr && !sel_ddrra && !sel_eth && !sel_prog) begin
         iomem_ready <= 1'b1;
         iomem_rdata <= 32'h0;
       end
@@ -209,6 +220,27 @@ module picosoc_eth_bridge (
             iomem_rdata <= {28'h0, dw_idx};
             iomem_ready <= 1'b1;
           end
+        end
+      end
+
+      // ---- SoC <- DDR3 read window ----
+      ddr_rd_req <= 1'b0;
+      if (dr_wait) begin
+        if (ddr_rd_done) begin
+          dr_wait     <= 1'b0;
+          iomem_rdata <= ddr_rd_data;
+          iomem_ready <= 1'b1;                       // release the stalled load
+          ddr_rd_addr <= ddr_rd_addr + 30'd4;        // sequential reads need no 0x33 write
+        end
+      end else begin
+        if (iomem_valid && !iomem_ready && sel_ddrra) begin
+          if (|iomem_wstrb) ddr_rd_addr <= iomem_wdata[29:0];
+          iomem_rdata <= {2'b0, ddr_rd_addr};
+          iomem_ready <= 1'b1;
+        end
+        if (iomem_valid && !iomem_ready && sel_ddrr) begin
+          if (|iomem_wstrb) iomem_ready <= 1'b1;     // stores to the data port are ignored
+          else begin ddr_rd_req <= 1'b1; dr_wait <= 1'b1; end   // CPU stalls until done
         end
       end
 
