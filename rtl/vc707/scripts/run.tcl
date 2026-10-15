@@ -284,7 +284,7 @@ if {$_picosoc_engine} {
         src/soc/simpleuart.v \
         src/soc/progmem_bram.v \
     }
-    read_verilog -sv { src/soc/picosoc_eth_bridge.sv }
+    read_verilog -sv { src/soc/soc_ddr_bridge.sv src/soc/picosoc_eth_bridge.sv }
 }
 
 # microgpt BabyGPT core (used by vc707_microgpt_eth's microgpt_exact_core
