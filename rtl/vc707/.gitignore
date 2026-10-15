@@ -67,3 +67,4 @@ src/soc/regmap_gen.h
 src/smollm/obj_dir/
 # generated updatemem memory map
 *.mmi
+build/

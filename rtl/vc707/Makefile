@@ -1210,3 +1210,23 @@ wipe-project:
         release-bitstream release-model program-release-bitstream flash-release-bitstream demo-model run \
         shakespeare shakespeare-train shakespeare-pack shakespeare-release shakespeare-run \
         smoke-test smoke-test-shakespeare wipe-project
+
+# ----------------------------------------------------------------------------
+# LiteX port (litex/): tinyllm as a peripheral of the proven xc7-bitstream-tools
+# VC707 SoC (VexRiscv SMP + 1 GiB DDR3 + LiteEth/ethmin + LiteSDCard).
+# ----------------------------------------------------------------------------
+LITEX_TOOLS_DIR ?= $(HOME)/xc7-bitstream-tools
+LITEX_PY        ?= $(LITEX_TOOLS_DIR)/.venv/bin/python
+LITEX_OUT       ?= build/litex
+LITEX_VIVADO_BIN ?= /opt/Xilinx/Vivado/2020.1/bin
+LITEX_GEN_CMD = cd litex && LITEX_VC707_DIR=$(LITEX_TOOLS_DIR)/examples/vc707-litex \
+	PATH="$(LITEX_VIVADO_BIN):$(dir $(LITEX_PY)):$$PATH" $(LITEX_PY) tinyllm_vc707.py \
+	--output-dir ../$(LITEX_OUT) --build
+
+.PHONY: litex-engine-gen litex-engine litex-engine-load
+litex-engine-gen: $(GENERATED_DIR)/build_version.svh
+	$(LITEX_GEN_CMD) --no-compile-gateware --no-compile-software
+litex-engine: $(GENERATED_DIR)/build_version.svh
+	$(LITEX_GEN_CMD)
+litex-engine-load:
+	~/openFPGALoader/build/openFPGALoader -c digilent --freq 15000000 $(LITEX_OUT)/gateware/xilinx_vc707.bit
