@@ -68,3 +68,6 @@ src/smollm/obj_dir/
 # generated updatemem memory map
 *.mmi
 build/
+litex/fw/*.o
+litex/fw/*.d
+litex/fw/tinyllm_fw.*
