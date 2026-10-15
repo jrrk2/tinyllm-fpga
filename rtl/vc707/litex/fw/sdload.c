@@ -90,6 +90,16 @@ int sd_load_all(void) {
     return ok;
 }
 
+/* True when a card answers and holds WEIGHTS.BIN (cheap enough at boot). */
+int sd_card_present(void) {
+    FATFS fs; FIL f;
+    if (!sd_open(&fs)) return 0;
+    int ok = (f_open(&f, "WEIGHTS.BIN", FA_READ) == FR_OK);
+    if (ok) f_close(&f);
+    f_mount(0, "", 0);
+    return ok;
+}
+
 int sd_ls(void) {
     FATFS fs; DIR d; FILINFO fi;
     if (!sd_open(&fs)) return 0;

@@ -70,6 +70,9 @@ constexpr uint8_t FT_HEARTBEAT  = 0x04;
 constexpr uint8_t FT_ACK        = 0x06;
 constexpr uint8_t FT_DDR_WRITE  = 0x0A;
 constexpr uint8_t FT_DDR_WRITE_N = 0x0D;   // batched: same 6-B header, N×64 B data
+constexpr uint8_t FT_DDR_BLAST   = 0x0E;   // FT_DDR_WRITE_N without an ACK (blast + checksum repair)
+constexpr uint8_t FT_CKSUM_REQ   = 0x10;   // {u32 base, u32 block, u16 first, u16 n} -> FT_CKSUM_RSP
+constexpr uint8_t FT_CKSUM_RSP   = 0x11;   // {u16 first, u16 n, u32 pad, u32 sum[n]}
 constexpr uint8_t FT_PROG_WRITE = 0x0B;   // {dest_word(16b), nwords(8b)} + code -> progmem port B
 constexpr uint8_t FT_PROG_EXEC  = 0x0C;   // {entry_word(16b)} -> call PROG_BASE+entry*4, ACK retval
 
@@ -1768,6 +1771,135 @@ void print_tokens(Udp& u, const Vocab* vocab, int n_steps) {
 
 // ---------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// blast: send the whole image with no per-frame ACKs, then ask the firmware
+// for a checksum of every block and resend only the blocks that differ.
+// Loss (LiteEth has two RX slots) costs a block, not a stall.  The checksum is
+// net.c's Fletcher pair over little-endian 32-bit words.
+// ---------------------------------------------------------------------------
+static uint32_t blast_cksum(const uint8_t* p, size_t nbytes) {
+    uint32_t s1 = 0, s2 = 0;
+    for (size_t i = 0; i + 3 < nbytes; i += 4) {
+        uint32_t w = p[i] | (p[i+1] << 8) | ((uint32_t)p[i+2] << 16) | ((uint32_t)p[i+3] << 24);
+        s1 += w; s2 += s1;
+    }
+    return s1 ^ (s2 * 0x9E3779B1u);
+}
+
+// Fetch firmware checksums for blocks [first, first+n) of `block` bytes at base.
+static bool blast_fetch_sums(Udp& u, uint32_t base, uint32_t block, uint32_t first, uint32_t n,
+                             std::vector<uint32_t>& out, uint8_t& seq) {
+    uint8_t tx[14];
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        seq = (seq == 255) ? 1 : seq + 1;
+        tx[0] = FT_CKSUM_REQ; tx[1] = seq;
+        for (int i = 0; i < 4; ++i) { tx[2 + i] = base >> (8 * i); tx[6 + i] = block >> (8 * i); }
+        tx[10] = first; tx[11] = first >> 8; tx[12] = n; tx[13] = n >> 8;
+        u.send(tx, sizeof(tx));
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < deadline) {
+            uint8_t rx[2048]; size_t got = 0;
+            if (!u.recv(rx, sizeof(rx), &got)) break;
+            if (got < 8 || rx[0] != FT_CKSUM_RSP || rx[1] != seq) continue;
+            uint32_t rn = rx[4] | (rx[5] << 8);
+            if (rn != n || got < 8 + 4 * n) continue;
+            out.resize(n);
+            for (uint32_t i = 0; i < n; ++i)
+                out[i] = rx[8 + 4*i] | (rx[9 + 4*i] << 8) | ((uint32_t)rx[10 + 4*i] << 16) | ((uint32_t)rx[11 + 4*i] << 24);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Send bytes [off, off+len) of the image as FT_DDR_BLAST frames at target_mbps.
+static void blast_send_range(Udp& u, const std::vector<uint8_t>& img, uint32_t base,
+                             size_t off, size_t len, double target_mbps, uint8_t& seq) {
+    const size_t frame_bytes = (size_t)MAX_CHUNKS_PER_FRAME * CHUNK;
+    const double ns_per_frame = (target_mbps > 0) ? frame_bytes / (target_mbps * 1e6) * 1e9 : 0;
+    auto next = std::chrono::steady_clock::now();
+    uint8_t tx[6 + MAX_CHUNKS_PER_FRAME * CHUNK];
+    for (size_t pos = off; pos < off + len; ) {
+        size_t n = std::min(frame_bytes, off + len - pos) / CHUNK;
+        if (n == 0) break;
+        seq = (seq == 255) ? 1 : seq + 1;
+        size_t fl = encode_ddr_frame(tx, seq, base + (uint32_t)pos, img.data() + pos, (int)n);
+        tx[0] = FT_DDR_BLAST;
+        u.send(tx, fl);
+        pos += n * CHUNK;
+        if (ns_per_frame > 0) {
+            next += std::chrono::nanoseconds((long long)ns_per_frame);
+            while (std::chrono::steady_clock::now() < next) { }
+        }
+    }
+}
+
+int blast_upload(Udp& u, const std::string& path, uint32_t base, double target_mbps,
+                 uint32_t block, int max_rounds, bool verify_only) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open " + path);
+    std::vector<uint8_t> img((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (img.size() % CHUNK) img.resize((img.size() + CHUNK - 1) / CHUNK * CHUNK, 0);
+    const uint32_t nblocks = (uint32_t)((img.size() + block - 1) / block);
+    if (target_mbps <= 0) target_mbps = 8.0;
+    std::printf("[blast] %s: %zu bytes, %u blocks of %u KiB, base 0x%08x, %.1f MB/s%s\n",
+                path.c_str(), img.size(), nblocks, block / 1024, base, target_mbps,
+                verify_only ? " (verify only)" : "");
+    std::vector<uint32_t> want(nblocks);
+    for (uint32_t b = 0; b < nblocks; ++b) {
+        size_t off = (size_t)b * block, len = std::min((size_t)block, img.size() - off);
+        want[b] = blast_cksum(img.data() + off, len);
+    }
+    // The image tail may not fill the last block: pad the firmware's view by
+    // uploading a zero-filled block end so both sides sum the same bytes.
+    if (img.size() % block) img.resize((size_t)nblocks * block, 0);
+    uint8_t seq = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    u.drain();
+    std::vector<uint32_t> bad;
+    if (!verify_only) {
+        blast_send_range(u, img, base, 0, img.size(), target_mbps, seq);
+        for (uint32_t b = 0; b < nblocks; ++b) bad.push_back(b);
+    }
+    for (int round = 1; round <= max_rounds; ++round) {
+        // verify: everything on the first round, else the blocks we resent
+        std::vector<uint32_t> check = (verify_only || round == 1)
+            ? std::vector<uint32_t>() : bad;
+        if (check.empty()) for (uint32_t b = 0; b < nblocks; ++b) check.push_back(b);
+        std::vector<uint32_t> still;
+        u.drain();
+        for (size_t i = 0; i < check.size(); ) {
+            // consecutive run starting at check[i], up to 64 blocks
+            uint32_t first = check[i]; size_t j = i;
+            while (j < check.size() && check[j] == first + (uint32_t)(j - i) && j - i < 64) ++j;
+            std::vector<uint32_t> got;
+            if (!blast_fetch_sums(u, base, block, first, (uint32_t)(j - i), got, seq)) {
+                std::printf("[blast] no checksum reply for blocks %u..%u — firmware without FT_CKSUM_REQ?\n",
+                            first, first + (uint32_t)(j - i) - 1);
+                return 1;
+            }
+            for (size_t k = 0; k < got.size(); ++k)
+                if (got[k] != want[first + k]) still.push_back(first + (uint32_t)k);
+            i = j;
+        }
+        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("[blast] round %d: %zu/%u blocks need repair  (%.1f s)\n",
+                    round, still.size(), nblocks, secs);
+        if (still.empty()) {
+            std::printf("[blast] done in %.1fs, %zu bytes verified (%.2f MB/s)\n",
+                        secs, img.size(), img.size() / secs / 1e6);
+            return 0;
+        }
+        if (verify_only) return 1;
+        bad = still;
+        for (uint32_t b : bad)
+            blast_send_range(u, img, base, (size_t)b * block, block, target_mbps * 0.5, seq);
+    }
+    std::printf("[blast] gave up after %d rounds, %zu blocks still differ\n", max_rounds, bad.size());
+    return 1;
+}
+
 void usage() {
     std::fprintf(stderr,
         "usage: bfp_client [-p IP:PORT] [-v VOCAB_BIN] [-m MAC]\n"
@@ -1791,6 +1923,10 @@ void usage() {
         "                     in /proc/net/arp; seed the cache by pinging the\n"
         "                     /24 around -p's IP (default %s) if not found\n"
         "  upload  <bin>      bulk-write the weight image to DDR3 base 0\n"
+        "  blast   <bin>      send with no per-frame ACKs, then repair by block\n"
+        "                     checksums (-r MB/s, default 8; -k block KiB, default\n"
+        "                     1024).  Needs the LiteX firmware (FT_CKSUM_REQ).\n"
+        "  cksum   <bin>      verify the image in DDR3 by block checksums only\n"
         "  verify  <bin>      restart, capture first AR, compare 64 B\n"
         "  verify-sampled <bin> [-N count]\n"
         "                     sample N (default 1000) random reads from the\n"
@@ -1841,6 +1977,7 @@ int main(int argc, char** argv) {
     uint32_t upload_base = 0;   // -a: DDR3 byte address for `upload` (default 0 = weight image)
     int         n_steps    = N_STEPS_DEFAULT;
     int         verify_count = 1000;   // -N for verify-sampled
+    uint32_t    blast_block = 1024 * 1024;   // -k: blast checksum block (KiB on the command line)
 
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-') {
@@ -1879,6 +2016,9 @@ int main(int argc, char** argv) {
             }
         } else if (a == "-N" && argi + 1 < argc) {
             verify_count = std::atoi(argv[++argi]);
+        } else if (a == "-k" && argi + 1 < argc) {
+            blast_block = static_cast<uint32_t>(std::strtoul(argv[++argi], nullptr, 0)) * 1024u;
+            if (blast_block == 0 || (blast_block & 63u)) { std::fprintf(stderr, "-k must be a multiple of 64 B\n"); return 2; }
         } else if (a == "-n" && argi + 1 < argc) {
             n_steps = std::atoi(argv[++argi]);
             if (n_steps < 1 || n_steps > N_STEPS_MAX) {
@@ -1968,6 +2108,10 @@ int main(int argc, char** argv) {
             auto st = upload(u, peer_ip, peer_port, argv[argi], upload_base, 4,
                              lead_limit, poll_ms, target_mbps, backlog_limit, chunks_per_frame);
             return st.aborted ? 1 : 0;
+        }
+        if (cmd == "blast" || cmd == "cksum") {
+            if (argi >= argc) { usage(); return 2; }
+            return blast_upload(u, argv[argi], upload_base, target_mbps, blast_block, 8, cmd == "cksum");
         }
         if (cmd == "verify") {
             if (argi >= argc) { usage(); return 2; }

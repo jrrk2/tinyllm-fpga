@@ -17,7 +17,7 @@
 static void menu(void) {
     printf("\ntinyllm_fw " __DATE__ " " __TIME__ "  (LiteX VC707, build 0x%08lx)\n",
            (unsigned long)tinyllm_build_version_read());
-    printf("v ver  s status  c crc  r restart  t tokens  e eth  l load-sd  d dir-sd  ? menu  (+Enter)\n");
+    printf("v ver  s status  c crc  r restart  t tokens  e eth  l load-sd  d dir-sd  R reboot  ? menu  (+Enter)\n");
     printf("or type a prompt (2+ chars) + Enter to run the model\n");
 }
 
@@ -81,6 +81,8 @@ int main(void) {
     menu();
     net_init();
     if (vocab_init()) printf("vocab table present\n");
+    /* A card with the model bundle makes the SoC self-sufficient: load it now. */
+    if (sd_card_present()) sd_load_all();
     printf("> ");
     static char line[LINE_MAX];
     int ll = 0;
@@ -104,6 +106,7 @@ int main(void) {
                 case 'e': net_stats(); break;
                 case 'l': sd_load_all(); break;
                 case 'd': sd_ls(); break;
+                case 'R': printf("rebooting (BIOS)\n"); uart_sync(); ctrl_reset_write(1); break;
                 case '?': case 'h': menu(); break;
                 default:  printf("? press ? for menu\n");
             }

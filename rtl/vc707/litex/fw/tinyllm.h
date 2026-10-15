@@ -73,6 +73,7 @@ void print_token(uint32_t t);
 /* sdload.c */
 int  sd_load_all(void);
 int  sd_ls(void);
+int  sd_card_present(void);
 /* main.c */
 void run_prompt_tokens(const uint16_t *toks, int nt);
 #endif
