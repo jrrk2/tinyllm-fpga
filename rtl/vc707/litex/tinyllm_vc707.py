@@ -52,6 +52,7 @@ def read_build_version(path):
     return int(m.group(1), 16) if m else 0
 
 ENGINE_CORE_FREQ = 40e6
+TINYLLM_MAC = 0x10e2d5544c4d
 
 class TinyLLMSoC(BaseSoC):
     def __init__(self, build_generated_dir, **kwargs):
@@ -100,10 +101,12 @@ def main():
                         l2_size=131072, csr_csv="csr.csv", csr_json="csr.json")
     args = parser.parse_args()
 
+    # Own MAC ("TLM"), so the BIOS netboots from its own per-MAC TFTP
+    # directory (~/tftp-vc707/10:e2:d5:54:4c:4d) and never collides with the
+    # Linux payload of the 1GB SoC that shares this CPU configuration.
     mac_address = args.mac_address
     if mac_address is None:
-        mac_address = mac_for_cpu(args.cpu_type, args.cpu_variant, with_ddr64=True,
-                                  cpu_count=getattr(args, "cpu_count", 1))
+        mac_address = TINYLLM_MAC
     print("MAC address: %012x" % mac_address)
 
     builder_kw = parser.builder_argdict
