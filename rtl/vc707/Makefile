@@ -246,10 +246,11 @@ VARIANT ?= smollm360
 
 ## Per-VARIANT defaults.  MAX_CTX/NPROMPT_MAX/N_GEN use `?=` so a command
 ## line `make MAX_CTX=64 ...` still wins (command-line vars > makefile
-## assignments, regardless of operator).  The smollm360 defaults are
-## tuned to fit XC7VX485T's 1030 BRAM36 budget: at MAX_CTX=64 the design
-## overflows by ~85 tiles (the KV cache is the dominant scaling consumer
-## and is linear in MAX_CTX); 32 leaves comfortable margin.
+## assignments, regardless of operator).  The KV cache is the dominant
+## BRAM consumer and is linear in MAX_CTX.  smollm360 at MAX_CTX=64 fits
+## XC7VX485T's 1030 BRAM36 budget only since bfp_sdpram packs narrow
+## memories as 2Kx18 / 4Kx9 tiles (it overflowed by ~85 tiles with the
+## old 1Kx36-only geometry).
 ifeq ($(VARIANT),smollm135)
   SMOLLM_MODEL := HuggingFaceTB/SmolLM2-135M
   SMOLLM_D     := 576
@@ -269,9 +270,9 @@ else ifeq ($(VARIANT),smollm360)
   SMOLLM_HD    := 64
   SMOLLM_FFN   := 2560
   SMOLLM_NL    := 32
-  MAX_CTX      ?= 32
-  NPROMPT_MAX  ?= 24
-  N_GEN        ?= 8
+  MAX_CTX      ?= 64
+  NPROMPT_MAX  ?= 48
+  N_GEN        ?= 16
 else
   $(error VARIANT=$(VARIANT) not recognised — use smollm135 or smollm360)
 endif
