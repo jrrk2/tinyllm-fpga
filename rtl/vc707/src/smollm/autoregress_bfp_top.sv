@@ -48,6 +48,10 @@ module autoregress_bfp_top #(
   // in [1, NPROMPT_MAX].  Already 2-FF synced into the core_clk
   // domain by the caller; stable for the duration of a run.
   input  wire [$clog2(NPROMPT_MAX+1)-1:0] n_prompt_active,
+  // Requested generated-token count; 0 = the N_GEN default.  Clamped so
+  // prompt + generated never exceeds N_STEPS or MAX_CTX: a short prompt can
+  // spend the rest of the context on its reply.  Synced like n_prompt_active.
+  input  wire [$clog2(N_STEPS+1)-1:0]  n_gen_req,
   output logic                         done,
   output logic [N_STEPS*16-1:0]        result_tokens,
   output wire  [31:0]                  weight_hash,
@@ -429,10 +433,20 @@ module autoregress_bfp_top #(
   logic [15:0]                         last_token;
   logic [15:0] result_buf [0:N_STEPS-1];
 
+  // Last step of the run, fixed at start from n_prompt_active + n_gen_req.
+  localparam int MAX_STEPS = (N_STEPS < MAX_CTX) ? N_STEPS : MAX_CTX;
+  logic [$clog2(N_STEPS+1)-1:0]        last_step;
+  logic [15:0]                         run_steps;
+  always_comb begin
+    run_steps = 16'(n_prompt_active) + ((n_gen_req == '0) ? 16'(N_GEN) : 16'(n_gen_req));
+    if (run_steps > 16'(MAX_STEPS)) run_steps = 16'(MAX_STEPS);
+  end
+
   always_ff @(posedge clk) begin
     if (rst_core_i) begin
       state       <= S_IDLE;
       step        <= '0;
+      last_step   <= '0;
       last_token  <= '0;
       mdl_start   <= 1'b0;
       lay_start   <= 1'b0;
@@ -453,6 +467,7 @@ module autoregress_bfp_top #(
       case (state)
         S_IDLE: if (start) begin
           step       <= '0;
+          last_step  <= ($bits(last_step))'(run_steps - 16'd1);
           last_token <= '0;
           state      <= S_DRIVE;
         end
@@ -486,13 +501,10 @@ module autoregress_bfp_top #(
           state            <= S_NEXT;
         end
         S_NEXT: begin
-          // Terminate after n_prompt_active prompt tokens + N_GEN generated
-          // tokens.  N_STEPS (= NPROMPT_MAX + N_GEN) sizes the buffer at
-          // synth — but if the active prompt is shorter than NPROMPT_MAX
-          // (the common case) the FSM would otherwise iterate over the
-          // empty slack slots, blowing the host poll timeout for no gain.
-          if (step == ({{($bits(step)-$clog2(NPROMPT_MAX+1)){1'b0}},
-                        n_prompt_active} + N_GEN - 1))
+          // Terminate after n_prompt_active prompt tokens + the requested
+          // generated tokens (last_step, latched at start).  N_STEPS sizes the
+          // buffer at synth; stopping early skips the empty slack slots.
+          if (step == last_step)
             state <= S_ALL_DONE;
           else begin
             step  <= step + 1'b1;

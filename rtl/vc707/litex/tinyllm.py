@@ -15,6 +15,7 @@ port of fw_engine.c:
   restart      write -> one restart pulse (resets the engine, clears
                done_latched / has_run / the first-AR,R snapshot)
   n_prompt     active prompt length (1..NPROMPT_MAX)
+  n_gen        generated tokens per run, 0 = NGEN; clamped to the context
   status       [0] done (live) [1] done_latched [2] has_run
                [3] first_ar_seen [4] first_r_seen [5] frozen
   bram_target  {inc[31], kind[22:18], addr[17:0]}  (old 0x060)
@@ -155,6 +156,9 @@ class TinyLLM(LiteXModule):
             CSRField("ngen",        8, reset=cfg["NGEN"]),
             CSRField("nl",          8, reset=cfg["NL"]),
         ])
+        self.n_gen = CSRStorage(bits_for(N_STEPS),
+                                description="generated tokens per run; 0 = NGEN.  The engine "
+                                            "clamps n_prompt + n_gen to min(N_STEPS, MAX_CTX)")
         ws_base = {}
         for r in REGION_ORDER:
             csr = CSRStorage(axi_addr_width, reset=self.bases[r],
@@ -198,6 +202,7 @@ class TinyLLM(LiteXModule):
 
         # -- quasi-static CDC ---------------------------------------------
         n_prompt_c = Signal(NPA_W); self.specials += MultiReg(self.n_prompt.storage, n_prompt_c, core_cd)
+        n_gen_c = Signal(bits_for(N_STEPS)); self.specials += MultiReg(self.n_gen.storage, n_gen_c, core_cd)
         snap_layer_c = Signal(5);   self.specials += MultiReg(self.snap_layer_sel.storage, snap_layer_c, core_cd)
         snap_step_c  = Signal(11);  self.specials += MultiReg(self.snap_step_sel.storage,  snap_step_c,  core_cd)
         stage_sel_c  = Signal(5);   self.specials += MultiReg(self.dbg_stage_sel.storage,  stage_sel_c,  core_cd)
@@ -259,7 +264,7 @@ class TinyLLM(LiteXModule):
             p_PREFIX=prefix, p_STREAM_LOOKUP=1,
             p_AXI_ADDR_WIDTH=axi_addr_width, p_AXI_ID_WIDTH=axi_id_width,
             i_clk=ClockSignal(core_cd), i_rst=rst_core, i_start=start_c,
-            i_n_prompt_active=n_prompt_c, o_done=done_core,
+            i_n_prompt_active=n_prompt_c, i_n_gen_req=n_gen_c, o_done=done_core,
             o_result_tokens=result_c, o_weight_hash=whash_c,
             i_wr_kind=wr_kind, i_wr_addr=port_addr, i_wr_data=wr_data, i_wr_en=wr_en,
             i_clk_wr=ClockSignal(axi_cd), o_wr_rdata=bram_rdata,

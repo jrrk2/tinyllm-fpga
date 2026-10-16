@@ -1296,6 +1296,7 @@ module vc707_microgpt_eth (
     .rst          ( ~core_resetn | lay_restart_core ),
     .start        ( bfp_start_r       ),
     .n_prompt_active( n_prompt_active_core ),
+    .n_gen_req      ( '0 ),                    // N_GEN default
     .done         ( lay_done_core     ),
     .result_tokens( bfp_result_tokens ),
     .weight_hash  ( bfp_weight_hash_core ),

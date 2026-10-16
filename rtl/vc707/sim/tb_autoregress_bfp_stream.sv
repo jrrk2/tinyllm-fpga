@@ -47,6 +47,7 @@ module tb_autoregress_bfp_stream (
   ) dut (
     .clk(clk), .rst(rst), .start(go),
     .n_prompt_active(($clog2(`LBFP_FULL_NPROMPT_MAX+1))'(`LBFP_FULL_NPROMPT)),
+    .n_gen_req('0),
     .done(done), .result_tokens(result_tokens),
     .weight_hash(/* unused in sim */),
     .wr_kind(5'd0), .wr_addr(18'd0), .wr_data(16'd0), .wr_en(1'b0), .clk_wr(clk), .wr_rdata(/* unused */),

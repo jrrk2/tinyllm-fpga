@@ -38,25 +38,50 @@ static void cmd_tokens(void) {
     printf("   (prompt %u + %u generated)\n", n, N_GEN);
 }
 
-static int wait_done(unsigned long max_ms) {
-    for (unsigned long ms = 0; ms < max_ms; ms++) {
-        if (tinyllm_status_read() & ST_DONE_LATCHED) return 1;
-        net_service();
-        busy_wait(1);
-    }
-    return 0;
+/* Print token k of a run of `steps` steps; returns 0 once <|endoftext|>
+ * (or the end of the run) is hit. */
+static int emit_token(int k, int nt, int steps) {
+    if (k < nt - 1) return 1;                    /* still feeding the prompt */
+    if (k >= steps) return 0;
+    uint16_t t = eng_result_token((unsigned)k);
+    if (t == 0) return 0;                        /* <|endoftext|> */
+    print_token(t);
+    return 1;
 }
 
+/* Stream tokens while the engine runs.  The layer index resets to 0 on
+ * restart, counts to NL-1 and holds there through the decode head, so a
+ * drop from NL-1 means step k's token is in result_buf.  NL-1 must be seen
+ * on two polls in a row: a multi-bit counter crossing the clock domain can
+ * read as NL-1 for one sample mid-increment (e.g. 15 -> 16).
+ * With the n_gen register the reply uses the whole context left after the
+ * prompt; it goes back to 0 (= N_GEN) afterwards for the host's runs. */
 void run_prompt_tokens(const uint16_t *toks, int nt) {
+    int steps = nt + N_GEN;
+#ifdef CSR_TINYLLM_N_GEN_ADDR
+    steps = N_STEPS < TINYLLM_MAX_CTX ? N_STEPS : TINYLLM_MAX_CTX;
+    tinyllm_n_gen_write((uint32_t)(steps - nt));
+#endif
     for (int i = 0; i < nt; i++) eng_bram_write(BRAM_KIND_PROMPT, (uint32_t)i, toks[i]);
     tinyllm_n_prompt_write((uint32_t)nt);
     eng_restart();
-    if (!wait_done(60000)) { printf("engine timeout\n"); return; }
-    for (int k = nt - 1; k < nt + N_GEN && k < (int)N_STEPS; k++) {
-        uint16_t t = eng_result_token((unsigned)k);
-        if (t == 0) break;                       /* <|endoftext|> */
-        print_token(t);
+    busy_wait(1);
+    int k = 0, live = 1, last_seen = 0;
+    for (unsigned long ms = 0; !(tinyllm_status_read() & ST_DONE_LATCHED); ms++) {
+        if (ms >= 600000) { printf("\nengine timeout\n"); live = 0; break; }
+        int last = tinyllm_dbg_cur_layer_read() == TINYLLM_NL - 1;
+        if (last) last_seen++;
+        else {
+            if (last_seen >= 2 && live) live = emit_token(k++, nt, steps);
+            last_seen = 0;
+        }
+        net_service();
+        busy_wait(1);
     }
+    while (live) live = emit_token(k++, nt, steps);   /* final step(s) */
+#ifdef CSR_TINYLLM_N_GEN_ADDR
+    tinyllm_n_gen_write(0);
+#endif
     printf("\n");
 }
 
