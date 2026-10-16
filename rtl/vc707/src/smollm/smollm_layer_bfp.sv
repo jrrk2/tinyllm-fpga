@@ -173,6 +173,10 @@ module smollm_layer_bfp #(
   localparam int CW_KV   = $clog2(H_KV*HD + 1);
   localparam int CW_HD   = $clog2(HD   + 1);
   localparam int CW_CTX  = $clog2(MAX_CTX + 1);
+  // AV timestep counter: covers kv_pos padded to a whole BFP_TILE (MAX_CTX
+  // rounded up to 16), and at least 5 bits so BFP_TILE-1 fits at tiny MAX_CTX.
+  localparam int CW_AVT  = ($clog2(((MAX_CTX + 15) / 16) * 16) + 1 > 5)
+                         ? $clog2(((MAX_CTX + 15) / 16) * 16) + 1 : 5;
 
   // Wide-packed ROM widths: each entry holds LANES mantissas (or exponents)
   // concatenated, so one BRAM read per cycle returns all 16 lanes worth
@@ -2290,12 +2294,17 @@ module smollm_layer_bfp #(
           automatic int tile_idx;
           automatic logic signed [BFP_EXP_W-1:0] v_e_this;
           automatic logic signed [BFP_EXP_W-1:0] shamt;
-          // consume_t must be wide enough to represent BFP_TILE-1=15 so the
-          // S_AV_DRAIN transition fires; CW_CTX (= $clog2(MAX_CTX+1)) can be
-          // smaller (3 bits at MAX_CTX=4) and would let consume_t wrap.
-          automatic logic [$clog2(BFP_TILE+1)-1:0] consume_t;
+          // The matvec input is the kv_pos+1 probabilities, padded up to the
+          // end of the BFP_TILE-wide tile holding kv_pos: drive timesteps
+          // 0..av_last_t = kv_pos | (BFP_TILE-1).  (This used to stop at
+          // BFP_TILE-1, silently dropping every position >= 16 -- incl. the
+          // current token -- from the attention output at steps 16+.)
+          // consume_t must hold av_last_t (>= BFP_TILE-1 even at tiny MAX_CTX).
+          automatic logic [CW_AVT-1:0] consume_t;
+          automatic logic [CW_AVT-1:0] av_last_t;
           tile_idx  = (head_grp * HD + chunk * LANES) / BFP_TILE;
-          consume_t = cnt[$clog2(BFP_TILE+1)-1:0] - 1'b1;
+          consume_t = cnt[CW_AVT-1:0] - 1'b1;
+          av_last_t = CW_AVT'(kv_pos) | CW_AVT'(BFP_TILE - 1);
           mv_valid <= 1'b1;
           mv_x_e   <= probs_e_shared;
           if (consume_t <= kv_pos) begin
@@ -2324,8 +2333,8 @@ module smollm_layer_bfp #(
               mv_w_e[ii*BFP_EXP_W  +: BFP_EXP_W ] <= av_emax;
             end
           end
-          mv_last <= (consume_t == BFP_TILE - 1);
-          if (consume_t == BFP_TILE - 1) state <= S_AV_DRAIN;
+          mv_last <= (consume_t == av_last_t);
+          if (consume_t == av_last_t) state <= S_AV_DRAIN;
           else cnt <= cnt + 1'b1;
         end
         S_AV_DRAIN: if (mv_out_valid_lat) begin : av_pipeA
