@@ -105,3 +105,21 @@ generated/tinyshakespeare.txt
 
 # Local Claude Code agent state — per-machine, never commit
 .claude/
+
+# Release smoke snapshots: same rule as release/ (binaries go to GitHub Releases)
+rtl/vc707/release-smoke/*/*.bit
+rtl/vc707/release-smoke/*/*.mcs
+rtl/vc707/release-smoke/*/*.bin
+rtl/vc707/ip/*/vivado*.jou
+rtl/vc707/ip/*/vivado*.log
+rtl/vc707/ip/*/*.hbs
+
+# rvc sim build outputs
+rtl/vc707/sim/rvc/*.vvp
+rtl/vc707/sim/rvc/*.elf
+rtl/vc707/sim/rvc/*.bin
+rtl/vc707/sim/rvc/*.mem
+rtl/vc707/sim/rvc/xsim.dir/
+rtl/vc707/sim/rvc/*.log
+rtl/vc707/sim/rvc/*.jou
+rtl/vc707/sim/rvc/*.pb

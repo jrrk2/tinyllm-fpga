@@ -1,0 +1,32 @@
+[all] FPGA at 192.168.1.42:19783  BUILD_VERSION = 0x69fd755c
+[upload] file=release-smoke/v0.2.0/lbfp_full_DDR3.bin  bytes=337227776  chunks=5269184  passes(max)=4
+[upload] first-frame probe (70 bytes, hex):
+  hdr: 0a 00 00 00 00 00
+  data: 48 fa c0 f9 e0 eb 60 e7 88 f8 56 01 00 15 d8 02
+        00 e0 94 03 7c 03 00 f0 20 ed 20 19 b8 fb 60 f2
+        c0 08 40 1b 00 0c 40 23 00 de 60 13 a0 e6 80 c9
+        9c fd 60 e0 80 be f0 07 60 eb 00 14 d0 0d 60 0b
+[upload] steady pace: target 2.00 MB/s (32.0 µs/chunk).  Burst-safety net: -L 1024 -P 20.
+[pass 1] sending 5269184 chunks
+  pass1 sent=31250/5269184 (  0.6%,  2.0 MB) acked=31118 (  0.6%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=62501/5269184 (  1.2%,  4.0 MB) acked=62247 (  1.2%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=93751/5269184 (  1.8%,  6.0 MB) acked=93373 (  1.8%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=125001/5269184 (  2.4%,  8.0 MB) acked=124498 (  2.4%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=156252/5269184 (  3.0%, 10.0 MB) acked=155620 (  3.0%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=187502/5269184 (  3.6%, 12.0 MB) acked=186744 (  3.5%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=218753/5269184 (  4.2%, 14.0 MB) acked=217872 (  4.1%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=250004/5269184 (  4.7%, 16.0 MB) acked=248997 (  4.7%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=281254/5269184 (  5.3%, 18.0 MB) acked=280122 (  5.3%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=312505/5269184 (  5.9%, 20.0 MB) acked=311250 (  5.9%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=343755/5269184 (  6.5%, 22.0 MB) acked=342371 (  6.5%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=375006/5269184 (  7.1%, 24.0 MB) acked=373498 (  7.1%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=406256/5269184 (  7.7%, 26.0 MB) acked=404629 (  7.7%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=437507/5269184 (  8.3%, 28.0 MB) acked=435753 (  8.3%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=468757/5269184 (  8.9%, 30.0 MB) acked=466872 (  8.9%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=500008/5269184 (  9.5%, 32.0 MB) acked=497999 (  9.5%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=531258/5269184 ( 10.1%, 34.0 MB) acked=529132 ( 10.0%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=562509/5269184 ( 10.7%, 36.0 MB) acked=560254 ( 10.6%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=593760/5269184 ( 11.3%, 38.0 MB) acked=591385 ( 11.2%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=625011/5269184 ( 11.9%, 40.0 MB) acked=622506 ( 11.8%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=656261/5269184 ( 12.5%, 42.0 MB) acked=653631 ( 12.4%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
+  pass1 sent=687511/5269184 ( 13.0%, 44.0 MB) acked=684757 ( 13.0%)   2.00 MB/s  parser->mig=0/peak0  eth_ring=1/peak1/max31
