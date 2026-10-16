@@ -95,6 +95,7 @@ constexpr uint16_t REG_BRAM_READ     = 0x062;   // read: {16'd0, BRAM[kind, addr
 constexpr uint16_t REG_N_PROMPT      = 0x063;   // r/w: active prompt length (1..NPROMPT_MAX)
 constexpr uint16_t REG_BUILD_VERSION = 0x10F;
 constexpr uint16_t REG_RESULT        = 0x1D0;
+constexpr uint16_t REG_MODEL_SHAPE   = 0x06B;   // LiteX fw: {N_GEN[15:8], NPROMPT_MAX[7:0]}
 constexpr uint16_t REG_DONE          = 0x1F0;   // {30'd0, lay_done_latched, lay_done}
 constexpr uint16_t REG_RESTART       = 0x1F1;   // bit 0: write 1 to pulse restart
 
@@ -1748,18 +1749,24 @@ std::vector<uint16_t> fetch_tokens(Udp& u, int n_steps) {
 }
 
 void print_tokens(Udp& u, const Vocab* vocab, int n_steps) {
-    auto tokens = fetch_tokens(u, n_steps);
-    // Trim to active_prompt + N_GEN (= 15) — the buffer is sized for
+    // Show active_prompt + N_GEN tokens — the buffer is sized for
     // NPROMPT_MAX prompts, but a short prompt leaves trailing zero
-    // slots that aren't meaningful output.  Older bitstreams that
-    // don't expose 0x063 just return 0; treat that as "no trim".
+    // slots that aren't meaningful output.  N_GEN comes from reg 0x06B
+    // ({N_GEN, NPROMPT_MAX} on the LiteX firmware); older bitstreams
+    // without it read 0 or junk, so fall back to the smollm135 value 15.
+    // Bitstreams that don't expose 0x063 either: no trim.
+    uint32_t active = 0, n_gen = 15;
     try {
-        uint32_t active = reg_read(u, REG_N_PROMPT, 1, 60)[0];
-        if (active > 0 && active < tokens.size()) {
-            size_t keep = std::min<size_t>(active + 15, tokens.size());
-            tokens.resize(keep);
-        }
-    } catch (...) { /* old bitstream — leave tokens untrimmed */ }
+        active = reg_read(u, REG_N_PROMPT, 1, 60)[0];
+        uint32_t shape = reg_read(u, REG_MODEL_SHAPE, 1, 61)[0];
+        uint32_t g = (shape >> 8) & 0xFF, pmax = shape & 0xFF;
+        if (g >= 1 && pmax >= 1 && g + pmax <= (uint32_t)N_STEPS_MAX) n_gen = g;
+    } catch (...) { active = 0; }
+    if (active > 0)
+        n_steps = std::max<int>(n_steps, std::min<int>(active + n_gen, N_STEPS_MAX));
+    auto tokens = fetch_tokens(u, n_steps);
+    if (active > 0 && active < tokens.size())
+        tokens.resize(std::min<size_t>(active + n_gen, tokens.size()));
     std::printf("RTL_TOKENS:");
     for (auto t : tokens) std::printf(" %u", t);
     std::printf("\n");

@@ -71,6 +71,7 @@ static uint32_t reg_read(uint16_t a) {
         case 0x067: return tinyllm_trig_cyc_en_read();
         case 0x068: return tinyllm_dbg_cyc_read();
         case 0x06A: return tinyllm_dbg_cur_layer_read() | ((st & ST_FROZEN) ? 0x100u : 0u);
+        case 0x06B: return ((uint32_t)N_GEN << 8) | NPROMPT_MAX;        /* model shape for the host */
         case 0x10F: return tinyllm_build_version_read();
         case 0x1F0: return ((st & ST_DONE_LATCHED) ? 2u : 0u) | ((st & ST_DONE) ? 1u : 0u);
         default:    break;
