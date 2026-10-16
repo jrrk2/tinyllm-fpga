@@ -25,9 +25,6 @@ static int sd_ready;
 #define SD_CLK_HZ 50000000
 #endif
 
-/* Load-rate printout from the CPU cycle counter (timer0 is no use: the
- * SD driver's busy_wait_us() reprograms it). */
-static uint32_t tick_now(void) { uint32_t c; __asm__ volatile("csrr %0, mcycle" : "=r"(c)); return c; }
 
 static int sd_open(FATFS *fs) {
     if (!sd_ready) {
@@ -100,7 +97,6 @@ static long sd_file_to_ram_fast(FATFS *fs, const char *name, uintptr_t dst, size
     printf("sd: %s -> 0x%08lx (%lu bytes, %lu KiB clusters)\n", name, (unsigned long)dst, len, (unsigned long)csize / 2);
     init_progression_bar(len);
     fat_cached_sec = 0xFFFFFFFFu;
-    uint32_t t_prev = tick_now(); uint64_t ticks = 0;
     unsigned long off = 0, shown = 0;
     while (off < len) {
         /* contiguous run starting at clst */
@@ -127,16 +123,12 @@ static long sd_file_to_ram_fast(FATFS *fs, const char *name, uintptr_t dst, size
                 }
             }
             sec += n; off += (unsigned long)n * 512; nsec -= n;
-            uint32_t t = tick_now(); ticks += (uint32_t)(t - t_prev); t_prev = t;
             if (off - shown >= (8u << 20) || off >= len) { shown = off; show_progress(off > len ? len : off); }
         }
         if (nxt < 2 || nxt >= fs->n_fatent) break;      /* end of chain */
         clst = nxt;
     }
     printf("\n");
-    unsigned long ms = (unsigned long)(ticks / (CONFIG_CLOCK_FREQUENCY / 1000));
-    if (ms) printf("sd: %lu bytes in %lu.%03lu s = %lu KB/s at SD clock %lu MHz\n", off, ms / 1000, ms % 1000,
-                   (unsigned long)((uint64_t)off / ms), (unsigned long)(SD_CLK_HZ / 1000000));
     if (off < len) { printf("sd: %s: chain ended early (%lu of %lu bytes)\n", name, off, len); return -1; }
     return (long)len;
 }
