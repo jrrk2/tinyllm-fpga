@@ -17,7 +17,7 @@
 static void menu(void) {
     printf("\ntinyllm_fw " __DATE__ " " __TIME__ "  (LiteX VC707, build 0x%08lx)\n",
            (unsigned long)tinyllm_build_version_read());
-    printf("v ver  s status  c crc  r restart  t tokens  e eth  l load-sd  d dir-sd  R reboot  ? menu  (+Enter)\n");
+    printf("v ver  s status  c crc  r restart  t tokens  e eth  l load-sd  d dir-sd  i chat-mode  R reboot  ? menu  (+Enter)\n");
     printf("or type a prompt (2+ chars) + Enter to run the model\n");
 }
 
@@ -44,7 +44,7 @@ static int emit_token(int k, int nt, int steps) {
     if (k < nt - 1) return 1;                    /* still feeding the prompt */
     if (k >= steps) return 0;
     uint16_t t = eng_result_token((unsigned)k);
-    if (t == 0) return 0;                        /* <|endoftext|> */
+    if (t == 0 || t == 2) return 0;              /* <|endoftext|>, <|im_end|> */
     print_token(t);
     return 1;
 }
@@ -85,14 +85,27 @@ void run_prompt_tokens(const uint16_t *toks, int nt) {
     printf("\n");
 }
 
+/* Chat mode (instruct models): wrap the prompt in the SmolLM2 chat template,
+ * <|im_start|>user\n ... <|im_end|>\n<|im_start|>assistant\n.  The special
+ * tokens cannot come out of the text tokenizer, so they are spliced in here. */
+static int chat_mode;
+static const uint16_t chat_pre[]  = {1, 4093, 198};
+static const uint16_t chat_post[] = {2, 198, 1, 520, 9531, 198};
+#define NPRE  (int)(sizeof chat_pre / sizeof chat_pre[0])
+#define NPOST (int)(sizeof chat_post / sizeof chat_post[0])
+
 static void run_prompt(const char *line, int n) {
     uint16_t toks[NPROMPT_MAX];
-    int nt = tokenize(line, n, toks, NPROMPT_MAX);
+    int pre = chat_mode ? NPRE : 0, post = chat_mode ? NPOST : 0;
+    int nt = tokenize(line, n, toks + pre, NPROMPT_MAX - pre - post);
     if (nt < 0) { printf("no vocab table at main_ram+0x%08x (SD: VOCAB.BIN, or bfp_client -a 0x%08x upload serial_vocab.bin)\n", VOCAB_OFFSET, VOCAB_OFFSET); return; }
     if (nt == 0) return;
+    for (int i = 0; i < pre; i++)  toks[i] = chat_pre[i];
+    for (int i = 0; i < post; i++) toks[pre + nt + i] = chat_post[i];
+    nt += pre + post;
     printf("tokens:");
     for (int i = 0; i < nt; i++) printf(" %u", toks[i]);
-    printf("\n%s", line);
+    printf("\n%s%s", line, chat_mode ? "\n" : "");
     run_prompt_tokens(toks, nt);
 }
 
@@ -131,6 +144,7 @@ int main(void) {
                 case 'e': net_stats(); break;
                 case 'l': sd_load_all(); break;
                 case 'd': sd_ls(); break;
+                case 'i': chat_mode = !chat_mode; printf("chat mode %s\n", chat_mode ? "on (instruct template)" : "off"); break;
                 case 'R': printf("rebooting (BIOS)\n"); uart_sync(); ctrl_reset_write(1); break;
                 case '?': case 'h': menu(); break;
                 default:  printf("? press ? for menu\n");
